@@ -1,0 +1,6 @@
+/target
+config.local.json
+*.db
+*.db-wal
+*.db-shm
+*.swp
