@@ -260,3 +260,56 @@ fn is_repo(s: &str) -> bool {
 fn is_exclude_author(s: &str) -> bool {
     is_login(s.strip_suffix("[bot]").unwrap_or(s))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{is_exclude_author, is_login, is_repo};
+
+    // is_repo must reject malformed forms ("/owner/name", "owner//name",
+    // "owner/name/") and the ':'/space forms that could smuggle a second
+    // search qualifier — the reason the validation exists. A charset
+    // allowlist enforces both; a slash-count check would not.
+    #[test]
+    fn repo_rejects_malformed_and_injection() {
+        for bad in [
+            "/owner/name",
+            "owner//name",
+            "owner/name/",
+            "owner",
+            "owner/",
+            "/name",
+            "",
+            "owner/na me",
+            "owner/na:me",
+            "owner/name involves:x",
+            "a/b is:issue",
+        ] {
+            assert!(!is_repo(bad), "should reject {bad:?}");
+        }
+        for ok in ["owner/name", "o/n", "owner/name.rs", "o-w/n_1"] {
+            assert!(is_repo(ok), "should accept {ok:?}");
+        }
+    }
+
+    #[test]
+    fn login_rejects_qualifier_injection() {
+        for bad in [
+            "me involves:target",
+            "a:b",
+            "has space",
+            "",
+            &"x".repeat(40),
+        ] {
+            assert!(!is_login(bad), "should reject {bad:?}");
+        }
+        assert!(is_login("octocat"));
+        assert!(is_login("a-b-1"));
+    }
+
+    #[test]
+    fn exclude_author_admits_bot_suffix() {
+        assert!(is_exclude_author("dependabot[bot]"));
+        assert!(is_exclude_author("alice"));
+        assert!(!is_exclude_author("bad login[bot]"));
+    }
+}
