@@ -28,7 +28,14 @@ CREATE TABLE IF NOT EXISTS prs (
   body            TEXT NOT NULL DEFAULT '',
   state           TEXT NOT NULL,         -- OPEN | CLOSED | MERGED
   is_draft        INTEGER NOT NULL DEFAULT 0,
-  author          TEXT,
+  author          TEXT,                  -- login (display; renameable)
+  author_id       INTEGER,               -- stable databaseId; survives a
+                                         -- login rename, so identity resolves
+                                         -- across it. NULL for Mannequin/Org.
+  author_assoc    TEXT,                  -- OWNER|MEMBER|COLLABORATOR|
+                                         -- CONTRIBUTOR|FIRST_TIME_CONTRIBUTOR|
+                                         -- NONE|MANNEQUIN — the reliable
+                                         -- external-vs-insider triage axis
   head_ref        TEXT,
   base_ref        TEXT,
   head_sha        TEXT,                  -- last commit oid
@@ -71,7 +78,9 @@ CREATE TABLE IF NOT EXISTS issues (
   title            TEXT NOT NULL,
   state            TEXT NOT NULL,         -- OPEN | CLOSED
   body             TEXT NOT NULL DEFAULT '',
-  author           TEXT,
+  author           TEXT,                  -- login (display; renameable)
+  author_id        INTEGER,               -- stable databaseId (see prs)
+  author_assoc     TEXT,                  -- see prs.author_assoc
   labels           TEXT,                  -- JSON array; triage signal
   assignees        TEXT,                  -- JSON array; triage signal
   url              TEXT NOT NULL,
@@ -116,7 +125,9 @@ CREATE TABLE IF NOT EXISTS comments (
   thread        INTEGER,                 -- review_threads.pk; NULL otherwise
   kind         TEXT NOT NULL DEFAULT 'comment',  -- comment | review_comment | review
   state        TEXT,                     -- review verdict when kind='review'
-  author       TEXT,
+  author       TEXT,                     -- login (display; renameable)
+  author_id    INTEGER,                  -- stable databaseId (see prs)
+  author_assoc TEXT,                     -- see prs.author_assoc
   body         TEXT NOT NULL DEFAULT '',
   is_minimized INTEGER NOT NULL DEFAULT 0,
   created_at   TEXT NOT NULL,
@@ -172,11 +183,17 @@ SELECT r.target_repo, r.target_number, p.repo, p.number, r.source
 -- The sync's own changelog: the field-by-field diff the upsert already
 -- computes, recorded. "What changed since yesterday" = WHERE observed_at > ?.
 -- Not an event system; GitHub's timeline API is deliberately not fetched.
+-- Observed fields are the PR's state signals. author_id and author_assoc are
+-- deliberately NOT observed: author_id is stable identity, not a state, and
+-- observing author_assoc would spray a row per PR the first time the column
+-- populates (NULL→value on backfill) for a transition that is not yet
+-- work-relevant — add it here only when a consumer wants it.
 CREATE TABLE IF NOT EXISTS observations (
   seq         INTEGER PRIMARY KEY,
   pr          INTEGER NOT NULL,          -- prs.pk (observations are PR-fields only)
   observed_at TEXT NOT NULL,
-  field       TEXT NOT NULL,             -- state | review_decision | head_sha | is_draft | ...
+  field       TEXT NOT NULL,             -- state | review_decision | head_sha |
+                                         -- is_draft | last_pushed_at | author | ...
   old         TEXT,
   new         TEXT
 );

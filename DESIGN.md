@@ -85,7 +85,16 @@ scope; and the issue stream is on by default at project scope only —
 no-op. Discovery selects each hit's author, so an excluded PR is skipped
 before hydration and costs discovery only. Filters govern ingest, never
 deletion, and per-repo `filtered` counts appear in the sync summary —
-configured absence is visible, like every other absence.
+configured absence is visible, like every other absence. Hydration also
+records each author's `authorAssociation` (OWNER/MEMBER/CONTRIBUTOR/
+FIRST_TIME_CONTRIBUTOR/…) and stable `databaseId` — both scalars on nodes
+already fetched, so zero extra rate-limit points. The association is a
+reliable external-vs-insider triage axis. The `databaseId` is stored now so
+identity matching can move off logins later (PLANNED, milestone 1): today
+`people`/`exclude_authors` match by login, so a login rename still breaks
+those matches — the stable id is captured, not yet consulted. A "service
+account" filter is deliberately absent: GitHub exposes no signal for it, so
+`exclude_authors` (explicit) is the honest tool, never a login heuristic.
 
 ### Watermarks
 

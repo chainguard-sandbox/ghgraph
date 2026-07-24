@@ -76,7 +76,10 @@ including person removal.
   every body-carrying field; search results regrouped by PR (bm25 ranks
   from separate FTS indexes are not comparable); `body_elided` distinct
   from `truncated` — one is a property of the archive, the other of the
-  request; `retry_after` on TRANSIENT envelopes.
+  request; `retry_after` on TRANSIENT envelopes; `author_assoc` surfaced on
+  every emitted PR/issue row (the triage axis is read-facing, and its
+  absence from output cannot be added back after `schema_version: 1`).
+  `author_id` stays internal — identity plumbing, not a display field.
 - Stamp `schema_version: 1`, additive-only from then on — strictly after
   milestone 1, whose fixes change the contract.
 - Opt-in `--max-body-bytes` elision. `--limit` on `prs`/`attention` with

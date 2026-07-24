@@ -91,12 +91,19 @@ pub fn discovery_terms(
 ///     reviewDecision is stored raw and never trusted alone.
 ///   * commits(last:1) carries head oid + pushedDate: an approval that
 ///     predates the last push is a stale approval.
-///   * Every author selection carries __typename: filters need structural
-///     Bot detection at ingest (not just discovery — sync --pr skips
-///     discovery entirely), and a unit test parses these documents to
-///     assert it. author is Option everywhere in the parse types: a deleted
-///     account (author: null) is ordinary data, ingested with author NULL —
-///     never an error, never a filter match.
+///   * Every author selection carries __typename (structural Bot detection
+///     at ingest, since sync --pr skips discovery) plus databaseId via
+///     User/Bot fragments (NULL for the rare Mannequin/Organization author).
+///     databaseId is a stable id captured now so identity matching can move
+///     off logins in a later milestone — it is stored, not yet consulted
+///     (matching is login-keyed today). author is Option everywhere in the
+///     parse types: author:null (deleted account) is ordinary data, ingested
+///     NULL, never an error or a filter match. All scalars on nodes already
+///     traversed, so zero extra rate-limit points — only a few response bytes.
+///   * authorAssociation on the PR, its comments, and linked issues is the
+///     reliable external-vs-insider axis (OWNER/MEMBER/CONTRIBUTOR/
+///     FIRST_TIME_CONTRIBUTOR/…) — the triage filter GitHub actually backs,
+///     unlike "service account", which has no API signal (use exclude_authors).
 ///   * repository { nameWithOwner } is the PR's own view of its repo:
 ///     mismatch against config detects a rename/transfer and surfaces as
 ///     CONFIGURATION ("repo renamed — update config"), never a silent
@@ -106,7 +113,8 @@ query($id: ID!) {
   node(id: $id) {
     ... on PullRequest {
       id number title body state isDraft url
-      author { login __typename }
+      author { login __typename ... on User { databaseId } ... on Bot { databaseId } }
+      authorAssociation
       repository { nameWithOwner }
       headRefName baseRefName
       reviewDecision
@@ -118,17 +126,20 @@ query($id: ID!) {
       }
       latestOpinionatedReviews(first: 20) {
         totalCount
-        nodes { author { login __typename } state submittedAt }
+        nodes { state submittedAt
+                author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
       }
       closingIssuesReferences(first: 10) {
         totalCount
-        nodes { id number title state body author { login __typename } url updatedAt
-                repository { nameWithOwner } }
+        nodes { id number title state body updatedAt
+                author { login __typename ... on User { databaseId } ... on Bot { databaseId } }
+                authorAssociation url repository { nameWithOwner } }
       }
       comments(first: 50) {
         totalCount
         pageInfo { hasNextPage endCursor }
-        nodes { id author { login __typename } body createdAt lastEditedAt url isMinimized }
+        nodes { id body createdAt lastEditedAt url isMinimized authorAssociation
+                author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
       }
       reviewThreads(first: 50) {
         totalCount
@@ -137,7 +148,8 @@ query($id: ID!) {
           id isResolved isOutdated path line
           comments(first: 30) {
             totalCount
-            nodes { id author { login __typename } body createdAt lastEditedAt url isMinimized }
+            nodes { id body createdAt lastEditedAt url isMinimized authorAssociation
+                    author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
           }
         }
       }
@@ -159,7 +171,8 @@ query($id: ID!, $after: String) {
           id isResolved isOutdated path line
           comments(first: 50) {
             totalCount
-            nodes { id author { login __typename } body createdAt lastEditedAt url isMinimized }
+            nodes { id body createdAt lastEditedAt url isMinimized authorAssociation
+                    author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
           }
         }
       }
