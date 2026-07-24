@@ -4,7 +4,7 @@
 # ghgraph is a design scaffold — function bodies are `todo!()` stubs, so
 # `build` compiles but `run` will panic until the bodies land. See DESIGN.md.
 
-.PHONY: help doctor build release run test fmt lint check check-full audit clean install setup-vet
+.PHONY: help doctor config build release run test fmt lint check check-full audit clean install setup setup-vet
 
 BINARY_NAME := ghgraph
 
@@ -23,6 +23,11 @@ doctor: ## Check prerequisites: gh CLI (authenticated) and the Rust toolchain
 	@command -v gh >/dev/null 2>&1 && echo "✓ gh $$(gh --version | head -1 | cut -d' ' -f3)" || { echo "✗ gh not found — ghgraph's only transport (https://cli.github.com)"; exit 1; }
 	@gh auth status >/dev/null 2>&1 && echo "✓ gh authenticated" || { echo "✗ gh not authenticated — run: gh auth login"; exit 1; }
 	@echo "✓ ready"
+
+config: ## Write a starter config to $XDG_CONFIG_HOME/ghgraph/ (never overwrites)
+	@dest="$${XDG_CONFIG_HOME:-$$HOME/.config}/ghgraph/config.json"; \
+	if [ -e "$$dest" ]; then echo "exists, not overwriting: $$dest"; \
+	else mkdir -p "$$(dirname "$$dest")" && cp config.example.json "$$dest" && echo "wrote $$dest — edit it, then: ghgraph sync"; fi
 
 #
 # Build and run
@@ -66,8 +71,12 @@ check-full: check audit ## check, plus the dependency advisory scan
 # Supply chain (dependency policy — see DESIGN.md)
 #
 
-audit: ## Scan dependencies for known advisories (cargo-audit)
+audit: ## Scan dependencies for known advisories (needs cargo-audit; make setup)
+	@command -v cargo-audit >/dev/null 2>&1 || { echo "cargo-audit not found — run 'make setup' (or: cargo install cargo-audit)"; exit 1; }
 	cargo audit
+
+setup: ## Install the dev tools the quality targets need (cargo-audit)
+	cargo install cargo-audit
 
 setup-vet: ## Initialize the cargo-vet store (one-time; hardening milestone)
 	cargo vet init

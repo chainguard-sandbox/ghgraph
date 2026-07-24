@@ -56,5 +56,6 @@ Signal handlers (cancellation is the absence of a handler), an event system
 (observations stay PR-fields only), FKs with cascades, `catch_unwind`, a
 panic hook, run-long transactions for locking, views that encode judgment,
 org- or forge-wide discovery (every synced repo is named in the config), a
-Windows port. Each was argued down in DESIGN.md; meet the argument, not
-the absence.
+Windows port, a CLI command with no MCP counterpart (human setup or config
+scaffolding is a flag or a Makefile target, not a verb). Each was argued
+down in DESIGN.md; meet the argument, not the absence.

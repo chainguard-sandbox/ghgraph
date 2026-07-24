@@ -4,3 +4,4 @@ config.local.json
 *.db-wal
 *.db-shm
 *.swp
+.idea/

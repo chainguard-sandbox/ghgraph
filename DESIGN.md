@@ -206,8 +206,16 @@ silent write.
 
 ## Command surface
 
-Seven verbs — sync, attention, prs, pr, search, query, stats — each mapping
-1:1 to a future MCP tool. stdout is always one JSON document (carve-outs:
+The verbs — sync, attention, prs, pr, search, query, stats — are the whole
+surface, and each is one operation on the archive that maps 1:1 to a future
+MCP tool. The mapping is the constraint, not the count: the CLI and the MCP
+server are one surface, so there is one contract to specify, test, and reason
+about rather than two that can diverge. A verb is an archive operation an
+agent would call; the count is incidental, and an additional verb is
+admissible when it meets that test. Anything else — human setup, config
+scaffolding, tooling — belongs in a flag (the `--help`/`--version` family) or
+the Makefile, not in a command that would have no MCP counterpart. stdout is
+always one JSON document (carve-outs:
 `--help`/`--version`, and abnormal exit, where empty stdout plus nonzero exit
 reads as INTERNAL); progress goes to stderr; a closed pipe is a silent
 exit 0, never a panic. Errors are typed envelopes, and the code names the

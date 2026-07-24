@@ -17,7 +17,7 @@ categories = ["command-line-utilities", "development-tools"]
 [dependencies]
 # The archive. `bundled` compiles SQLite (FTS5 included) into the binary so
 # behavior never skews with a system libsqlite3. The only C in the build.
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 # JSON in (GraphQL responses from the gh subprocess) and JSON out (the stdout
 # contract: one JSON document, nothing else).
 serde = { version = "1", features = ["derive"] }

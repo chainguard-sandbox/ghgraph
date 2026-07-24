@@ -157,6 +157,10 @@ interaction as a named design input at that point.
 - The ~10-minute watermark overlap at project-scope volume — the
   unchanged-remote replay check is the live detector of an insufficient
   overlap (a missed item resurfaces as a spurious delta).
+- `--print-default-config` — a flag (like `--help`) that emits the example
+  config to stdout, for a released binary whose users have no checkout. The
+  `make config` target covers source checkouts today; a verb is ruled out,
+  since config scaffolding has no MCP counterpart.
 - FTS tokenizer for identifiers — ship stock unicode61; decide from captured
   queries. A tokenizer change is a rebuild migration, not a data migration.
 - Retry deadlines, budgets, quarantine threshold — ship conservative

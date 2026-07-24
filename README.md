@@ -14,8 +14,11 @@ Status: design scaffold. The command surface, schema, and invariants are the
 current deliverable; bodies are stubs. [DESIGN.md](DESIGN.md) has the
 architecture; [ROADMAP.md](ROADMAP.md) sequences the build.
 
-Unix only. Requires the [gh](https://cli.github.com) CLI: ghgraph carries no
-HTTP, TLS, or auth code by design.
+Requires the [gh](https://cli.github.com) CLI — ghgraph carries no HTTP, TLS,
+or auth code by design (gh itself runs on Linux, macOS, and Windows). ghgraph
+is Unix-only for its own reasons: cancellation is process-group signals and
+the archive is protected by file-mode bits, neither of which has a Windows
+equivalent.
 
     ghgraph sync                 fetch configured repos into the archive
     ghgraph attention            what is waiting on you, or on your project
