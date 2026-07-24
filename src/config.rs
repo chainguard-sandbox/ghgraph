@@ -201,13 +201,33 @@ pub fn load(flag: Option<&Path>) -> Result<Config> {
         .map_err(|e| Error::config(format!("cannot read config {}: {e}", path.display())))?;
     let cfg: Config = serde_json::from_str(&raw)
         .map_err(|e| Error::config(format!("invalid config {}: {e}", path.display())))?;
+    // Every identifier is interpolated into a GitHub search qualifier
+    // (queries.rs). A value containing a space or ':' could smuggle a second
+    // qualifier — "owner/name involves:someone-else" — so validate at the
+    // boundary. This charset gate is the interim; the validating RepoName/
+    // Login newtypes that make injection unrepresentable by type land in
+    // milestone 1.
+    for login in cfg.people.iter().chain([&cfg.viewer]) {
+        if !is_login(login) {
+            return Err(Error::config(format!(
+                "login {login:?} is not a valid GitHub login (letters, digits, hyphen)"
+            )));
+        }
+    }
     for entry in &cfg.repos {
         let rc = entry.resolved();
-        if rc.repo.split('/').filter(|s| !s.is_empty()).count() != 2 {
+        if !is_repo(&rc.repo) {
             return Err(Error::config(format!(
                 "repo {:?} is not of the form owner/name",
                 rc.repo
             )));
+        }
+        for a in &rc.exclude_authors {
+            if !is_exclude_author(a) {
+                return Err(Error::config(format!(
+                    "exclude_authors entry {a:?} is not a valid login (optionally with a [bot] suffix)"
+                )));
+            }
         }
         if rc.scope == Scope::Working && rc.issues() {
             return Err(Error::config(format!(
@@ -218,4 +238,25 @@ pub fn load(flag: Option<&Path>) -> Result<Config> {
         }
     }
     Ok(cfg)
+}
+
+fn is_login(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 39 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+fn is_repo(s: &str) -> bool {
+    match s.split_once('/') {
+        Some((owner, name)) => {
+            is_login(owner)
+                && !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        }
+        None => false,
+    }
+}
+
+fn is_exclude_author(s: &str) -> bool {
+    is_login(s.strip_suffix("[bot]").unwrap_or(s))
 }

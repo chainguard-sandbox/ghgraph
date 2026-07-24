@@ -102,13 +102,41 @@ enum Command {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    // clap owns --help/--version: it prints them to stdout and we exit 0.
+    // Any other parse failure is a user typo — USER_INPUT, not the empty-
+    // stdout-exit-2 that reads as INTERNAL. clap's own default would do the
+    // latter, so we intercept.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => match e.kind() {
+            clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+                let _ = e.print();
+                std::process::exit(0);
+            }
+            _ => {
+                emit(&error::Error::user(e.to_string()).envelope());
+                std::process::exit(2);
+            }
+        },
+    };
     match run(cli) {
-        Ok(doc) => println!("{doc:#}"),
+        Ok(doc) => emit(&format!("{doc:#}")),
         Err(e) => {
-            println!("{}", e.envelope());
+            emit(&e.envelope());
             std::process::exit(2);
         }
+    }
+}
+
+/// The single stdout writer. A closed pipe (`ghgraph … | head`) is a silent
+/// success, never a panic — `println!` would panic on EPIPE, violating the
+/// stdout contract every consumer depends on.
+fn emit(doc: &str) {
+    use std::io::Write;
+    match writeln!(std::io::stdout().lock(), "{doc}") {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+        Err(_) => std::process::exit(2),
     }
 }
 

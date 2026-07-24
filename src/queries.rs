@@ -42,11 +42,14 @@ query($q: String!, $after: String) {
 
 /// The discovery search strings for one configured repo.
 /// `since` is RFC 3339; the caller has already applied the overlap window.
-/// PLANNED (milestone 1): every interpolated value becomes a validating
-/// newtype (RepoName, Login, Rfc3339Utc), enforced by this signature. Today
-/// they are raw strings and the slash-count config check is the only guard —
-/// "a/b is:issue" passes it and injects a qualifier. Do not add
-/// interpolation sites before the newtypes land.
+/// Interpolated identifiers are charset-validated at config load
+/// (config.rs: is_login / is_repo reject spaces and ':', so a value cannot
+/// smuggle a second qualifier). PLANNED (milestone 1): promote those checks
+/// to validating newtypes (RepoName, Login, Rfc3339Utc) enforced by this
+/// signature, so injection is unrepresentable by type rather than by a
+/// boundary check. `since` is a server-supplied timestamp, still validated
+/// only by convention until Rfc3339Utc lands — do not add interpolation
+/// sites that bypass config validation.
 pub fn discovery_terms(
     rc: &RepoConfig,
     viewer: &str,

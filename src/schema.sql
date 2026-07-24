@@ -15,9 +15,9 @@
 -- No FOREIGN KEYs, decided: PrBundle writes a parent and its children in one
 -- transaction, so orphans are unrepresentable in the write path, and ON
 -- DELETE CASCADE would amplify hard deletes against the soft-delete audit
--- trail; a `stats` orphan audit is the backstop. Child tables re-key on
--- prs.pk before v1 data exists (ROADMAP milestone 1) so a node-id format
--- migration can strand nothing.
+-- trail; a `stats` orphan audit is the backstop. Child tables key on the
+-- parent's local `pk` (INTEGER), never the node-id TEXT — a node-id format
+-- migration updates one prs/issues row and strands nothing.
 
 CREATE TABLE IF NOT EXISTS prs (
   pk              INTEGER PRIMARY KEY,
@@ -31,8 +31,11 @@ CREATE TABLE IF NOT EXISTS prs (
   author          TEXT,
   head_ref        TEXT,
   base_ref        TEXT,
-  head_sha        TEXT,                  -- last commit; reviews older than its
-                                         -- push time are stale approvals
+  head_sha        TEXT,                  -- last commit oid
+  last_pushed_at  TEXT,                  -- last head push (server time); an
+                                         -- approval older than it is stale.
+                                         -- NULL/unknown ordering degrades a PR
+                                         -- OUT of ready_to_merge (attention.rs)
   review_decision TEXT,                  -- raw API value; never trusted alone
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL,
@@ -40,6 +43,11 @@ CREATE TABLE IF NOT EXISTS prs (
   closed_at       TEXT,
   url             TEXT NOT NULL,
   truncated       INTEGER NOT NULL DEFAULT 0,  -- hydration incomplete; no silent caps
+  verified_at     TEXT,                  -- last WITNESSED complete hydration
+                                         -- (every connection paginated to end);
+                                         -- the tiered re-verify schedules from
+                                         -- it, and only a witness-holding
+                                         -- transaction may write it (sync.rs)
   deleted_at      TEXT,
   UNIQUE (repo, number)
 );
@@ -47,59 +55,88 @@ CREATE INDEX IF NOT EXISTS idx_prs_repo_state ON prs (repo, state);
 CREATE INDEX IF NOT EXISTS idx_prs_author_state ON prs (author, state);
 CREATE INDEX IF NOT EXISTS idx_prs_updated ON prs (updated_at);
 
--- Skinny issue cache: populated for issues that synced PRs reference, so the
--- context behind a PR is available offline. Not a standalone sync loop.
+-- Issues, first-class under project scope and a skinny cache under working
+-- scope — one table, two writers, distinguished by hydration_source. The
+-- shape mirrors prs (pk, truncated, deleted_at, FTS) so a project repo's
+-- issue stream is a full citizen. The working-scope writer (a PR's
+-- closingIssuesReferences) is FILL-ONLY: it inserts a missing row but never
+-- downgrades a stream-hydrated one, so the skinny cache cannot clobber
+-- labels/assignees that project-scope hydration owns (hydration_source gates
+-- the upsert). Not a standalone sync loop at working scope.
 CREATE TABLE IF NOT EXISTS issues (
-  id         TEXT NOT NULL UNIQUE,
-  repo       TEXT NOT NULL,
-  number     INTEGER NOT NULL,
-  title      TEXT NOT NULL,
-  state      TEXT NOT NULL,
-  body       TEXT NOT NULL DEFAULT '',
-  author     TEXT,
-  url        TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  synced_at  TEXT NOT NULL,              -- staleness is part of the record
+  pk               INTEGER PRIMARY KEY,
+  id               TEXT NOT NULL UNIQUE,  -- GraphQL node id (data, not key)
+  repo             TEXT NOT NULL,
+  number           INTEGER NOT NULL,
+  title            TEXT NOT NULL,
+  state            TEXT NOT NULL,         -- OPEN | CLOSED
+  body             TEXT NOT NULL DEFAULT '',
+  author           TEXT,
+  labels           TEXT,                  -- JSON array; triage signal
+  assignees        TEXT,                  -- JSON array; triage signal
+  url              TEXT NOT NULL,
+  created_at       TEXT,                  -- nullable unlike prs: the fill-only
+                                          -- linked-cache writer may not fetch it
+  updated_at       TEXT NOT NULL,
+  hydration_source TEXT NOT NULL,         -- 'stream' | 'linked' (fill-only)
+  truncated        INTEGER NOT NULL DEFAULT 0,
+  verified_at      TEXT,
+  synced_at        TEXT NOT NULL,         -- staleness is part of the record
+  deleted_at       TEXT,
   UNIQUE (repo, number)
 );
+CREATE INDEX IF NOT EXISTS idx_issues_repo_state ON issues (repo, state);
+CREATE INDEX IF NOT EXISTS idx_issues_updated ON issues (updated_at);
 
 CREATE TABLE IF NOT EXISTS review_threads (
-  id          TEXT PRIMARY KEY,
-  pr_id       TEXT NOT NULL,             -- prs.id
+  pk          INTEGER PRIMARY KEY,
+  id          TEXT NOT NULL UNIQUE,      -- GraphQL node id (data, not key)
+  pr          INTEGER NOT NULL,          -- prs.pk (review threads are PR-only)
   path        TEXT,
   line        INTEGER,
   is_resolved INTEGER NOT NULL DEFAULT 0,
   is_outdated INTEGER NOT NULL DEFAULT 0,
   deleted_at  TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_threads_pr ON review_threads (pr_id);
+CREATE INDEX IF NOT EXISTS idx_threads_pr ON review_threads (pr);
 
 -- Reviews live here as kind='review' rows (state = APPROVED | CHANGES_REQUESTED
--- | COMMENTED | DISMISSED); no separate reviews table.
+-- | COMMENTED | DISMISSED); no separate reviews table. A comment hangs off a
+-- PR or an issue: (parent_kind, parent) names which, keyed on that parent's
+-- local pk — so the stats orphan audit resolves the parent BY parent_kind
+-- ('pr'→prs.pk, 'issue'→issues.pk) and any join must branch the same way.
+-- is_minimized is GitHub's own hostile-content label; it is stored and
+-- load-bearing — a minimized comment never drives waiting_on_me
+-- (attention.rs), only annotates.
 CREATE TABLE IF NOT EXISTS comments (
-  pk         INTEGER PRIMARY KEY,
-  id         TEXT NOT NULL UNIQUE,
-  pr_id      TEXT NOT NULL,              -- prs.id
-  thread_id  TEXT,                       -- review_threads.id; NULL otherwise
-  kind       TEXT NOT NULL DEFAULT 'comment',  -- comment | review_comment | review
-  state      TEXT,                       -- review verdict when kind='review'
-  author     TEXT,
-  body       TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL,
-  updated_at TEXT,                       -- edit detection; keeps the FTS copy honest
-  url        TEXT,
-  deleted_at TEXT
+  pk           INTEGER PRIMARY KEY,
+  id           TEXT NOT NULL UNIQUE,
+  parent_kind  TEXT NOT NULL,            -- 'pr' | 'issue'
+  parent       INTEGER NOT NULL,         -- prs.pk or issues.pk per parent_kind
+  thread        INTEGER,                 -- review_threads.pk; NULL otherwise
+  kind         TEXT NOT NULL DEFAULT 'comment',  -- comment | review_comment | review
+  state        TEXT,                     -- review verdict when kind='review'
+  author       TEXT,
+  body         TEXT NOT NULL DEFAULT '',
+  is_minimized INTEGER NOT NULL DEFAULT 0,
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT,                     -- edit detection; keeps the FTS copy honest
+  url          TEXT,
+  deleted_at   TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_comments_pr ON comments (pr_id);
-CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments (thread_id);
+CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments (parent_kind, parent);
+CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments (thread);
 
 -- Current review requests, replaced wholesale per PR per sync. Role ("mine" vs
 -- "reviewing") is derived at query time from author + this table — a stored
--- role column would go stale and mislabel author-and-reviewer PRs.
+-- role column would go stale and mislabel author-and-reviewer PRs. kind keeps
+-- a user "platform" distinct from a team "platform": a team request reaches
+-- waiting_on_me by team name, a user request by login (attention.rs).
 CREATE TABLE IF NOT EXISTS review_requests (
-  pr_id    TEXT NOT NULL,
+  pr       INTEGER NOT NULL,             -- prs.pk
   reviewer TEXT NOT NULL,
-  PRIMARY KEY (pr_id, reviewer)
+  kind     TEXT NOT NULL DEFAULT 'user', -- 'user' | 'team'
+  PRIMARY KEY (pr, reviewer, kind)
 );
 
 -- Cross-references, recomputed per PR on every sync: a view over observed
@@ -108,23 +145,28 @@ CREATE TABLE IF NOT EXISTS review_requests (
 -- a dangling target is signal, not an error. `blocks` is stored as observed,
 -- never flipped — blocked_edges below canonicalizes direction.
 CREATE TABLE IF NOT EXISTS refs (
-  src           TEXT NOT NULL,           -- prs.id
+  src_pr        INTEGER NOT NULL,        -- prs.pk (refs are extracted from PRs)
   kind          TEXT NOT NULL,           -- fixes | depends_on | blocked_by | blocks | mentions
   source        TEXT NOT NULL,           -- body | api (closingIssuesReferences → fixes/api)
   target_repo   TEXT NOT NULL,
   target_number INTEGER NOT NULL,
-  PRIMARY KEY (src, kind, source, target_repo, target_number)
+  PRIMARY KEY (src_pr, kind, source, target_repo, target_number)
 );
 CREATE INDEX IF NOT EXISTS idx_refs_target ON refs (target_repo, target_number);
 
+-- `source` is exposed so a consumer can drop body-sourced edges: `involves:`
+-- discovery means any GitHub user can mention the viewer's PR and plant a
+-- body ref against it, so a body-sourced blocked_by must never silently gate
+-- (attention.rs treats it as annotation, never suppression).
 CREATE VIEW IF NOT EXISTS blocked_edges AS
 SELECT p.repo AS blocked_repo, p.number AS blocked_number,
-       r.target_repo AS blocker_repo, r.target_number AS blocker_number
-  FROM refs r JOIN prs p ON p.id = r.src
+       r.target_repo AS blocker_repo, r.target_number AS blocker_number,
+       r.source AS source
+  FROM refs r JOIN prs p ON p.pk = r.src_pr
  WHERE r.kind = 'blocked_by'
 UNION
-SELECT r.target_repo, r.target_number, p.repo, p.number
-  FROM refs r JOIN prs p ON p.id = r.src
+SELECT r.target_repo, r.target_number, p.repo, p.number, r.source
+  FROM refs r JOIN prs p ON p.pk = r.src_pr
  WHERE r.kind = 'blocks';
 
 -- The sync's own changelog: the field-by-field diff the upsert already
@@ -132,7 +174,7 @@ SELECT r.target_repo, r.target_number, p.repo, p.number
 -- Not an event system; GitHub's timeline API is deliberately not fetched.
 CREATE TABLE IF NOT EXISTS observations (
   seq         INTEGER PRIMARY KEY,
-  pr_id       TEXT NOT NULL,
+  pr          INTEGER NOT NULL,          -- prs.pk (observations are PR-fields only)
   observed_at TEXT NOT NULL,
   field       TEXT NOT NULL,             -- state | review_decision | head_sha | is_draft | ...
   old         TEXT,
@@ -226,4 +268,28 @@ BEGIN
   INSERT INTO comments_fts(comments_fts, rowid, body)
     VALUES ('delete', old.pk, old.body);
   INSERT INTO comments_fts(rowid, body) VALUES (new.pk, new.body);
+END;
+
+-- Issues share the PR FTS shape (schema is final); the stream writer
+-- populates it under project scope. "Where did we discuss X" lands in issue
+-- bodies for an active project — the query that earns the index.
+CREATE VIRTUAL TABLE IF NOT EXISTS issues_fts USING fts5(
+  title, body,
+  content='issues', content_rowid='pk',
+  tokenize='porter unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS issues_ai AFTER INSERT ON issues BEGIN
+  INSERT INTO issues_fts(rowid, title, body) VALUES (new.pk, new.title, new.body);
+END;
+CREATE TRIGGER IF NOT EXISTS issues_ad AFTER DELETE ON issues BEGIN
+  INSERT INTO issues_fts(issues_fts, rowid, title, body)
+    VALUES ('delete', old.pk, old.title, old.body);
+END;
+-- Same WHEN rationale as prs_au.
+CREATE TRIGGER IF NOT EXISTS issues_au AFTER UPDATE ON issues
+WHEN old.title IS NOT new.title OR old.body IS NOT new.body
+BEGIN
+  INSERT INTO issues_fts(issues_fts, rowid, title, body)
+    VALUES ('delete', old.pk, old.title, old.body);
+  INSERT INTO issues_fts(rowid, title, body) VALUES (new.pk, new.title, new.body);
 END;

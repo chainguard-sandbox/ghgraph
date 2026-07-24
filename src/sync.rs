@@ -143,7 +143,9 @@
 //! (runs_since_advance) is state and lives on sync_state; per-repo HISTORY
 //! is telemetry and stays ephemeral.
 
-use crate::config::Config;
+use std::sync::mpsc::{Receiver, Sender};
+
+use crate::config::{Config, RepoConfig};
 use crate::error::Result;
 
 /// Rows for one writer transaction, already parsed and typed.
@@ -226,13 +228,18 @@ pub fn run(_cfg: &Config, _full: bool, _pr: Option<&str>) -> Result<serde_json::
 }
 
 /// Discovery (scope-dependent flavors, deduped by id) + hydration for one
-/// repo, oldest window first, ascending updatedAt within a window. Sends
-/// Page batches as PRs hydrate and one Done per completed window.
-fn sync_repo(_repo: &str, _since: Option<&str>) -> Result<String> {
+/// configured repo, oldest window first, ascending updatedAt within a
+/// window. Every result — Page, per-window Done with its watermark and
+/// quarantine rows, Deferred at the floor, Failed — flows through the
+/// channel, never a return value: a String return could carry at most one
+/// watermark, and a project repo has two streams. Reads config for scope,
+/// people, filters, and the fingerprint.
+fn sync_repo(_cfg: &Config, _repo: &RepoConfig, _tx: &Sender<Msg>) -> Result<()> {
     todo!()
 }
 
-/// Single writer: owns the Connection, applies Msg stream, produces summary rows.
-fn writer(_rx: std::sync::mpsc::Receiver<Msg>) -> Result<serde_json::Value> {
+/// Single writer: owns the Connection, applies the Msg stream in order, and
+/// produces the summary document.
+fn writer(_rx: Receiver<Msg>) -> Result<serde_json::Value> {
     todo!()
 }

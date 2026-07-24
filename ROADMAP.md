@@ -6,59 +6,37 @@ that change the contract; MCP follows the freeze.
 
 ## 1 — schema and identity, before any v1 data
 
-- `prs.last_pushed_at`, so stale-approval detection has its third input. The
-  upstream `pushedDate` is deprecated and the `committedDate` fallback is
-  rebase-skewed, so unknown ordering degrades a PR out of `ready_to_merge`.
-- Child tables keyed on the parent's `pk`; node ids become data everywhere.
-  Comments gain a typed parent (PR or issue) in the same migration.
-- Issues get the PR shape: `pk` (the table has no declared primary key
-  today, and adding one later is a rebuild), `deleted_at`, `truncated`,
-  plus `labels` and `assignees` for triage. Issues FTS itself waits for
-  milestone 4.
-- Validating `RepoName`/`Login`/`Rfc3339Utc` newtypes at config load and in
-  `discovery_terms`' signature, replacing the slash-count check (which
-  admits search-qualifier injection — the counterexample string lives on as
-  a unit test). Login equivalence is one function, called everywhere logins
-  compare, tested against a captured GraphQL bot-actor fixture; `x[bot]`
-  means login `x` with author type `Bot`.
-- A manual `Deserialize` for the `repos` entry (string or object) so a
-  config typo names the failing entry and field instead of serde's opaque
-  untagged-variant message; the manual impl rejects duplicate keys
-  explicitly, or closure regresses while diagnosability improves.
-- `sync_state` re-keyed to `(repo, stream)` with the structured discovery
-  fingerprint (scope, viewer, people, filters, lookback — the mechanism
-  that defines every config-change transition), `last_checked_at` (the
-  `_meta` freshness source; the watermark cannot express "checked, nothing
-  new"), and `runs_since_advance` (starved-first scheduling and starvation
-  visibility). `last_full_resync` is dropped: no consumer.
-- The `quarantine` table — a durable row per failed hydration, committed in
-  the same transaction as the watermark that passes its id, so no exit
-  turns "quarantined" into "forgotten".
-- FTS `WHEN` guards on the update triggers, so metadata-only changes (state
-  flips, `is_minimized`) stop rewriting full tokenizations — the diff gate
-  cannot catch this, and at project scope it rewrites the whole corpus once
-  per PR lifecycle.
-- `__typename` on every author selection and `author` as `Option` in every
-  parse type: filters need structural Bot detection at ingest (`sync --pr`
-  skips discovery), and a deleted account is ordinary data, never an error.
-- Issues gain `verified_at` and a `hydration_source` column; the
-  working-scope linked-issue cache writes fill-only, never downgrading a
-  stream-hydrated row.
-- Archive dir/db created 0700/0600 at creation time (mode bits at open,
-  no chmod-after race) — pulled forward from hardening.
-- An `involves:` discovery flavor per tracked person (config `people`) —
-  without it the `people_prs` bucket is structurally empty forever, and
-  tracked people's activity never reaches the archive.
-- `review_requests.kind`, so team-routed (CODEOWNERS) requests can reach
-  `waiting_on_me`; `refs.source` exposed on `blocked_edges`; store
-  `comments.is_minimized` (fetched on every comment connection, review
-  threads included) so moderated content never drives attention.
-- `prs.verified_at` — when the PR last had a witnessed complete hydration;
-  the tiered re-verify schedules from it, and only a transaction holding
-  completeness witnesses for every connection may write it.
+The schema is final and lives in `src/schema.sql`: child tables keyed on the
+parent's `pk` (node ids are data everywhere); comments carry a typed parent
+(PR or issue) and `is_minimized`; issues share the PR shape (`pk`, `truncated`,
+`deleted_at`, `verified_at`, `labels`, `assignees`, `hydration_source`, and
+`issues_fts`); `prs.last_pushed_at` and `prs.verified_at`; `review_requests.kind`;
+`sync_state` keyed `(repo, stream)` with the discovery fingerprint,
+`last_checked_at`, and `runs_since_advance`; the `quarantine` table; and FTS
+`WHEN` guards. Rationale is recorded at each definition. What remains for this
+milestone is the identity code that validates and populates against it:
 
-Done when schema.sql and config.rs carry the decisions and their rationale
-in place.
+- Promote config's charset gate (config.rs `is_login`/`is_repo`) to validating
+  `RepoName`/`Login`/`Rfc3339Utc` newtypes enforced by `discovery_terms`'
+  signature, so injection is unrepresentable by type; the counterexample
+  string lives on as a unit test.
+- Login equivalence as one function, called everywhere logins compare, tested
+  against a captured GraphQL bot-actor fixture; `x[bot]` means login `x` with
+  author type `Bot`.
+- A manual `Deserialize` for the `repos` entry (string or object) so a config
+  typo names the failing entry and field instead of serde's opaque
+  untagged-variant message; it rejects duplicate keys explicitly, or closure
+  regresses while diagnosability improves.
+- `__typename` on every author selection is in the queries; the parse types
+  carry `author` as `Option` (a deleted account is data, never an error) and
+  read structural Bot type for ingest filtering (`sync --pr` skips discovery).
+- An `involves:` discovery flavor per tracked person; `refs.source` exposed on
+  `blocked_edges` (in schema) consumed by the reader.
+- Archive dir/db created 0700/0600 at creation time (mode bits at open, no
+  chmod-after race) — pulled forward from hardening.
+
+Done when the identity code validates against the final schema and the
+injection, bot-equivalence, and config-diagnosability tests pass.
 
 ## 2 — sync pipeline bodies
 
