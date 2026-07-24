@@ -26,6 +26,10 @@ HTTP, TLS, or auth code by design.
 stdout is always one JSON document. Progress goes to stderr. Errors are typed
 envelopes with exit code 2.
 
+Getting started: `make doctor` checks your prerequisites (the gh CLI, signed
+in, and the Rust toolchain), `make check` runs everything CI does, and
+`make help` lists the rest.
+
 Config: `~/.config/ghgraph/config.json` — see
 [config.example.json](config.example.json).
 
