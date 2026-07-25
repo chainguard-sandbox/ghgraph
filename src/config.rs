@@ -60,11 +60,40 @@ pub enum Scope {
 /// the full object. The config file is a public interface — the eighth verb —
 /// so the shape is closed (deny_unknown_fields) and every default is
 /// resolved in code, in one place, where a test can see it.
-#[derive(Deserialize)]
-#[serde(untagged)]
 pub enum RepoEntry {
     Name(String),
     Detailed(RepoConfig),
+}
+
+// Hand-written rather than #[serde(untagged)]: an untagged enum collapses a
+// bad object into "data did not match any variant of untagged enum
+// RepoEntry", naming neither the entry nor the field. Dispatching on the JSON
+// type instead lets RepoConfig's deny_unknown_fields surface the offending
+// field by name (config errors name the field, per the config contract).
+impl<'de> Deserialize<'de> for RepoEntry {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct RepoEntryVisitor;
+        impl<'de> serde::de::Visitor<'de> for RepoEntryVisitor {
+            type Value = RepoEntry;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(r#"a repo string "owner/name" or a repo object"#)
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<RepoEntry, E> {
+                Ok(RepoEntry::Name(v.to_string()))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<RepoEntry, A::Error> {
+                RepoConfig::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(RepoEntry::Detailed)
+            }
+        }
+        deserializer.deserialize_any(RepoEntryVisitor)
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -115,9 +144,13 @@ impl RepoConfig {
 }
 
 impl RepoEntry {
-    /// Shorthand → full form; defaults resolve here and nowhere else.
+    /// Shorthand → full form; defaults resolve here and nowhere else. The
+    /// repo is case-folded to lowercase: GitHub treats owner/name
+    /// case-insensitively, so folding at the boundary (and at API ingest)
+    /// keeps `Foo/Bar` and `foo/bar` from splitting the (repo, number) key
+    /// or tripping rename detection against the canonical `nameWithOwner`.
     pub fn resolved(&self) -> RepoConfig {
-        match self {
+        let mut rc = match self {
             RepoEntry::Detailed(rc) => rc.clone(),
             RepoEntry::Name(name) => RepoConfig {
                 repo: name.clone(),
@@ -127,7 +160,9 @@ impl RepoEntry {
                 bots: None,
                 exclude_authors: Vec::new(),
             },
-        }
+        };
+        rc.repo = rc.repo.to_ascii_lowercase();
+        rc
     }
 }
 
@@ -263,7 +298,30 @@ fn is_exclude_author(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_exclude_author, is_login, is_repo};
+    use super::{RepoEntry, is_exclude_author, is_login, is_repo};
+
+    // A bad field in an object entry must be named, not collapsed into serde's
+    // opaque untagged-enum message — the reason RepoEntry has a hand-written
+    // Deserialize instead of #[serde(untagged)].
+    #[test]
+    fn repo_entry_object_names_bad_field() {
+        let err = serde_json::from_str::<RepoEntry>(r#"{"repo":"a/b","bogus":1}"#)
+            .err()
+            .expect("should error")
+            .to_string();
+        assert!(err.contains("bogus"), "should name the field: {err}");
+        assert!(
+            !err.contains("did not match any variant"),
+            "should not be the untagged message: {err}"
+        );
+    }
+
+    // Repo is case-folded at the boundary so Foo/Bar and foo/bar are one key.
+    #[test]
+    fn repo_entry_lowercases() {
+        let e: RepoEntry = serde_json::from_str(r#""Foo/Bar""#).unwrap();
+        assert_eq!(e.resolved().repo, "foo/bar");
+    }
 
     // is_repo must reject malformed forms ("/owner/name", "owner//name",
     // "owner/name/") and the ':'/space forms that could smuggle a second

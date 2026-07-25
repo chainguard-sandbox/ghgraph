@@ -267,7 +267,11 @@ CONFIGURATION naming the entry and field — never skip-and-continue, and
 never serde's opaque untagged-enum message — every identifier becomes a
 validating newtype before it can reach a search qualifier (milestone 1),
 and every default resolves in one place in code, so "what will this sync?"
-always has one checkable answer.
+always has one checkable answer. Identifiers are case-insensitive, as
+GitHub treats them: repo names fold to lowercase at the config boundary
+(and API-ingested repos fold to match), so `Foo/Bar` and `foo/bar` never
+split the `(repo, number)` key or trip rename detection against the
+canonical `nameWithOwner`.
 
 Config changes over an existing archive are defined, not accidental. Each
 `sync_state` row carries the structured fingerprint of the discovery inputs

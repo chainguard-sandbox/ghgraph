@@ -91,23 +91,29 @@ pub fn discovery_terms(
 ///     reviewDecision is stored raw and never trusted alone.
 ///   * commits(last:1) carries head oid + pushedDate: an approval that
 ///     predates the last push is a stale approval.
-///   * Every author selection carries __typename (structural Bot detection
-///     at ingest, since sync --pr skips discovery) plus databaseId via
-///     User/Bot fragments (NULL for the rare Mannequin/Organization author).
-///     databaseId is a stable id captured now so identity matching can move
-///     off logins in a later milestone — it is stored, not yet consulted
-///     (matching is login-keyed today). author is Option everywhere in the
-///     parse types: author:null (deleted account) is ordinary data, ingested
-///     NULL, never an error or a filter match. All scalars on nodes already
-///     traversed, so zero extra rate-limit points — only a few response bytes.
-///   * authorAssociation on the PR, its comments, and linked issues is the
-///     reliable external-vs-insider axis (OWNER/MEMBER/CONTRIBUTOR/
-///     FIRST_TIME_CONTRIBUTOR/…) — the triage filter GitHub actually backs,
-///     unlike "service account", which has no API signal (use exclude_authors).
+///   * Every author selection in this hydration document carries __typename
+///     (structural Bot detection at ingest, since sync --pr skips discovery)
+///     plus databaseId via User/Bot fragments (NULL for the rare Mannequin/
+///     Organization author). DISCOVERY fetches only login + __typename: its
+///     results decide skip-or-hydrate and are never stored, so databaseId
+///     there would be waste. databaseId is a stable id captured now so
+///     identity matching can move off logins in a later milestone — it is
+///     stored, not yet consulted (matching is login-keyed today). author is
+///     Option everywhere in the parse types: author:null (deleted account) is
+///     ordinary data, ingested NULL, never an error or a filter match. All
+///     scalars on nodes already traversed, so zero extra rate-limit points —
+///     only a few response bytes.
+///   * authorAssociation on every author-bearing node — the PR, its reviews,
+///     comments, and linked issues — is the reliable external-vs-insider axis
+///     (OWNER/MEMBER/CONTRIBUTOR/FIRST_TIME_CONTRIBUTOR/…), the triage filter
+///     GitHub actually backs, unlike "service account", which has no API
+///     signal (use exclude_authors). Reviews carry it too, so the
+///     comments.kind='review' rows never leave author_assoc silently NULL.
 ///   * repository { nameWithOwner } is the PR's own view of its repo:
-///     mismatch against config detects a rename/transfer and surfaces as
-///     CONFIGURATION ("repo renamed — update config"), never a silent
-///     follow and never a silently empty stream.
+///     a mismatch against config — compared case-folded, since repo identity
+///     is case-insensitive (config.rs lowercases; fold nameWithOwner too) —
+///     detects a rename/transfer and surfaces as CONFIGURATION ("repo
+///     renamed — update config"), never a silent follow or empty stream.
 pub const HYDRATE_PR: &str = r#"
 query($id: ID!) {
   node(id: $id) {
@@ -126,7 +132,7 @@ query($id: ID!) {
       }
       latestOpinionatedReviews(first: 20) {
         totalCount
-        nodes { state submittedAt
+        nodes { state submittedAt authorAssociation
                 author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
       }
       closingIssuesReferences(first: 10) {
