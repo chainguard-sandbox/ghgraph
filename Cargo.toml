@@ -1,0 +1,28 @@
+[package]
+name = "ghgraph"
+version = "0.1.0"
+edition = "2024"
+# 1.89 for std::fs::File::try_lock — the sync run lock. If this floor must
+# ever drop, the fallback is a sidecar SQLite lock database.
+rust-version = "1.89"
+license = "Apache-2.0"
+description = "Sync your GitHub work — pull requests, review threads, issues — into local SQLite; query it offline from the CLI, in JSON."
+repository = "https://github.com/chainguard-sandbox/ghgraph"
+keywords = ["github", "cli", "sqlite", "pull-requests"]
+categories = ["command-line-utilities", "development-tools"]
+
+# Dependency policy: every entry justified here, tree audited with `cargo vet`.
+# Network transport is the `gh` CLI as a subprocess — auth, SSO, retries, and
+# TLS are gh's problem, so no HTTP or TLS crates appear below.
+[dependencies]
+# The archive. `bundled` compiles SQLite (FTS5 included) into the binary so
+# behavior never skews with a system libsqlite3. The only C in the build.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# JSON in (GraphQL responses from the gh subprocess) and JSON out (the stdout
+# contract: one JSON document, nothing else).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# CLI surface: subcommands, flags, generated --help. The one ergonomics dep.
+# Default features off: color and "did you mean" suggestions cost ~7 crates
+# (anstream/anstyle/strsim) for styling on a tool whose output is JSON.
+clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
