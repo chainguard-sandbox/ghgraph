@@ -113,17 +113,18 @@ pub fn open_rw(path: &Path) -> Result<RwArchive> {
     }
     create_0600_if_absent(path)?;
 
-    // create_0600_if_absent already birthed the file at 0600, so SQLITE_OPEN_
-    // CREATE is a no-op that never sets a mode here; it is kept only to survive
-    // the vanishing-file race between our create and this open. No NOFOLLOW —
-    // it false-refuses archives under symlinked parent dirs; the 0700 directory
-    // is the symlink-swap defense (see module docs).
+    // create_0600_if_absent already birthed the file at 0600, so in the normal
+    // path SQLITE_OPEN_CREATE never sets a mode. It is kept only to survive the
+    // vanishing-file race between our create and this open — and in that race
+    // branch O_CREAT recreates the file at umask-default (not 0600). That narrow
+    // gap is undefended, but reaching it requires already controlling the 0700
+    // archive directory. No NOFOLLOW — it false-refuses archives under symlinked
+    // parent dirs; the 0700 directory is the symlink-swap defense (module docs).
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let mut conn = Connection::open_with_flags(path, flags).map_err(|e| open_error(path, e))?;
-    conn.busy_timeout(BUSY_TIMEOUT)
-        .map_err(|e| Error::config(format!("cannot configure archive {}: {e}", path.display())))?;
+    configure_conn(&conn, path)?;
     set_wal(&conn, path)?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| Error::config(format!("cannot set synchronous on {}: {e}", path.display())))?;
@@ -136,17 +137,28 @@ pub fn open_rw(path: &Path) -> Result<RwArchive> {
 /// half-initialized one means "this is not a ghgraph archive I understand" —
 /// both CONFIGURATION, and neither is answered against.
 pub fn open_ro(path: &Path) -> Result<RoArchive> {
-    if !path.try_exists().unwrap_or(false) {
-        return Err(Error::config(format!(
-            "no archive at {} — run `ghgraph sync` first",
-            path.display()
-        )));
+    // try_exists distinguishes "not there" (run sync) from an access error
+    // (e.g. the parent lost its 0700 traverse bit) — the latter must not be
+    // laundered into the friendly "run sync first" message.
+    match path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(Error::config(format!(
+                "no archive at {} — run `ghgraph sync` first",
+                path.display()
+            )));
+        }
+        Err(e) => {
+            return Err(Error::config(format!(
+                "cannot access archive {}: {e}",
+                path.display()
+            )));
+        }
     }
     // No NOFOLLOW (see module docs); the 0700 dir is the symlink defense.
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags).map_err(|e| open_error(path, e))?;
-    conn.busy_timeout(BUSY_TIMEOUT)
-        .map_err(|e| Error::config(format!("cannot configure archive {}: {e}", path.display())))?;
+    configure_conn(&conn, path)?;
     // query_only blocks writes the READ_ONLY flag alone would miss (ATTACH).
     conn.pragma_update(None, "query_only", true)
         .map_err(|e| Error::config(format!("cannot set query_only on {}: {e}", path.display())))?;
@@ -167,8 +179,20 @@ pub fn open_ro(path: &Path) -> Result<RoArchive> {
 /// precondition in the module docs; enforcing 0700 on a pre-existing parent is
 /// PLANNED milestone 5).
 fn ensure_dir_0700(dir: &Path) -> Result<()> {
-    if dir.as_os_str().is_empty() || dir.exists() {
+    if dir.as_os_str().is_empty() {
         return Ok(());
+    }
+    // try_exists (not exists()) so an access error surfaces with an accurate
+    // message rather than falling through to a create that fails vaguer.
+    match dir.try_exists() {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => {
+            return Err(Error::config(format!(
+                "cannot access archive dir {}: {e}",
+                dir.display()
+            )));
+        }
     }
     DirBuilder::new()
         .recursive(true)
@@ -197,6 +221,13 @@ fn create_0600_if_absent(path: &Path) -> Result<()> {
             path.display()
         ))),
     }
+}
+
+/// The busy_timeout every connection gets, RW and RO alike (shared so a timeout
+/// policy change is one edit). Failure is a configuration problem, not INTERNAL.
+fn configure_conn(conn: &Connection, path: &Path) -> Result<()> {
+    conn.busy_timeout(BUSY_TIMEOUT)
+        .map_err(|e| Error::config(format!("cannot configure archive {}: {e}", path.display())))
 }
 
 /// Set WAL and verify it took. A WAL switch cannot happen inside a transaction,
@@ -427,13 +458,20 @@ mod tests {
             other => panic!("expected SqliteFailure(ReadOnly), got {other:?}"),
         }
         // An ATTACH-based write is what query_only (not the READ_ONLY flag)
-        // closes; it too must be refused.
-        assert!(
-            ro.conn()
-                .execute_batch("ATTACH DATABASE ':memory:' AS side; CREATE TABLE side.t(x)")
-                .is_err(),
-            "ATTACH-based write must be refused"
-        );
+        // closes; it too must be refused, and specifically as read-only — a bare
+        // is_err() would pass even if the statement failed for some other reason.
+        let attach_err = ro
+            .conn()
+            .execute_batch("ATTACH DATABASE ':memory:' AS side; CREATE TABLE side.t(x)")
+            .unwrap_err();
+        match attach_err {
+            rusqlite::Error::SqliteFailure(e, _) => assert_eq!(
+                e.code,
+                ErrorCode::ReadOnly,
+                "ATTACH write must be refused as read-only"
+            ),
+            other => panic!("expected SqliteFailure(ReadOnly) on ATTACH path, got {other:?}"),
+        }
         // Reads still work.
         let n: i64 = ro
             .conn()
