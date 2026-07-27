@@ -171,12 +171,7 @@ pub fn open_ro(path: &Path) -> Result<RoArchive> {
         .map_err(|e| sqlite_err(path, "cannot set query_only on", e))?;
     let version = user_version(&conn, path)?;
     if version != SCHEMA_VERSION {
-        return Err(Error::config(format!(
-            "archive {} is at schema version {version}, expected {SCHEMA_VERSION} \
-             (a version 0 archive is empty or foreign; a higher version was written \
-             by a newer ghgraph)",
-            path.display()
-        )));
+        return Err(wrong_version(path, version));
     }
     Ok(RoArchive(conn))
 }
@@ -265,26 +260,35 @@ fn user_version(conn: &Connection, path: &Path) -> Result<i64> {
 /// Bring the archive to [`SCHEMA_VERSION`]. Each arm is a defined outcome; an
 /// unrecognized version is refused, not guessed.
 fn migrate(conn: &mut Connection, path: &Path) -> Result<()> {
-    let version = user_version(conn, path)?;
-    match version {
+    match user_version(conn, path)? {
         0 => apply_v1(conn, path),
         v if v == SCHEMA_VERSION => Ok(()),
-        v if v > SCHEMA_VERSION => Err(Error::config(format!(
-            "archive {} is schema version {v}, newer than this ghgraph (v{SCHEMA_VERSION}); \
-             upgrade ghgraph",
-            path.display()
-        ))),
-        // Everything else: a negative user_version (SQLite accepts any i32, so a
-        // corrupt or foreign archive can carry a negative sentinel) and, once
-        // SCHEMA_VERSION exceeds 1, the 0 < v < SCHEMA_VERSION case. The latter
-        // is PLANNED (milestone: whenever SCHEMA_VERSION first exceeds 1) —
-        // dispatch the ordered migration steps from v to SCHEMA_VERSION here,
-        // each in its own transaction. Refusing is the safe default for both.
-        v => Err(Error::config(format!(
-            "archive {} is at schema version {v}, which this ghgraph has no migration path for",
-            path.display()
-        ))),
+        // Once SCHEMA_VERSION exceeds 1, insert the 0 < v < SCHEMA_VERSION arm
+        // here — PLANNED (milestone: whenever that happens): dispatch the ordered
+        // migration steps from v to SCHEMA_VERSION, each in its own transaction.
+        // Everything else (a newer archive, or a negative/foreign sentinel —
+        // SQLite accepts any i64 user_version) is refused, never guessed.
+        v => Err(wrong_version(path, v)),
     }
+}
+
+/// The CONFIGURATION error for an archive whose `user_version` is not the
+/// current [`SCHEMA_VERSION`] and cannot be migrated to it. Shared by `open_ro`
+/// (any non-current version) and `migrate` (its refusal arms) so the two never
+/// drift. `migrate` handles v == 0 by applying the schema, so the v == 0 message
+/// here is reached only from `open_ro`.
+fn wrong_version(path: &Path, v: i64) -> Error {
+    let detail = if v == 0 {
+        "empty or not a ghgraph archive — run `ghgraph sync` first".to_string()
+    } else if v > SCHEMA_VERSION {
+        format!("newer than this ghgraph (v{SCHEMA_VERSION}); upgrade ghgraph")
+    } else {
+        format!("not one this ghgraph (v{SCHEMA_VERSION}) has a migration path for")
+    };
+    Error::config(format!(
+        "archive {} is at schema version {v}: {detail}",
+        path.display()
+    ))
 }
 
 /// Apply the v1 schema and stamp user_version=1 atomically. The schema apply
@@ -528,6 +532,28 @@ mod tests {
             rw.message
         );
         let ro = open_ro(&path).err().expect("open_ro must refuse newer");
+        assert_eq!(ro.code, crate::error::Code::Configuration);
+        assert!(
+            ro.message.contains("upgrade ghgraph"),
+            "open_ro message must direct the operator to upgrade, got: {}",
+            ro.message
+        );
+    }
+
+    #[test]
+    fn refuses_negative_schema_version() {
+        // SQLite accepts any i64 user_version; a corrupt or foreign archive can
+        // carry a negative sentinel that clears the 0 / ==VERSION / >VERSION
+        // guards and hits migrate's catch-all. Both opens must refuse it.
+        let s = Scratch::new();
+        let path = s.join("ghgraph.db");
+        {
+            let _a = open_rw(&path).unwrap();
+        }
+        set_raw_user_version(&path, -1);
+        let rw = open_rw(&path).err().expect("open_rw must refuse negative");
+        assert_eq!(rw.code, crate::error::Code::Configuration);
+        let ro = open_ro(&path).err().expect("open_ro must refuse negative");
         assert_eq!(ro.code, crate::error::Code::Configuration);
     }
 }
