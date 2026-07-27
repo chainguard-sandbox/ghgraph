@@ -116,9 +116,13 @@ impl Rfc3339Utc {
     /// representable timestamp; rather than panic, `now` falls back to the Unix
     /// epoch in that (practically unreachable) case.
     pub fn now() -> Rfc3339Utc {
+        // try_from (not `as i64`) so a u64 second-count above i64::MAX does not
+        // wrap to a small/negative residue — an unrepresentable clock resolves
+        // to the Unix-epoch fallback, matching the doc above.
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_secs()).ok())
             .unwrap_or(0);
         Rfc3339Utc::from_epoch(secs).unwrap_or_else(Rfc3339Utc::unix_epoch)
     }
@@ -149,8 +153,10 @@ impl Rfc3339Utc {
     }
 
     /// This instant minus `secs` seconds (the watermark overlap window is built
-    /// this way). `None` if the result falls out of the representable range.
-    pub fn checked_sub_secs(&self, secs: i64) -> Option<Rfc3339Utc> {
+    /// this way). `secs` is unsigned so "minus" cannot silently become "plus".
+    /// `None` if the result falls out of the representable range.
+    pub fn checked_sub_secs(&self, secs: u64) -> Option<Rfc3339Utc> {
+        let secs = i64::try_from(secs).ok()?;
         Rfc3339Utc::from_epoch(self.epoch.checked_sub(secs)?)
     }
 
@@ -339,6 +345,8 @@ mod tests {
 
     #[test]
     fn rejects_malformed() {
+        // Each of these is specifically Malformed (too short, or bad separators)
+        // — pinned exactly so a NotZulu/Malformed misclassification is caught.
         for s in [
             "",
             "2026",
@@ -348,11 +356,9 @@ mod tests {
             "2026-07-24 13:59:00Z", // space where the 'T' separator must be
             "2026-07-24T13:59:00",  // no zone at all (too short)
         ] {
-            assert!(
-                matches!(
-                    Rfc3339Utc::parse(s),
-                    Err(ParseError::Malformed | ParseError::NotZulu)
-                ),
+            assert_eq!(
+                Rfc3339Utc::parse(s),
+                Err(ParseError::Malformed),
                 "input: {s}"
             );
         }
