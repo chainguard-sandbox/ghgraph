@@ -59,7 +59,11 @@ use rusqlite::{Connection, ErrorCode, OpenFlags};
 
 use crate::error::{Error, Result};
 
-pub const SCHEMA: &str = include_str!("schema.sql");
+// Not pub: the only legitimate way to apply the schema is through open_rw's
+// migration, which also sets WAL, the file mode, and the version stamp. A
+// public SCHEMA would let a caller execute_batch it onto a connection that
+// skipped all of that.
+const SCHEMA: &str = include_str!("schema.sql");
 
 /// Current schema version, written to PRAGMA user_version after migration.
 pub const SCHEMA_VERSION: i64 = 1;
@@ -117,17 +121,19 @@ pub fn open_rw(path: &Path) -> Result<RwArchive> {
     // path SQLITE_OPEN_CREATE never sets a mode. It is kept only to survive the
     // vanishing-file race between our create and this open — and in that race
     // branch O_CREAT recreates the file at umask-default (not 0600). That narrow
-    // gap is undefended, but reaching it requires already controlling the 0700
-    // archive directory. No NOFOLLOW — it false-refuses archives under symlinked
-    // parent dirs; the 0700 directory is the symlink-swap defense (module docs).
+    // gap is undefended (PLANNED milestone 5: re-verify the fd's mode after
+    // open), but reaching it requires already controlling the 0700 archive
+    // directory. No NOFOLLOW — it false-refuses archives under symlinked parent
+    // dirs; the 0700 directory is the symlink-swap defense (module docs).
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let mut conn = Connection::open_with_flags(path, flags).map_err(|e| open_error(path, e))?;
+    let mut conn = Connection::open_with_flags(path, flags)
+        .map_err(|e| sqlite_err(path, "cannot open archive", e))?;
     configure_conn(&conn, path)?;
     set_wal(&conn, path)?;
     conn.pragma_update(None, "synchronous", "NORMAL")
-        .map_err(|e| Error::config(format!("cannot set synchronous on {}: {e}", path.display())))?;
+        .map_err(|e| sqlite_err(path, "cannot set synchronous on", e))?;
     migrate(&mut conn, path)?;
     Ok(RwArchive(conn))
 }
@@ -157,11 +163,12 @@ pub fn open_ro(path: &Path) -> Result<RoArchive> {
     }
     // No NOFOLLOW (see module docs); the 0700 dir is the symlink defense.
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags(path, flags).map_err(|e| open_error(path, e))?;
+    let conn = Connection::open_with_flags(path, flags)
+        .map_err(|e| sqlite_err(path, "cannot open archive", e))?;
     configure_conn(&conn, path)?;
     // query_only blocks writes the READ_ONLY flag alone would miss (ATTACH).
     conn.pragma_update(None, "query_only", true)
-        .map_err(|e| Error::config(format!("cannot set query_only on {}: {e}", path.display())))?;
+        .map_err(|e| sqlite_err(path, "cannot set query_only on", e))?;
     let version = user_version(&conn, path)?;
     if version != SCHEMA_VERSION {
         return Err(Error::config(format!(
@@ -227,7 +234,7 @@ fn create_0600_if_absent(path: &Path) -> Result<()> {
 /// policy change is one edit). Failure is a configuration problem, not INTERNAL.
 fn configure_conn(conn: &Connection, path: &Path) -> Result<()> {
     conn.busy_timeout(BUSY_TIMEOUT)
-        .map_err(|e| Error::config(format!("cannot configure archive {}: {e}", path.display())))
+        .map_err(|e| sqlite_err(path, "cannot configure archive", e))
 }
 
 /// Set WAL and verify it took. A WAL switch cannot happen inside a transaction,
@@ -238,7 +245,7 @@ fn configure_conn(conn: &Connection, path: &Path) -> Result<()> {
 fn set_wal(conn: &Connection, path: &Path) -> Result<()> {
     let mode: String = conn
         .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
-        .map_err(|e| Error::config(format!("cannot set WAL on {}: {e}", path.display())))?;
+        .map_err(|e| sqlite_err(path, "cannot set WAL on", e))?;
     if mode.eq_ignore_ascii_case("wal") {
         Ok(())
     } else {
@@ -252,12 +259,7 @@ fn set_wal(conn: &Connection, path: &Path) -> Result<()> {
 
 fn user_version(conn: &Connection, path: &Path) -> Result<i64> {
     conn.query_row("PRAGMA user_version", [], |r| r.get(0))
-        .map_err(|e| {
-            Error::config(format!(
-                "cannot read schema version of {}: {e}",
-                path.display()
-            ))
-        })
+        .map_err(|e| sqlite_err(path, "cannot read schema version of", e))
 }
 
 /// Bring the archive to [`SCHEMA_VERSION`]. Each arm is a defined outcome; an
@@ -272,11 +274,12 @@ fn migrate(conn: &mut Connection, path: &Path) -> Result<()> {
              upgrade ghgraph",
             path.display()
         ))),
-        // 0 < v < SCHEMA_VERSION: reachable only once numbered migration steps
-        // exist. PLANNED (milestone: whenever SCHEMA_VERSION first exceeds 1) —
-        // dispatch the ordered steps from v to SCHEMA_VERSION here, each in its
-        // own transaction. Until then this arm is unreachable (the only value
-        // below 1 is 0) and refusing is the safe default.
+        // Everything else: a negative user_version (SQLite accepts any i32, so a
+        // corrupt or foreign archive can carry a negative sentinel) and, once
+        // SCHEMA_VERSION exceeds 1, the 0 < v < SCHEMA_VERSION case. The latter
+        // is PLANNED (milestone: whenever SCHEMA_VERSION first exceeds 1) —
+        // dispatch the ordered migration steps from v to SCHEMA_VERSION here,
+        // each in its own transaction. Refusing is the safe default for both.
         v => Err(Error::config(format!(
             "archive {} is at schema version {v}, which this ghgraph has no migration path for",
             path.display()
@@ -291,9 +294,7 @@ fn migrate(conn: &mut Connection, path: &Path) -> Result<()> {
 /// last CREATE and the stamp rolls back to user_version=0 and the next open
 /// retries from clean.
 fn apply_v1(conn: &mut Connection, path: &Path) -> Result<()> {
-    let cannot = |e: rusqlite::Error| {
-        Error::config(format!("cannot initialize archive {}: {e}", path.display()))
-    };
+    let cannot = |e: rusqlite::Error| sqlite_err(path, "cannot initialize archive", e);
     let tx = conn.transaction().map_err(cannot)?;
     tx.execute_batch(SCHEMA).map_err(cannot)?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -302,11 +303,15 @@ fn apply_v1(conn: &mut Connection, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Classify a rusqlite open failure. A busy or locked archive is TRANSIENT —
-/// the fix is to retry, not to change a path. Everything else here is
-/// operator-fixable configuration: a corrupt archive is removable-and-
-/// rebuildable, a symlink or permission problem is a path the operator controls.
-fn open_error(path: &Path, e: rusqlite::Error) -> Error {
+/// Classify a rusqlite failure by the actor who can fix it, at every call site
+/// — open, a pragma, or the migration. A busy or locked database is TRANSIENT
+/// (retry), whichever operation hit it; this one classifier is why the
+/// "busy is TRANSIENT" promise in `open_rw` holds on every path, not just open.
+/// Everything else is operator-fixable configuration: a corrupt archive is
+/// removable-and-rebuildable, a full/read-only filesystem or a permission
+/// problem is a path the operator controls. `ctx` is the leading clause of the
+/// CONFIGURATION message, e.g. "cannot set WAL on".
+fn sqlite_err(path: &Path, ctx: &str, e: rusqlite::Error) -> Error {
     if let rusqlite::Error::SqliteFailure(err, _) = &e
         && matches!(
             err.code,
@@ -315,7 +320,7 @@ fn open_error(path: &Path, e: rusqlite::Error) -> Error {
     {
         return Error::transient(format!("archive {} is busy: {e}", path.display()));
     }
-    Error::config(format!("cannot open archive {}: {e}", path.display()))
+    Error::config(format!("{ctx} {}: {e}", path.display()))
 }
 
 #[cfg(test)]
@@ -513,9 +518,15 @@ mod tests {
             let _a = open_rw(&path).unwrap();
         }
         set_raw_user_version(&path, SCHEMA_VERSION + 1);
-        // Both paths must refuse, as CONFIGURATION ("upgrade ghgraph").
+        // Both paths must refuse as CONFIGURATION, and the open_rw message must
+        // carry the actionable remedy — pin it so a refactor can't drop it.
         let rw = open_rw(&path).err().expect("open_rw must refuse newer");
         assert_eq!(rw.code, crate::error::Code::Configuration);
+        assert!(
+            rw.message.contains("upgrade ghgraph"),
+            "message must direct the operator to upgrade, got: {}",
+            rw.message
+        );
         let ro = open_ro(&path).err().expect("open_ro must refuse newer");
         assert_eq!(ro.code, crate::error::Code::Configuration);
     }
