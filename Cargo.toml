@@ -2,9 +2,14 @@
 name = "ghgraph"
 version = "0.1.0"
 edition = "2024"
-# 1.89 for std::fs::File::try_lock — the sync run lock. If this floor must
-# ever drop, the fallback is a sidecar SQLite lock database.
-rust-version = "1.89"
+# MSRV 1.95: the dependency tree sets the floor, not our code. rusqlite 0.40 and
+# libsqlite3-sys 0.38 use std's cfg_select! macro (stable since 1.95.0), so
+# anything older fails to build (E0658). Verified by building + testing on
+# 1.95.0. Our own minimum is 1.89 (std::fs::File::try_lock, the sync run lock),
+# now subsumed. Pinning older deps to hold 1.89 was rejected — it forfeits
+# SQLite and security updates for a floor nothing enforces; if the MSRV must drop
+# later, that pin is the lever, and the run-lock fallback is a sidecar lock DB.
+rust-version = "1.95"
 license = "Apache-2.0"
 description = "Sync your GitHub work — pull requests, review threads, issues — into local SQLite; query it offline from the CLI, in JSON."
 repository = "https://github.com/chainguard-sandbox/ghgraph"
