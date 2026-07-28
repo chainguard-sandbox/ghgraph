@@ -1,0 +1,29 @@
+# Fuzz harness — NOT part of the shipped crate or the default build. It is its
+# own workspace, so `cargo build`/`make check` at the repo root never see it and
+# the four-dependency floor of the binary is untouched. `libfuzzer-sys` is a
+# fuzz-only dependency; targets reach the code under test through the `ghgraph`
+# library crate (hence the src/lib.rs split).
+[package]
+name = "ghgraph-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ghgraph]
+path = ".."
+
+[[bin]]
+name = "config_gate"
+path = "fuzz_targets/config_gate.rs"
+test = false
+doc = false
+bench = false
+
+# Own workspace so the root `cargo build` never descends into the fuzz crate.
+[workspace]

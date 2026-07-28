@@ -4,9 +4,13 @@
 # ghgraph is a design scaffold — function bodies are `todo!()` stubs, so
 # `build` compiles but `run` will panic until the bodies land. See DESIGN.md.
 
-.PHONY: help doctor config build release run test fmt lint check check-full audit clean install setup setup-vet
+.PHONY: help doctor config build release run test fuzz fmt lint check check-full audit clean install setup setup-vet
 
 BINARY_NAME := ghgraph
+
+# Fuzzing knobs (see the `fuzz` target).
+TARGET ?= config_gate
+SECS ?= 60
 
 help: ## Show this help
 	@echo "$(BINARY_NAME) — make <target>"
@@ -57,6 +61,12 @@ lint: ## Clippy, warnings as errors
 
 test: ## Run the test suite
 	cargo test
+
+fuzz: ## Fuzz a target (out-of-build, nightly). TARGET=config_gate SECS=60
+	@command -v cargo-fuzz >/dev/null 2>&1 || { echo "cargo-fuzz not found — run: cargo install cargo-fuzz"; exit 1; }
+	@nb="$$(dirname "$$(rustup which --toolchain nightly cargo)")"; \
+	echo "fuzzing $(TARGET) for $(SECS)s on nightly…"; \
+	PATH="$$nb:$$HOME/.cargo/bin:$$PATH" cargo fuzz run $(TARGET) -- -max_total_time=$(SECS)
 
 check: ## Fast pre-commit gate: format, clippy, check, test
 	cargo fmt --all -- --check

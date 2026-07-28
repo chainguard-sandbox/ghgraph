@@ -1,0 +1,6 @@
+# cargo-fuzz needs nightly (-Zsanitizer=address). Pinned here so the harness
+# builds with a rustup nightly. This is honored only when the invoking cargo is
+# a rustup proxy; `make fuzz` additionally prepends the nightly toolchain's bin
+# to PATH so a shadowing system cargo (e.g. Homebrew's) does not reject -Z.
+[toolchain]
+channel = "nightly"

@@ -1,4 +1,9 @@
 /target
+# Fuzz harness build + generated corpora/crashes (the harness source is tracked).
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/Cargo.lock
 config.local.json
 *.db
 *.db-wal
