@@ -6,7 +6,9 @@
 //! single writer thread — the only thread that ever touches the write
 //! connection.
 //!
+//! ```text
 //!     workers ── sync_channel(16) ──▶ writer (owns the Connection)
+//! ```
 //!
 //! Messages (see Msg): Page for intermediate rows; Done for one COMPLETED
 //! discovery window — its rows, its quarantine records, and the watermark
@@ -114,6 +116,7 @@
 //!
 //! Summary document: repos sorted by name, per-repo fields grouped —
 //!
+//! ```text
 //!     counts   fetched, upserted, unchanged (diff-gate skips), filtered
 //!              (bots / exclude_authors skips — configured absence is
 //!              visible), observations, soft_deleted
@@ -123,6 +126,7 @@
 //!              rate_cost, sleeps, sleep_seconds
 //!     health   truncated, quarantined, discovery_truncated,
 //!              deferred_at_floor, watchdog_kills, errors
+//! ```
 //!
 //! plus run-level rate remaining. Per-call overhead is the intercept of a
 //! regression over the run's real (bytes_parsed, subprocess_seconds) pairs;

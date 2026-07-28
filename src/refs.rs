@@ -5,11 +5,13 @@
 //! Recognized grammar (case-insensitive keywords, `#N` or `owner/name#N`
 //! targets):
 //!
+//! ```text
 //!     fix|fixes|fixed|close|closes|closed|resolve|resolves|resolved  → fixes
 //!     depends on                                                     → depends_on
 //!     blocked by                                                     → blocked_by
 //!     blocks                                                         → blocks
 //!     bare #N / owner/name#N                                         → mentions
+//! ```
 //!
 //! Body-extracted `fixes` is source='body'; the API's closingIssuesReferences
 //! lands as source='api' (sync ingests both — same fact, different trust).
