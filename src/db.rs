@@ -283,9 +283,17 @@ fn migrate(conn: &mut Connection, path: &Path) -> Result<()> {
 fn wrong_version(path: &Path, v: i64) -> Error {
     let detail = if v == 0 {
         "empty or not a ghgraph archive — run `ghgraph sync` first".to_string()
+    } else if v < 0 {
+        // SQLite stores any i64; a negative user_version is not a version this
+        // (or any) ghgraph ever wrote — a corrupt or foreign sentinel. Say so,
+        // rather than "no migration path", which implies a real intermediate
+        // version. This arm must come before the > / catch-all below.
+        "a negative sentinel — the archive is corrupt or not a ghgraph archive".to_string()
     } else if v > SCHEMA_VERSION {
         format!("newer than this ghgraph (v{SCHEMA_VERSION}); upgrade ghgraph")
     } else {
+        // Only 0 < v < SCHEMA_VERSION reaches here — currently vacuous (v==1 is
+        // handled by migrate), reserved for when SCHEMA_VERSION exceeds 1.
         format!("not one this ghgraph (v{SCHEMA_VERSION}) has a migration path for")
     };
     Error::config(format!(
@@ -585,9 +593,24 @@ mod tests {
             let _a = open_rw(&path).unwrap();
         }
         set_raw_user_version(&path, -1);
+        // Refuse as CONFIGURATION on both paths, AND the message must flag the
+        // archive as corrupt/foreign — not "no migration path", which would
+        // imply a real intermediate version. Pin the wording so a refactor of
+        // wrong_version cannot silently fold negatives back into the else arm
+        // (mirrors refuses_newer_schema_version pinning "upgrade ghgraph").
         let rw = open_rw(&path).err().expect("open_rw must refuse negative");
         assert_eq!(rw.code, crate::error::Code::Configuration);
+        assert!(
+            rw.message.contains("corrupt"),
+            "negative-version message must flag corruption, got: {}",
+            rw.message
+        );
         let ro = open_ro(&path).err().expect("open_ro must refuse negative");
         assert_eq!(ro.code, crate::error::Code::Configuration);
+        assert!(
+            ro.message.contains("corrupt"),
+            "open_ro negative-version message must flag corruption, got: {}",
+            ro.message
+        );
     }
 }

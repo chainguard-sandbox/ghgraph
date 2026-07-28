@@ -166,6 +166,14 @@ impl RepoEntry {
     }
 }
 
+// `parse` is the only guarded constructor: it runs `validate` (the injection
+// gate) after deserializing. Config derives Deserialize with public identifier
+// fields, so a caller that bypasses `parse` — `serde_json::from_str::<Config>`
+// directly — obtains an UNVALIDATED value; here the gate is discipline, not
+// type. Every construction site today goes through `parse` (load, the tests,
+// the fuzz harness). The validating Login/RepoName newtypes (milestone 1) close
+// this for good by making an unvalidated identifier unrepresentable; until they
+// land this is a known, fenced gap — recorded here, not silent.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -257,7 +265,8 @@ fn validate(cfg: &Config) -> Result<()> {
     for login in cfg.people.iter().chain([&cfg.viewer]) {
         if !is_login(login) {
             return Err(Error::config(format!(
-                "login {login:?} is not a valid GitHub login (letters, digits, hyphen)"
+                "login {login:?} is not a valid GitHub login \
+                 (letters, digits, interior hyphens; 1–39 chars)"
             )));
         }
     }
@@ -288,14 +297,28 @@ fn validate(cfg: &Config) -> Result<()> {
 }
 
 fn is_login(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 39 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    // GitHub logins are 1–39 chars of [A-Za-z0-9-] and may not begin or end
+    // with a hyphen. The leading/trailing-hyphen check is not injection defense
+    // (a hyphen smuggles no qualifier — space and ':' are excluded by the
+    // charset regardless); it keeps the gate's admitted set from being wider
+    // than GitHub's, so a bad login earns a clean CONFIGURATION message here
+    // instead of an opaque API rejection later.
+    !s.is_empty()
+        && s.len() <= 39
+        && s.bytes().next() != Some(b'-')
+        && s.bytes().next_back() != Some(b'-')
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 fn is_repo(s: &str) -> bool {
     match s.split_once('/') {
         Some((owner, name)) => {
+            // owner is bounded to 39 by is_login; GitHub caps the name at 100.
+            // Bounding it here keeps the gate's admitted set aligned with
+            // GitHub's, same rationale as is_login's length cap.
             is_login(owner)
                 && !name.is_empty()
+                && name.len() <= 100
                 && name
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
@@ -380,12 +403,14 @@ mod tests {
             "a:b",
             "has space",
             "",
+            "-foo", // leading hyphen: GitHub disallows, and so does the gate
+            "bar-", // trailing hyphen: likewise
             &"x".repeat(40),
         ] {
             assert!(!is_login(bad), "should reject {bad:?}");
         }
         assert!(is_login("octocat"));
-        assert!(is_login("a-b-1"));
+        assert!(is_login("a-b-1")); // interior hyphens are fine
     }
 
     // Pin the length boundary (GitHub logins max 39): a 39-char login is
@@ -395,6 +420,17 @@ mod tests {
     fn login_length_boundary() {
         assert!(is_login(&"x".repeat(39)), "39 chars must be accepted");
         assert!(!is_login(&"x".repeat(40)), "40 chars must be rejected");
+    }
+
+    // Pin the repo-name length boundary (GitHub caps names at 100): a 100-char
+    // name is accepted, 101 is not. The owner half is already covered by
+    // login_length_boundary via is_login.
+    #[test]
+    fn repo_name_length_boundary() {
+        let n100 = format!("o/{}", "x".repeat(100));
+        let n101 = format!("o/{}", "x".repeat(101));
+        assert!(is_repo(&n100), "100-char name must be accepted");
+        assert!(!is_repo(&n101), "101-char name must be rejected");
     }
 
     // The scope-derived defaults are policy: issues() off / bots() on at
