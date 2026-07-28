@@ -388,6 +388,113 @@ mod tests {
         assert!(is_login("a-b-1"));
     }
 
+    // Pin the length boundary (GitHub logins max 39): a 39-char login is
+    // accepted, 40 is not. Without the lower assertion, relaxing `<= 39` to
+    // `< 39` would go unnoticed.
+    #[test]
+    fn login_length_boundary() {
+        assert!(is_login(&"x".repeat(39)), "39 chars must be accepted");
+        assert!(!is_login(&"x".repeat(40)), "40 chars must be rejected");
+    }
+
+    // The scope-derived defaults are policy: issues() off / bots() on at
+    // working scope, and the reverse at project scope.
+    #[test]
+    fn scope_defaults_for_issues_and_bots() {
+        let w = parse(
+            r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"working"}]}"#,
+            "<test>",
+        )
+        .unwrap()
+        .repos[0]
+            .resolved();
+        assert!(!w.issues(), "working: issues() defaults off");
+        assert!(w.bots(), "working: bots() defaults on");
+
+        let p = parse(
+            r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"project"}]}"#,
+            "<test>",
+        )
+        .unwrap()
+        .repos[0]
+            .resolved();
+        assert!(p.issues(), "project: issues() defaults on");
+        assert!(!p.bots(), "project: bots() defaults off");
+    }
+
+    // The global defaults are a documented contract; a silent change is a
+    // regression (see the default_* fns and their rationale).
+    #[test]
+    fn defaults_match_documented_policy() {
+        let c = parse(r#"{"viewer":"v","repos":["o/n"]}"#, "<test>").unwrap();
+        assert_eq!(c.lookback_days, 90);
+        assert_eq!(c.reverify_open_days, 7);
+        assert_eq!(c.reverify_closed_days, 30);
+        assert_eq!(c.workers, 3);
+        assert_eq!(c.rate_limit_floor, 500);
+    }
+
+    // validate() must reject a malformed repo (not just a bad viewer) and the
+    // working-scope issue-stream error, and accept a clean config.
+    #[test]
+    fn validate_rejects_bad_repo_and_working_issues() {
+        assert!(
+            parse(r#"{"viewer":"v","repos":["bad repo"]}"#, "<test>").is_err(),
+            "a malformed repo must be rejected"
+        );
+        let e = parse(
+            r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"working","issues":true}]}"#,
+            "<test>",
+        )
+        .err()
+        .expect("issues:true at working scope must be rejected");
+        assert_eq!(e.code, crate::error::Code::Configuration);
+        assert!(
+            parse(
+                r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"project"}]}"#,
+                "<test>"
+            )
+            .is_ok(),
+            "a clean config must parse"
+        );
+    }
+
+    // exclude_authors are gated too: a malformed entry is rejected; a bare
+    // login and a [bot]-suffixed one are accepted.
+    #[test]
+    fn validate_checks_exclude_authors() {
+        assert!(
+            parse(
+                r#"{"viewer":"v","repos":[{"repo":"o/n","exclude_authors":["bad login"]}]}"#,
+                "<test>"
+            )
+            .is_err(),
+            "a malformed exclude_authors entry must be rejected"
+        );
+        assert!(
+            parse(
+                r#"{"viewer":"v","repos":[{"repo":"o/n","exclude_authors":["alice","dependabot[bot]"]}]}"#,
+                "<test>"
+            )
+            .is_ok(),
+            "valid exclude_authors (incl. [bot]) must be accepted"
+        );
+    }
+
+    // db_path honors an explicit override rather than deriving from XDG.
+    #[test]
+    fn db_path_uses_explicit_override() {
+        let c = parse(
+            r#"{"viewer":"v","repos":["o/n"],"db_path":"/tmp/ghgraph-x.db"}"#,
+            "<test>",
+        )
+        .unwrap();
+        assert_eq!(
+            c.db_path().unwrap(),
+            std::path::PathBuf::from("/tmp/ghgraph-x.db")
+        );
+    }
+
     #[test]
     fn exclude_author_admits_bot_suffix() {
         assert!(is_exclude_author("dependabot[bot]"));

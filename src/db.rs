@@ -227,6 +227,9 @@ fn create_0600_if_absent(path: &Path) -> Result<()> {
 
 /// The busy_timeout every connection gets, RW and RO alike (shared so a timeout
 /// policy change is one edit). Failure is a configuration problem, not INTERNAL.
+/// rusqlite already defaults this to 5000ms, so setting it here is explicit
+/// intent, version-independent of that default — which also makes dropping the
+/// call a behaviorally-equivalent mutation the tests cannot (and need not) kill.
 fn configure_conn(conn: &Connection, path: &Path) -> Result<()> {
     conn.busy_timeout(BUSY_TIMEOUT)
         .map_err(|e| sqlite_err(path, "cannot configure archive", e))
@@ -447,6 +450,37 @@ mod tests {
             mode.eq_ignore_ascii_case("wal"),
             "expected wal, got {mode:?}"
         );
+    }
+
+    #[test]
+    fn open_rw_sets_synchronous_normal() {
+        // The default is FULL (2); open_rw sets NORMAL (1), the right pairing
+        // with WAL. Without this, dropping the pragma is an undetected change.
+        let s = Scratch::new();
+        let path = s.join("ghgraph.db");
+        let arc = open_rw(&path).unwrap();
+        let sync: i64 = arc
+            .conn()
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            sync, 1,
+            "synchronous must be NORMAL (1), not the FULL default"
+        );
+    }
+
+    #[test]
+    fn open_rw_sets_busy_timeout() {
+        // configure_conn sets 5000ms; the default is 0. Without this, skipping
+        // configure_conn (or its being replaced with a no-op) goes undetected.
+        let s = Scratch::new();
+        let path = s.join("ghgraph.db");
+        let arc = open_rw(&path).unwrap();
+        let ms: i64 = arc
+            .conn()
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, 5000, "busy_timeout must be 5000ms");
     }
 
     #[test]
