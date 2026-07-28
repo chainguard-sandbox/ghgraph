@@ -430,6 +430,40 @@ mod tests {
     }
 
     #[test]
+    fn civil_inverse_holds_for_every_representable_date() {
+        // Exhaustive proof-by-enumeration over all ~3.65M valid dates in
+        // 0001..=9999: civil_from_days is the exact inverse of days_from_civil,
+        // and days advance by exactly 1 per calendar day. This is the algebraic
+        // core the epoch<->string round-trip rests on — total coverage in pure
+        // integer arithmetic (no allocation), well under a second. It is what a
+        // Kani proof would establish; Kani can't run here yet (its toolchain
+        // predates our 1.95 MSRV), so exhaustion stands in.
+        let mut prev = i64::MIN;
+        for year in 1..=9999i64 {
+            for month in 1..=12i64 {
+                for day in 1..=days_in_month(year, month) {
+                    let z = days_from_civil(year, month, day);
+                    assert_eq!(
+                        civil_from_days(z),
+                        (year, month, day),
+                        "round-trip failed at {year:04}-{month:02}-{day:02}"
+                    );
+                    if prev != i64::MIN {
+                        assert_eq!(
+                            z,
+                            prev + 1,
+                            "days must advance by exactly 1 per calendar day"
+                        );
+                    }
+                    prev = z;
+                }
+            }
+        }
+        assert_eq!(days_from_civil(1, 1, 1), -719_162);
+        assert_eq!(days_from_civil(9999, 12, 31), 2_932_896);
+    }
+
+    #[test]
     fn parse_error_never_echoes_input() {
         // Untrusted text must not reach an error message.
         let sneaky = "owner/repo involves:someone-else";
