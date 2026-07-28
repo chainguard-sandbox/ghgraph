@@ -234,14 +234,26 @@ pub fn load(flag: Option<&Path>) -> Result<Config> {
     let path = config_path(flag)?;
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| Error::config(format!("cannot read config {}: {e}", path.display())))?;
-    let cfg: Config = serde_json::from_str(&raw)
-        .map_err(|e| Error::config(format!("invalid config {}: {e}", path.display())))?;
-    // Every identifier is interpolated into a GitHub search qualifier
-    // (queries.rs). A value containing a space or ':' could smuggle a second
-    // qualifier — "owner/name involves:someone-else" — so validate at the
-    // boundary. This charset gate is the interim; the validating RepoName/
-    // Login newtypes that make injection unrepresentable by type land in
-    // milestone 1.
+    parse(&raw, &path.display().to_string())
+}
+
+/// Parse and validate a config from JSON text. `source` labels the input in the
+/// deserialization error (a path for [`load`], `"<fuzz>"`/`"<test>"` elsewhere).
+/// Shared by `load`, the tests, and the fuzz harness so all three exercise the
+/// one injection gate rather than a re-implementation.
+pub fn parse(raw: &str, source: &str) -> Result<Config> {
+    let cfg: Config = serde_json::from_str(raw)
+        .map_err(|e| Error::config(format!("invalid config {source}: {e}")))?;
+    validate(&cfg)?;
+    Ok(cfg)
+}
+
+/// The injection gate. Every identifier is interpolated into a GitHub search
+/// qualifier (queries.rs); a value containing a space or ':' could smuggle a
+/// second qualifier — "owner/name involves:someone-else" — so validate at the
+/// boundary. This charset gate is the interim; the validating RepoName/Login
+/// newtypes that make injection unrepresentable by type land in milestone 1.
+fn validate(cfg: &Config) -> Result<()> {
     for login in cfg.people.iter().chain([&cfg.viewer]) {
         if !is_login(login) {
             return Err(Error::config(format!(
@@ -272,7 +284,7 @@ pub fn load(flag: Option<&Path>) -> Result<Config> {
             )));
         }
     }
-    Ok(cfg)
+    Ok(())
 }
 
 fn is_login(s: &str) -> bool {
@@ -298,7 +310,19 @@ fn is_exclude_author(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RepoEntry, is_exclude_author, is_login, is_repo};
+    use super::{RepoEntry, is_exclude_author, is_login, is_repo, parse};
+
+    // The public entry the fuzz harness uses: a config whose viewer would
+    // smuggle a search qualifier is rejected end-to-end (serde + gate), not
+    // just by the private predicate.
+    #[test]
+    fn parse_rejects_injection_config() {
+        let bad = r#"{"viewer":"me involves:target","repos":["o/n"]}"#;
+        let err = parse(bad, "<test>").err().expect("must reject");
+        assert_eq!(err.code, crate::error::Code::Configuration);
+        let ok = parse(r#"{"viewer":"octocat","repos":["o/n"]}"#, "<test>");
+        assert!(ok.is_ok(), "a clean config must parse");
+    }
 
     // A bad field in an object entry must be named, not collapsed into serde's
     // opaque untagged-enum message — the reason RepoEntry has a hand-written
