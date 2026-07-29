@@ -25,5 +25,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "rfc3339_parse"
+path = "fuzz_targets/rfc3339_parse.rs"
+test = false
+doc = false
+bench = false
+
 # Own workspace so the root `cargo build` never descends into the fuzz crate.
 [workspace]
