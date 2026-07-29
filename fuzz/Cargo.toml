@@ -32,5 +32,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "epoch_arith"
+path = "fuzz_targets/epoch_arith.rs"
+test = false
+doc = false
+bench = false
+
 # Own workspace so the root `cargo build` never descends into the fuzz crate.
 [workspace]
