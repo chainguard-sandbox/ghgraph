@@ -12,6 +12,10 @@
 //!      mirror of rfc3339_parse's string->epoch->string one).
 //!   3. `checked_sub_secs`/`checked_sub_days` never panic and never turn
 //!      "minus" into "plus": any accepted result is no later than the original.
+//!   4. The canonical form of any accepted value stays within `[0-9:TZ-]` — the
+//!      charset the injection-safety argument (A3) reserves to this module. An
+//!      extreme epoch is where a widened/`-`-signed field would show; here it
+//!      can't, over all of i64.
 
 use libfuzzer_sys::fuzz_target;
 
@@ -32,6 +36,16 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(t.epoch(), secs, "from_epoch must preserve the epoch it accepts");
         let back = Rfc3339Utc::parse(t.as_str()).expect("canonical string must re-parse");
         assert_eq!(back.epoch(), secs, "epoch -> string -> epoch must round-trip");
+
+        // Charset stays within [0-9:TZ-] even for extreme epochs (no widened or
+        // sign-prefixed field). The A3 injection-safety proof consumes this.
+        assert!(
+            t.as_str()
+                .bytes()
+                .all(|c| matches!(c, b'0'..=b'9' | b':' | b'T' | b'Z' | b'-')),
+            "canonical form escaped [0-9:TZ-]: {:?}",
+            t.as_str()
+        );
 
         // 3: the subtractions saturate to None, never panic, and never run
         // the clock forward (the whole point of the unsigned-argument design).

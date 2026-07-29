@@ -465,22 +465,39 @@ mod tests {
     }
 
     #[test]
-    fn canonical_has_no_whitespace() {
-        // The injection-safety argument (A3) depends on this.
+    fn canonical_charset_is_bounded() {
+        // The injection-safety argument (A3) depends on the canonical form
+        // staying within [0-9:TZ-] — no whitespace, no ':' outside HH:MM:SS.
+        // epoch_arith fuzzes this same predicate over accepted values across all
+        // of i64 (where extreme epochs could otherwise widen a field); this pins
+        // it as a fast, always-run unit assertion.
         let t = Rfc3339Utc::parse("2026-07-24T13:59:00Z").unwrap();
-        assert!(t.as_str().bytes().all(|c| !c.is_ascii_whitespace()));
+        assert!(
+            t.as_str()
+                .bytes()
+                .all(|c| matches!(c, b'0'..=b'9' | b':' | b'T' | b'Z' | b'-')),
+            "canonical form must stay within [0-9:TZ-], got {:?}",
+            t.as_str()
+        );
     }
 
     #[test]
     fn civil_inverse_holds_for_every_representable_date() {
         // Exhaustive proof-by-enumeration over all ~3.65M valid dates in
-        // 0001..=9999: civil_from_days is the exact inverse of days_from_civil,
-        // and days advance by exactly 1 per calendar day. This is the algebraic
-        // core the epoch<->string round-trip rests on — total coverage in pure
-        // integer arithmetic (no allocation), well under a second. It is what a
-        // Kani proof would establish; Kani can't run here yet (its toolchain
-        // predates our 1.95 MSRV), so exhaustion stands in.
+        // 0001..=9999. Three properties, total over the whole domain:
+        //   * civil_from_days is the exact inverse of days_from_civil;
+        //   * the day count advances by exactly 1 per calendar day;
+        //   * the canonical rendering is byte-monotonic in the day count — i.e.
+        //     lexicographic order == chronological order, the property the
+        //     schema's ORDER BY on timestamp columns depends on (declared at the
+        //     top of this module, and what makes Eq/Ord-by-instant consistent
+        //     with the string). Witnessed here, not just argued in prose.
+        // This is the algebraic core the epoch<->string round-trip rests on, and
+        // what a Kani proof would establish; Kani can't run here yet (its
+        // toolchain predates our 1.95 MSRV), so exhaustion stands in. Runs in
+        // well under a couple seconds (the monotonicity check formats each date).
         let mut prev = i64::MIN;
+        let mut prev_str: Option<String> = None;
         for year in 1..=9999i64 {
             for month in 1..=12i64 {
                 for day in 1..=days_in_month(year, month) {
@@ -497,7 +514,19 @@ mod tests {
                             "days must advance by exactly 1 per calendar day"
                         );
                     }
+                    // A strictly-later day must render to a strictly-greater
+                    // canonical string (compared bytewise, as SQLite's default
+                    // collation does): this ties lexicographic to chronological
+                    // order across the whole domain.
+                    let s = format_epoch(z * 86_400);
+                    if let Some(ps) = &prev_str {
+                        assert!(
+                            s.as_bytes() > ps.as_bytes(),
+                            "canonical byte order must track day order: {ps:?} !< {s:?}"
+                        );
+                    }
                     prev = z;
+                    prev_str = Some(s);
                 }
             }
         }
