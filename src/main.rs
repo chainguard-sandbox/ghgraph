@@ -1,31 +1,16 @@
 #![forbid(unsafe_code)]
-// Design-phase scaffold: the command surface, module boundaries, types, and
-// invariants are the deliverable. Bodies are todo!() stubs.
-#![allow(dead_code)]
-
-// Unix only, by declaration: cancellation is process-group SIGINT semantics
-// and archive protection is mode bits (0700/0600). A port would need a second
-// mechanism — and a second proof — for each. Not a missing feature; a fence.
-#[cfg(windows)]
-compile_error!(
-    "ghgraph is Unix-only: its cancellation and file-mode invariants are Unix semantics (see DESIGN.md)"
-);
-
-mod attention;
-mod config;
-mod db;
-mod error;
-mod gh;
-mod queries;
-mod refs;
-mod report;
-mod sync;
+// A thin shell over the `ghgraph` library crate (src/lib.rs), which owns the
+// modules, types, invariants, and the Unix-only fence. The split exists so
+// verification harnesses can reach the library; the binary just wires argv to
+// it.
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::error::Result;
+use ghgraph::config;
+use ghgraph::error::{self, Result};
+use ghgraph::{report, sync};
 
 /// Sync your GitHub work — pull requests, review threads, issues — into
 /// local SQLite; query it offline from the CLI, in JSON.

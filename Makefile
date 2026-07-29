@@ -4,9 +4,20 @@
 # ghgraph is a design scaffold — function bodies are `todo!()` stubs, so
 # `build` compiles but `run` will panic until the bodies land. See DESIGN.md.
 
-.PHONY: help doctor config build release run test fmt lint check check-full audit clean install setup setup-vet
+.PHONY: help doctor config build release run test fuzz mutants fmt lint check check-full audit clean install setup setup-vet
 
 BINARY_NAME := ghgraph
+
+# Fuzzing knobs (see the `fuzz` target).
+TARGET ?= config_gate
+SECS ?= 60
+
+# Mutation-testing knobs (see the `mutants` target). Scoped to the implemented
+# modules by default — mutating the todo!() stubs only yields false survivors;
+# widen MUTANTS_FILES as modules land.
+MUTANTS_FILES ?= --file src/db.rs --file src/config.rs
+JOBS ?= 4
+TIMEOUT ?= 60
 
 help: ## Show this help
 	@echo "$(BINARY_NAME) — make <target>"
@@ -57,6 +68,16 @@ lint: ## Clippy, warnings as errors
 
 test: ## Run the test suite
 	cargo test
+
+fuzz: ## Fuzz a target (out-of-build, nightly). TARGET=config_gate SECS=60
+	@command -v cargo-fuzz >/dev/null 2>&1 || { echo "cargo-fuzz not found — run: cargo install cargo-fuzz"; exit 1; }
+	@nb="$$(dirname "$$(rustup which --toolchain nightly cargo)")"; \
+	echo "fuzzing $(TARGET) for $(SECS)s on nightly…"; \
+	PATH="$$nb:$$HOME/.cargo/bin:$$PATH" cargo fuzz run $(TARGET) -- -max_total_time=$(SECS)
+
+mutants: ## Mutation-test the implemented modules (needs cargo-mutants). MUTANTS_FILES/JOBS/TIMEOUT
+	@command -v cargo-mutants >/dev/null 2>&1 || { echo "cargo-mutants not found — run: cargo install cargo-mutants"; exit 1; }
+	cargo mutants $(MUTANTS_FILES) --jobs $(JOBS) --timeout $(TIMEOUT)
 
 check: ## Fast pre-commit gate: format, clippy, check, test
 	cargo fmt --all -- --check

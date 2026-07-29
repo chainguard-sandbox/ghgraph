@@ -1,4 +1,12 @@
 /target
+# Fuzz harness build + generated corpora/crashes (the harness source is tracked).
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/Cargo.lock
+# cargo-mutants output.
+/mutants.out
+/mutants.out.old
 config.local.json
 *.db
 *.db-wal

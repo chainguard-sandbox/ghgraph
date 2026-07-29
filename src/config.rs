@@ -166,6 +166,14 @@ impl RepoEntry {
     }
 }
 
+// `parse` is the only guarded constructor: it runs `validate` (the injection
+// gate) after deserializing. Config derives Deserialize with public identifier
+// fields, so a caller that bypasses `parse` — `serde_json::from_str::<Config>`
+// directly — obtains an UNVALIDATED value; here the gate is discipline, not
+// type. Every construction site today goes through `parse` (load, the tests,
+// the fuzz harness). The validating Login/RepoName newtypes (milestone 1) close
+// this for good by making an unvalidated identifier unrepresentable; until they
+// land this is a known, fenced gap — recorded here, not silent.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -234,18 +242,31 @@ pub fn load(flag: Option<&Path>) -> Result<Config> {
     let path = config_path(flag)?;
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| Error::config(format!("cannot read config {}: {e}", path.display())))?;
-    let cfg: Config = serde_json::from_str(&raw)
-        .map_err(|e| Error::config(format!("invalid config {}: {e}", path.display())))?;
-    // Every identifier is interpolated into a GitHub search qualifier
-    // (queries.rs). A value containing a space or ':' could smuggle a second
-    // qualifier — "owner/name involves:someone-else" — so validate at the
-    // boundary. This charset gate is the interim; the validating RepoName/
-    // Login newtypes that make injection unrepresentable by type land in
-    // milestone 1.
+    parse(&raw, &path.display().to_string())
+}
+
+/// Parse and validate a config from JSON text. `source` labels the input in the
+/// deserialization error (a path for [`load`], `"<fuzz>"`/`"<test>"` elsewhere).
+/// Shared by `load`, the tests, and the fuzz harness so all three exercise the
+/// one injection gate rather than a re-implementation.
+pub fn parse(raw: &str, source: &str) -> Result<Config> {
+    let cfg: Config = serde_json::from_str(raw)
+        .map_err(|e| Error::config(format!("invalid config {source}: {e}")))?;
+    validate(&cfg)?;
+    Ok(cfg)
+}
+
+/// The injection gate. Every identifier is interpolated into a GitHub search
+/// qualifier (queries.rs); a value containing a space or ':' could smuggle a
+/// second qualifier — "owner/name involves:someone-else" — so validate at the
+/// boundary. This charset gate is the interim; the validating RepoName/Login
+/// newtypes that make injection unrepresentable by type land in milestone 1.
+fn validate(cfg: &Config) -> Result<()> {
     for login in cfg.people.iter().chain([&cfg.viewer]) {
         if !is_login(login) {
             return Err(Error::config(format!(
-                "login {login:?} is not a valid GitHub login (letters, digits, hyphen)"
+                "login {login:?} is not a valid GitHub login \
+                 (letters, digits, interior hyphens; 1–39 chars)"
             )));
         }
     }
@@ -272,18 +293,32 @@ pub fn load(flag: Option<&Path>) -> Result<Config> {
             )));
         }
     }
-    Ok(cfg)
+    Ok(())
 }
 
 fn is_login(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 39 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    // GitHub logins are 1–39 chars of [A-Za-z0-9-] and may not begin or end
+    // with a hyphen. The leading/trailing-hyphen check is not injection defense
+    // (a hyphen smuggles no qualifier — space and ':' are excluded by the
+    // charset regardless); it keeps the gate's admitted set from being wider
+    // than GitHub's, so a bad login earns a clean CONFIGURATION message here
+    // instead of an opaque API rejection later.
+    !s.is_empty()
+        && s.len() <= 39
+        && s.bytes().next() != Some(b'-')
+        && s.bytes().next_back() != Some(b'-')
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 fn is_repo(s: &str) -> bool {
     match s.split_once('/') {
         Some((owner, name)) => {
+            // owner is bounded to 39 by is_login; GitHub caps the name at 100.
+            // Bounding it here keeps the gate's admitted set aligned with
+            // GitHub's, same rationale as is_login's length cap.
             is_login(owner)
                 && !name.is_empty()
+                && name.len() <= 100
                 && name
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
@@ -298,7 +333,19 @@ fn is_exclude_author(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RepoEntry, is_exclude_author, is_login, is_repo};
+    use super::{RepoEntry, is_exclude_author, is_login, is_repo, parse};
+
+    // The public entry the fuzz harness uses: a config whose viewer would
+    // smuggle a search qualifier is rejected end-to-end (serde + gate), not
+    // just by the private predicate.
+    #[test]
+    fn parse_rejects_injection_config() {
+        let bad = r#"{"viewer":"me involves:target","repos":["o/n"]}"#;
+        let err = parse(bad, "<test>").err().expect("must reject");
+        assert_eq!(err.code, crate::error::Code::Configuration);
+        let ok = parse(r#"{"viewer":"octocat","repos":["o/n"]}"#, "<test>");
+        assert!(ok.is_ok(), "a clean config must parse");
+    }
 
     // A bad field in an object entry must be named, not collapsed into serde's
     // opaque untagged-enum message — the reason RepoEntry has a hand-written
@@ -356,12 +403,132 @@ mod tests {
             "a:b",
             "has space",
             "",
+            "-foo", // leading hyphen: GitHub disallows, and so does the gate
+            "bar-", // trailing hyphen: likewise
             &"x".repeat(40),
         ] {
             assert!(!is_login(bad), "should reject {bad:?}");
         }
         assert!(is_login("octocat"));
-        assert!(is_login("a-b-1"));
+        assert!(is_login("a-b-1")); // interior hyphens are fine
+    }
+
+    // Pin the length boundary (GitHub logins max 39): a 39-char login is
+    // accepted, 40 is not. Without the lower assertion, relaxing `<= 39` to
+    // `< 39` would go unnoticed.
+    #[test]
+    fn login_length_boundary() {
+        assert!(is_login(&"x".repeat(39)), "39 chars must be accepted");
+        assert!(!is_login(&"x".repeat(40)), "40 chars must be rejected");
+    }
+
+    // Pin the repo-name length boundary (GitHub caps names at 100): a 100-char
+    // name is accepted, 101 is not. The owner half is already covered by
+    // login_length_boundary via is_login.
+    #[test]
+    fn repo_name_length_boundary() {
+        let n100 = format!("o/{}", "x".repeat(100));
+        let n101 = format!("o/{}", "x".repeat(101));
+        assert!(is_repo(&n100), "100-char name must be accepted");
+        assert!(!is_repo(&n101), "101-char name must be rejected");
+    }
+
+    // The scope-derived defaults are policy: issues() off / bots() on at
+    // working scope, and the reverse at project scope.
+    #[test]
+    fn scope_defaults_for_issues_and_bots() {
+        let w = parse(
+            r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"working"}]}"#,
+            "<test>",
+        )
+        .unwrap()
+        .repos[0]
+            .resolved();
+        assert!(!w.issues(), "working: issues() defaults off");
+        assert!(w.bots(), "working: bots() defaults on");
+
+        let p = parse(
+            r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"project"}]}"#,
+            "<test>",
+        )
+        .unwrap()
+        .repos[0]
+            .resolved();
+        assert!(p.issues(), "project: issues() defaults on");
+        assert!(!p.bots(), "project: bots() defaults off");
+    }
+
+    // The global defaults are a documented contract; a silent change is a
+    // regression (see the default_* fns and their rationale).
+    #[test]
+    fn defaults_match_documented_policy() {
+        let c = parse(r#"{"viewer":"v","repos":["o/n"]}"#, "<test>").unwrap();
+        assert_eq!(c.lookback_days, 90);
+        assert_eq!(c.reverify_open_days, 7);
+        assert_eq!(c.reverify_closed_days, 30);
+        assert_eq!(c.workers, 3);
+        assert_eq!(c.rate_limit_floor, 500);
+    }
+
+    // validate() must reject a malformed repo (not just a bad viewer) and the
+    // working-scope issue-stream error, and accept a clean config.
+    #[test]
+    fn validate_rejects_bad_repo_and_working_issues() {
+        assert!(
+            parse(r#"{"viewer":"v","repos":["bad repo"]}"#, "<test>").is_err(),
+            "a malformed repo must be rejected"
+        );
+        let e = parse(
+            r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"working","issues":true}]}"#,
+            "<test>",
+        )
+        .err()
+        .expect("issues:true at working scope must be rejected");
+        assert_eq!(e.code, crate::error::Code::Configuration);
+        assert!(
+            parse(
+                r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"project"}]}"#,
+                "<test>"
+            )
+            .is_ok(),
+            "a clean config must parse"
+        );
+    }
+
+    // exclude_authors are gated too: a malformed entry is rejected; a bare
+    // login and a [bot]-suffixed one are accepted.
+    #[test]
+    fn validate_checks_exclude_authors() {
+        assert!(
+            parse(
+                r#"{"viewer":"v","repos":[{"repo":"o/n","exclude_authors":["bad login"]}]}"#,
+                "<test>"
+            )
+            .is_err(),
+            "a malformed exclude_authors entry must be rejected"
+        );
+        assert!(
+            parse(
+                r#"{"viewer":"v","repos":[{"repo":"o/n","exclude_authors":["alice","dependabot[bot]"]}]}"#,
+                "<test>"
+            )
+            .is_ok(),
+            "valid exclude_authors (incl. [bot]) must be accepted"
+        );
+    }
+
+    // db_path honors an explicit override rather than deriving from XDG.
+    #[test]
+    fn db_path_uses_explicit_override() {
+        let c = parse(
+            r#"{"viewer":"v","repos":["o/n"],"db_path":"/tmp/ghgraph-x.db"}"#,
+            "<test>",
+        )
+        .unwrap();
+        assert_eq!(
+            c.db_path().unwrap(),
+            std::path::PathBuf::from("/tmp/ghgraph-x.db")
+        );
     }
 
     #[test]

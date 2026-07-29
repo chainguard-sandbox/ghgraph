@@ -37,7 +37,9 @@ TLS, or async crates: network transport is the `gh` CLI as a subprocess,
 which owns auth, SSO, and TLS. `gh` is a documented runtime prerequisite.
 `unsafe` is forbidden crate-wide. No time crate: timestamps are strict
 RFC 3339 UTC "Z" strings, validated at ingest by ~40 lines of std. The MSRV
-is 1.89, and exists for `std::fs::File::try_lock` (the sync run lock).
+is 1.95, set by the dependency tree: rusqlite and libsqlite3-sys use std's
+`cfg_select!` (stable since 1.95). Our own code needs only 1.89
+(`std::fs::File::try_lock`, the sync run lock); the deps dominate.
 
 The gh coupling is a seam, not a marriage: `gh::graphql()` is the entire
 transport surface, nothing else knows gh exists, and every semantic signal
