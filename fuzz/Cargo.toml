@@ -39,5 +39,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "identity_gate"
+path = "fuzz_targets/identity_gate.rs"
+test = false
+doc = false
+bench = false
+
 # Own workspace so the root `cargo build` never descends into the fuzz crate.
 [workspace]

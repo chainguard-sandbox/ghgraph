@@ -1,13 +1,17 @@
 #![no_main]
-//! Fuzz the config injection gate (`config::parse`).
+//! Fuzz the config injection gate end-to-end (`config::parse`).
 //!
-//! Two properties, over arbitrary UTF-8 input:
+//! The gate now lives in the identity newtypes' Deserialize impls
+//! (identity.rs; identity_gate fuzzes the constructors directly) — this
+//! target proves the whole config surface still composes to the same two
+//! properties, over arbitrary UTF-8 input:
 //!   1. `parse` never panics — total over every input.
-//!   2. The load-bearing one: no identifier the gate ACCEPTS may contain a
-//!      space or ':'. Those are the characters that could smuggle a second gh
-//!      search qualifier ("owner/name involves:someone-else"), and the whole
-//!      point of the gate is to make an accepted value safe to interpolate. If
-//!      the gate ever lets one through, this target produces the counterexample.
+//!   2. The load-bearing one: no identifier a parsed Config CARRIES may
+//!      contain a space or ':'. Those are the characters that could smuggle a
+//!      second gh search qualifier ("owner/name involves:someone-else"), and
+//!      the whole point of the types is that a carried value is safe to
+//!      interpolate. If serde plumbing ever routes around the constructors,
+//!      this target produces the counterexample.
 
 use libfuzzer_sys::fuzz_target;
 
@@ -23,21 +27,21 @@ fuzz_target!(|data: &[u8]| {
     let clean = |id: &str| {
         assert!(
             !id.contains(' ') && !id.contains(':'),
-            "gate accepted an identifier carrying a qualifier separator: {id:?}"
+            "config carries an identifier with a qualifier separator: {id:?}"
         );
     };
     // repo / viewer / people are interpolated into search qualifiers.
     for login in cfg.people.iter().chain([&cfg.viewer]) {
-        clean(login);
+        clean(login.as_str());
     }
     for entry in &cfg.repos {
         let rc = entry.resolved();
-        clean(&rc.repo);
+        clean(rc.repo.as_str());
         // exclude_authors is a filter today, not interpolated — checked as
-        // defense in depth. The [bot] suffix's brackets are allowed; only a
-        // space or ':' in the login core would be smuggling material.
+        // defense in depth ahead of the milestone-4 move to server-side
+        // `-author:x` terms.
         for a in &rc.exclude_authors {
-            clean(a.strip_suffix("[bot]").unwrap_or(a));
+            clean(a.login().as_str());
         }
     }
 });

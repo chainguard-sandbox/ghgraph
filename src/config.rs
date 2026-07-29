@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
+use crate::identity::{AuthorPattern, Login, RepoName};
 
 fn default_lookback_days() -> u32 {
     90
@@ -61,7 +62,7 @@ pub enum Scope {
 /// so the shape is closed (deny_unknown_fields) and every default is
 /// resolved in code, in one place, where a test can see it.
 pub enum RepoEntry {
-    Name(String),
+    Name(RepoName),
     Detailed(RepoConfig),
 }
 
@@ -82,7 +83,10 @@ impl<'de> Deserialize<'de> for RepoEntry {
                 f.write_str(r#"a repo string "owner/name" or a repo object"#)
             }
             fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<RepoEntry, E> {
-                Ok(RepoEntry::Name(v.to_string()))
+                // Route through RepoName's Deserialize so the bare-string and
+                // object forms share one validation and one error message.
+                RepoName::deserialize(serde::de::value::StrDeserializer::new(v))
+                    .map(RepoEntry::Name)
             }
             fn visit_map<A: serde::de::MapAccess<'de>>(
                 self,
@@ -99,8 +103,8 @@ impl<'de> Deserialize<'de> for RepoEntry {
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct RepoConfig {
-    /// "owner/name".
-    pub repo: String,
+    /// "owner/name", validated and case-folded by the RepoName newtype.
+    pub repo: RepoName,
     #[serde(default)]
     pub scope: Scope,
     /// Sync the repo's issue stream. Default: on at project scope, and
@@ -119,18 +123,20 @@ pub struct RepoConfig {
     #[serde(default)]
     bots: Option<bool>,
     /// Logins whose PRs are never ingested for this repo. Matching is one
-    /// function, called everywhere logins compare (milestone 1):
-    /// ASCII-case-insensitive; "x[bot]" matches login "x" with GraphQL
-    /// author type Bot (the API returns bare logins for bots — a literal
-    /// bracket match would never fire); bare "x" matches a User. Applied at
-    /// discovery (excluded PRs are skipped before hydration, so they cost
-    /// discovery only) and enforced at ingest. Filters govern ingest, never
-    /// deletion: excluding an author later does not touch their archived
-    /// rows. Note bot-typed authors are already excluded by default at
-    /// project scope — exclude_authors is for humans and for bots you have
-    /// opted back in via bots: true.
+    /// function (identity::AuthorPattern::matches, on identity::login_eq):
+    /// ASCII-case-insensitive; a bare "x" matches an author with login x of
+    /// EITHER type, User or Bot (excluding "dependabot" must filter the
+    /// dependabot bot — the rationale is recorded at AuthorPattern);
+    /// "x[bot]" NARROWS the match to GraphQL author type Bot (the API
+    /// returns bare logins for bots — a literal bracket match would never
+    /// fire). Applied at discovery (excluded PRs are skipped before
+    /// hydration, so they cost discovery only) and enforced at ingest.
+    /// Filters govern ingest, never deletion: excluding an author later
+    /// does not touch their archived rows. Note bot-typed authors are
+    /// already excluded by default at project scope — exclude_authors is
+    /// for humans and for bots you have opted back in via bots: true.
     #[serde(default)]
-    pub exclude_authors: Vec<String>,
+    pub exclude_authors: Vec<AuthorPattern>,
 }
 
 impl RepoConfig {
@@ -144,13 +150,12 @@ impl RepoConfig {
 }
 
 impl RepoEntry {
-    /// Shorthand → full form; defaults resolve here and nowhere else. The
-    /// repo is case-folded to lowercase: GitHub treats owner/name
-    /// case-insensitively, so folding at the boundary (and at API ingest)
-    /// keeps `Foo/Bar` and `foo/bar` from splitting the (repo, number) key
-    /// or tripping rename detection against the canonical `nameWithOwner`.
+    /// Shorthand → full form; defaults resolve here and nowhere else. Case
+    /// folding is RepoName's (construction folds to lowercase, so `Foo/Bar`
+    /// and `foo/bar` can never split the (repo, number) key — see
+    /// identity.rs).
     pub fn resolved(&self) -> RepoConfig {
-        let mut rc = match self {
+        match self {
             RepoEntry::Detailed(rc) => rc.clone(),
             RepoEntry::Name(name) => RepoConfig {
                 repo: name.clone(),
@@ -160,26 +165,24 @@ impl RepoEntry {
                 bots: None,
                 exclude_authors: Vec::new(),
             },
-        };
-        rc.repo = rc.repo.to_ascii_lowercase();
-        rc
+        }
     }
 }
 
-// `parse` is the only guarded constructor: it runs `validate` (the injection
-// gate) after deserializing. Config derives Deserialize with public identifier
-// fields, so a caller that bypasses `parse` — `serde_json::from_str::<Config>`
-// directly — obtains an UNVALIDATED value; here the gate is discipline, not
-// type. Every construction site today goes through `parse` (load, the tests,
-// the fuzz harness). The validating Login/RepoName newtypes (milestone 1) close
-// this for good by making an unvalidated identifier unrepresentable; until they
-// land this is a known, fenced gap — recorded here, not silent.
+// Deserialization IS validation: every identifier field is a newtype
+// (identity.rs) whose Deserialize impl runs the injection gate, so a caller
+// that bypasses `parse` — `serde_json::from_str::<Config>` directly — still
+// cannot obtain an unvalidated identifier. (Before milestone 1 this was a
+// known, fenced gap held by discipline; the direct-deserialize test below is
+// the closure's witness.) `parse` remains the entry point: it labels the
+// source and runs `validate`, which now carries only the CROSS-FIELD rules —
+// the per-identifier gate lives in the types.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// The operator's GitHub login. "my PRs" vs "PRs I review" derives from
     /// this at query time; it is never stored per row.
-    pub viewer: String,
+    pub viewer: Login,
     /// Repositories to sync; see RepoEntry.
     pub repos: Vec<RepoEntry>,
     /// GitHub logins to track in working-scope repos: collaborators or
@@ -188,7 +191,7 @@ pub struct Config {
     /// the operator's own; `attention` surfaces their unreviewed open PRs.
     /// Project-scope repos subsume this — everyone is already in.
     #[serde(default)]
-    pub people: Vec<String>,
+    pub people: Vec<Login>,
     /// Archive path. Default: $XDG_DATA_HOME/ghgraph/ghgraph.db.
     #[serde(default)]
     pub db_path: Option<PathBuf>,
@@ -225,7 +228,16 @@ fn home() -> Result<PathBuf> {
 }
 
 fn xdg_dir(var: &str, fallback: &str) -> Result<PathBuf> {
-    match env::var_os(var) {
+    resolve_xdg(env::var_os(var), fallback)
+}
+
+/// Pure policy half of [`xdg_dir`], split from the env read so the
+/// set/empty/unset cases are testable: mutating process env in tests would
+/// need `std::env::set_var`, which is `unsafe` in edition 2024 and unsafe is
+/// forbidden crate-wide. An empty XDG var is treated as unset, per the Base
+/// Directory spec.
+fn resolve_xdg(value: Option<std::ffi::OsString>, fallback: &str) -> Result<PathBuf> {
+    match value {
         Some(v) if !v.is_empty() => Ok(PathBuf::from(v)),
         _ => Ok(home()?.join(fallback)),
     }
@@ -256,84 +268,27 @@ pub fn parse(raw: &str, source: &str) -> Result<Config> {
     Ok(cfg)
 }
 
-/// The injection gate. Every identifier is interpolated into a GitHub search
-/// qualifier (queries.rs); a value containing a space or ':' could smuggle a
-/// second qualifier — "owner/name involves:someone-else" — so validate at the
-/// boundary. This charset gate is the interim; the validating RepoName/Login
-/// newtypes that make injection unrepresentable by type land in milestone 1.
+/// Cross-field validation. The per-identifier injection gate lives in the
+/// identity newtypes' Deserialize impls (identity.rs) — by the time a Config
+/// value exists, every identifier is validated — so what remains here are
+/// the rules that span fields.
 fn validate(cfg: &Config) -> Result<()> {
-    for login in cfg.people.iter().chain([&cfg.viewer]) {
-        if !is_login(login) {
-            return Err(Error::config(format!(
-                "login {login:?} is not a valid GitHub login \
-                 (letters, digits, interior hyphens; 1–39 chars)"
-            )));
-        }
-    }
     for entry in &cfg.repos {
         let rc = entry.resolved();
-        if !is_repo(&rc.repo) {
-            return Err(Error::config(format!(
-                "repo {:?} is not of the form owner/name",
-                rc.repo
-            )));
-        }
-        for a in &rc.exclude_authors {
-            if !is_exclude_author(a) {
-                return Err(Error::config(format!(
-                    "exclude_authors entry {a:?} is not a valid login (optionally with a [bot] suffix)"
-                )));
-            }
-        }
         if rc.scope == Scope::Working && rc.issues() {
             return Err(Error::config(format!(
                 "repo {:?}: linked issues are already cached at working scope; \
                  the issue *stream* requires scope: project",
-                rc.repo
+                rc.repo.as_str()
             )));
         }
     }
     Ok(())
 }
 
-fn is_login(s: &str) -> bool {
-    // GitHub logins are 1–39 chars of [A-Za-z0-9-] and may not begin or end
-    // with a hyphen. The leading/trailing-hyphen check is not injection defense
-    // (a hyphen smuggles no qualifier — space and ':' are excluded by the
-    // charset regardless); it keeps the gate's admitted set from being wider
-    // than GitHub's, so a bad login earns a clean CONFIGURATION message here
-    // instead of an opaque API rejection later.
-    !s.is_empty()
-        && s.len() <= 39
-        && s.bytes().next() != Some(b'-')
-        && s.bytes().next_back() != Some(b'-')
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-}
-
-fn is_repo(s: &str) -> bool {
-    match s.split_once('/') {
-        Some((owner, name)) => {
-            // owner is bounded to 39 by is_login; GitHub caps the name at 100.
-            // Bounding it here keeps the gate's admitted set aligned with
-            // GitHub's, same rationale as is_login's length cap.
-            is_login(owner)
-                && !name.is_empty()
-                && name.len() <= 100
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
-        }
-        None => false,
-    }
-}
-
-fn is_exclude_author(s: &str) -> bool {
-    is_login(s.strip_suffix("[bot]").unwrap_or(s))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{RepoEntry, is_exclude_author, is_login, is_repo, parse};
+    use super::{Config, RepoEntry, parse};
 
     // The public entry the fuzz harness uses: a config whose viewer would
     // smuggle a search qualifier is rejected end-to-end (serde + gate), not
@@ -363,74 +318,29 @@ mod tests {
         );
     }
 
-    // Repo is case-folded at the boundary so Foo/Bar and foo/bar are one key.
+    // Repo is case-folded at the boundary (by RepoName's constructor) so
+    // Foo/Bar and foo/bar are one key. The charset, boundary, and injection
+    // tests for the newtypes themselves live in identity.rs.
     #[test]
     fn repo_entry_lowercases() {
         let e: RepoEntry = serde_json::from_str(r#""Foo/Bar""#).unwrap();
-        assert_eq!(e.resolved().repo, "foo/bar");
+        assert_eq!(e.resolved().repo.as_str(), "foo/bar");
     }
 
-    // is_repo must reject malformed forms ("/owner/name", "owner//name",
-    // "owner/name/") and the ':'/space forms that could smuggle a second
-    // search qualifier — the reason the validation exists. A charset
-    // allowlist enforces both; a slash-count check would not.
+    // The closure witness for the pre-milestone-1 fenced gap (see the Config
+    // comment): bypassing parse() via serde directly can no longer yield an
+    // unvalidated identifier, because validation runs inside Deserialize.
     #[test]
-    fn repo_rejects_malformed_and_injection() {
-        for bad in [
-            "/owner/name",
-            "owner//name",
-            "owner/name/",
-            "owner",
-            "owner/",
-            "/name",
-            "",
-            "owner/na me",
-            "owner/na:me",
-            "owner/name involves:x",
-            "a/b is:issue",
-        ] {
-            assert!(!is_repo(bad), "should reject {bad:?}");
-        }
-        for ok in ["owner/name", "o/n", "owner/name.rs", "o-w/n_1"] {
-            assert!(is_repo(ok), "should accept {ok:?}");
-        }
-    }
-
-    #[test]
-    fn login_rejects_qualifier_injection() {
-        for bad in [
-            "me involves:target",
-            "a:b",
-            "has space",
-            "",
-            "-foo", // leading hyphen: GitHub disallows, and so does the gate
-            "bar-", // trailing hyphen: likewise
-            &"x".repeat(40),
-        ] {
-            assert!(!is_login(bad), "should reject {bad:?}");
-        }
-        assert!(is_login("octocat"));
-        assert!(is_login("a-b-1")); // interior hyphens are fine
-    }
-
-    // Pin the length boundary (GitHub logins max 39): a 39-char login is
-    // accepted, 40 is not. Without the lower assertion, relaxing `<= 39` to
-    // `< 39` would go unnoticed.
-    #[test]
-    fn login_length_boundary() {
-        assert!(is_login(&"x".repeat(39)), "39 chars must be accepted");
-        assert!(!is_login(&"x".repeat(40)), "40 chars must be rejected");
-    }
-
-    // Pin the repo-name length boundary (GitHub caps names at 100): a 100-char
-    // name is accepted, 101 is not. The owner half is already covered by
-    // login_length_boundary via is_login.
-    #[test]
-    fn repo_name_length_boundary() {
-        let n100 = format!("o/{}", "x".repeat(100));
-        let n101 = format!("o/{}", "x".repeat(101));
-        assert!(is_repo(&n100), "100-char name must be accepted");
-        assert!(!is_repo(&n101), "101-char name must be rejected");
+    fn direct_deserialize_cannot_bypass_the_gate() {
+        assert!(
+            serde_json::from_str::<Config>(r#"{"viewer":"me involves:target","repos":["o/n"]}"#)
+                .is_err(),
+            "an injection viewer must fail even without parse()"
+        );
+        assert!(
+            serde_json::from_str::<Config>(r#"{"viewer":"v","repos":["o/n is:issue"]}"#).is_err(),
+            "an injection repo must fail even without parse()"
+        );
     }
 
     // The scope-derived defaults are policy: issues() off / bots() on at
@@ -495,8 +405,9 @@ mod tests {
         );
     }
 
-    // exclude_authors are gated too: a malformed entry is rejected; a bare
-    // login and a [bot]-suffixed one are accepted.
+    // exclude_authors are gated too (by AuthorPattern's Deserialize): a
+    // malformed entry is rejected; a bare login and a [bot]-suffixed one are
+    // accepted. Matching semantics are tested in identity.rs.
     #[test]
     fn validate_checks_exclude_authors() {
         assert!(
@@ -517,6 +428,62 @@ mod tests {
         );
     }
 
+    // The shipped example config is the operator's template (and what
+    // `make config` installs); it must always pass the real gate.
+    #[test]
+    fn example_config_parses() {
+        parse(include_str!("../config.example.json"), "<example>")
+            .expect("config.example.json must parse");
+    }
+
+    // The XDG policy is pure and pinned: a set, nonempty var wins verbatim;
+    // empty and unset both fall back to $HOME/<fallback> (empty-is-unset per
+    // the Base Directory spec).
+    #[test]
+    fn resolve_xdg_set_empty_unset() {
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+        let home = super::home().expect("HOME is set in any test environment");
+        assert_eq!(
+            super::resolve_xdg(Some(OsString::from("/xdg")), ".config").unwrap(),
+            PathBuf::from("/xdg")
+        );
+        assert_eq!(
+            super::resolve_xdg(Some(OsString::new()), ".config").unwrap(),
+            home.join(".config")
+        );
+        assert_eq!(
+            super::resolve_xdg(None, ".config").unwrap(),
+            home.join(".config")
+        );
+    }
+
+    // The default paths are anchored, never relative: home() is the real
+    // $HOME and config_path(None) resolves under it (or under a real XDG
+    // dir), ending at the documented location.
+    #[test]
+    fn default_paths_are_absolute_and_named() {
+        let h = super::home().unwrap();
+        assert!(h.is_absolute(), "home must be absolute: {h:?}");
+        let p = super::config_path(None).unwrap();
+        assert!(p.is_absolute(), "config path must be absolute: {p:?}");
+        assert!(
+            p.ends_with("ghgraph/config.json"),
+            "documented location: {p:?}"
+        );
+    }
+
+    // A non-string, non-object repos entry earns the visitor's expecting
+    // message — the diagnosability the hand-written Deserialize exists for.
+    #[test]
+    fn repo_entry_wrong_type_names_expectation() {
+        let err = serde_json::from_str::<RepoEntry>("42")
+            .err()
+            .expect("should error")
+            .to_string();
+        assert!(err.contains("a repo string"), "should say what fits: {err}");
+    }
+
     // db_path honors an explicit override rather than deriving from XDG.
     #[test]
     fn db_path_uses_explicit_override() {
@@ -529,12 +496,5 @@ mod tests {
             c.db_path().unwrap(),
             std::path::PathBuf::from("/tmp/ghgraph-x.db")
         );
-    }
-
-    #[test]
-    fn exclude_author_admits_bot_suffix() {
-        assert!(is_exclude_author("dependabot[bot]"));
-        assert!(is_exclude_author("alice"));
-        assert!(!is_exclude_author("bad login[bot]"));
     }
 }
