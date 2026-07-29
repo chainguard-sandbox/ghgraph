@@ -86,7 +86,7 @@ impl fmt::Display for ParseError {
         let s = match self {
             ParseError::NotZulu => "not a Z-terminated UTC (RFC 3339) timestamp",
             ParseError::Malformed => "malformed RFC 3339 timestamp",
-            ParseError::OutOfRange => "RFC 3339 timestamp field out of range",
+            ParseError::OutOfRange => "RFC 3339 timestamp field outside the accepted range",
         };
         f.write_str(s)
     }
@@ -188,7 +188,7 @@ impl Rfc3339Utc {
     /// This instant minus `days` days (the re-verify tiers are built this way).
     /// `None` on overflow or if the result falls out of the representable range.
     pub fn checked_sub_days(&self, days: u32) -> Option<Rfc3339Utc> {
-        let delta = (days as i64).checked_mul(86_400)?;
+        let delta = i64::from(days).checked_mul(86_400)?;
         Rfc3339Utc::from_epoch(self.epoch.checked_sub(delta)?)
     }
 
@@ -389,6 +389,9 @@ mod tests {
             "20260724T135900Z",     // missing separators
             "2026-07-24 13:59:00Z", // space where the 'T' separator must be (pos 10)
             "2026-07-24T13:59:00",  // no zone at all (too short)
+            "2026-07-24t13:59:00Z", // lowercase 't': RFC §5.6 permits it, we
+            // decline -> Malformed (b[10] != 'T'). The z side of this documented
+            // narrowing is pinned in rejects_non_zulu_forms; this is the t side.
             // Exactly ONE separator wrong, the rest correct — each isolates a
             // single clause of the separator check (pos 10 covered above), so a
             // mutation that weakens one `||` to `&&` produces a mis-parse here.
@@ -468,17 +471,25 @@ mod tests {
     fn canonical_charset_is_bounded() {
         // The injection-safety argument (A3) depends on the canonical form
         // staying within [0-9:TZ-] — no whitespace, no ':' outside HH:MM:SS.
-        // epoch_arith fuzzes this same predicate over accepted values across all
-        // of i64 (where extreme epochs could otherwise widen a field); this pins
-        // it as a fast, always-run unit assertion.
-        let t = Rfc3339Utc::parse("2026-07-24T13:59:00Z").unwrap();
-        assert!(
-            t.as_str()
-                .bytes()
-                .all(|c| matches!(c, b'0'..=b'9' | b':' | b'T' | b'Z' | b'-')),
-            "canonical form must stay within [0-9:TZ-], got {:?}",
-            t.as_str()
-        );
+        // Check representative values AND the domain boundaries, where an extreme
+        // epoch could otherwise widen or sign-prefix a field. (epoch_arith fuzzes
+        // this same predicate over accepted values across all of i64; this pins
+        // the boundaries as a fast, always-run unit assertion.)
+        let samples = [
+            Rfc3339Utc::parse("2026-07-24T13:59:00Z").unwrap(),
+            Rfc3339Utc::from_epoch(0).unwrap(), // 1970-01-01
+            Rfc3339Utc::parse("0001-01-01T00:00:00Z").unwrap(), // min year
+            Rfc3339Utc::parse("9999-12-31T23:59:59Z").unwrap(), // max year
+        ];
+        for t in samples {
+            assert!(
+                t.as_str()
+                    .bytes()
+                    .all(|c| matches!(c, b'0'..=b'9' | b':' | b'T' | b'Z' | b'-')),
+                "canonical form must stay within [0-9:TZ-], got {:?}",
+                t.as_str()
+            );
+        }
     }
 
     #[test]
@@ -543,6 +554,13 @@ mod tests {
             !format!("{err}").contains("involves"),
             "error must not carry the offending input"
         );
+        // Debug is an error surface too (tracing events, unwrap panics); it must
+        // not leak the input either. Fieldless enum today, so this holds by
+        // construction — pin it against a future hand-rolled Debug.
+        assert!(
+            !format!("{err:?}").contains("involves"),
+            "Debug must not carry the offending input either"
+        );
     }
 
     #[test]
@@ -563,7 +581,7 @@ mod tests {
         );
         assert_eq!(
             format!("{}", ParseError::OutOfRange),
-            "RFC 3339 timestamp field out of range"
+            "RFC 3339 timestamp field outside the accepted range"
         );
         // Equality is by instant: distinct instants must NOT compare equal. Every
         // other test asserts equality of EQUAL values, which an eq that always
