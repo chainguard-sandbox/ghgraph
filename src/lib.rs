@@ -24,3 +24,4 @@ pub mod queries;
 pub mod refs;
 pub mod report;
 pub mod sync;
+pub mod time;
