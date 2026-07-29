@@ -4,10 +4,35 @@
 //! `2026-07-24T13:59:00Z`, occasionally with a fractional-second part. This
 //! module accepts exactly that shape and nothing else: [`Rfc3339Utc::parse`] is
 //! Z-only and total — every input either produces a canonical value or a
-//! [`ParseError`], never a mis-parse. Offsets (`+00:00`), a lowercase `z`, a
-//! space separator, out-of-range fields, and calendar-invalid dates are all
-//! refused. A fractional part is accepted and truncated to whole seconds (the
-//! archive's granularity; the watermark overlap window is minutes wide).
+//! [`ParseError`], never a mis-parse. A non-`Z` terminator, a space separator,
+//! out-of-range or calendar-invalid fields, and the RFC-permitted forms listed
+//! under "Divergences" below are all refused. A fractional part is accepted and
+//! truncated to whole seconds (the archive's granularity; the watermark overlap
+//! window is minutes wide).
+//!
+//! Divergences from RFC 3339 §5.6, every one in the SAFE direction: `parse`
+//! accepts a strict SUBSET of the grammar — for each field, the values it
+//! admits are a subset of what the RFC admits — so it can never accept a string
+//! the RFC rejects; it only declines valid-but-unwanted forms. Each narrowing
+//! is sound only because the sole input is GitHub's API, which emits
+//! uppercase-`Z`, offset-free, leap-second-free, four-digit-year timestamps. If
+//! that input source ever broadens, revisit these — the offset and leap-second
+//! cases especially:
+//!   * Lowercase `t`/`z`: RFC §5.6 permits them ("the 'T' and 'Z' characters
+//!     ... may alternatively be lower case"); we require uppercase (`t` falls
+//!     out as `Malformed`, `z` as `NotZulu`).
+//!   * Numeric offsets (`±HH:MM`), including `+00:00` and the semantically
+//!     distinct `-00:00` ("offset to local time is unknown"): RFC permits them;
+//!     we take `Z` only. A general parser would normalize an offset to UTC; we
+//!     do not, because we never receive one.
+//!   * Leap second `:60`: RFC §5.6 explicitly permits `time-second` = 60 "at
+//!     the end of months in which a leap second occurs"; we reject it as
+//!     `OutOfRange`. Unix epoch seconds cannot represent a leap second and
+//!     GitHub does not emit one — declining is a policy choice, not the value
+//!     being invalid per the RFC.
+//!   * Year `0000`: the RFC's `4DIGIT` admits it syntactically; we require
+//!     `0001..=9999` so the canonical form stays fixed-width and
+//!     lexicographically ordered (see below).
 //!
 //! Why a newtype and not a bare String:
 //!   * The stored form is CANONICAL and fixed-width (`YYYY-MM-DDTHH:MM:SSZ`, 20
@@ -390,7 +415,7 @@ mod tests {
             "2026-02-29T00:00:00Z", // Feb 29 in a non-leap year
             "2026-07-24T24:00:00Z", // hour 24
             "2026-07-24T13:60:00Z", // minute 60
-            "2026-07-24T13:59:60Z", // second 60 (no leap seconds)
+            "2026-07-24T13:59:60Z", // second 60: a leap second, permitted by RFC 3339 §5.6 but deliberately declined (see module docs)
             "0000-01-01T00:00:00Z", // year 0
         ] {
             assert_eq!(
