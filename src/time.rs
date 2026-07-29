@@ -250,6 +250,15 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 // i64 for every representable year; no floating point.
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
+    // The `else` (y < 0) arm is Hinnant's negative-year handling, kept for
+    // fidelity to the published algorithm — but it is UNREACHABLE here:
+    // `parse` range-checks year ∈ 1..=9999 before calling this, so y is 0 (only
+    // for Jan/Feb of year 1) or positive, never negative. `civil_from_days` is
+    // the direction that meets negative inputs (via `from_epoch`), and its own
+    // negative arm IS exercised (from_epoch_rejects_every_instant_below_year_one).
+    // Mutations to `y - 399` therefore survive as EQUIVALENT mutants: no
+    // representable date reaches this branch, and the exhaustive civil test
+    // covers only y ≥ 0. Left documented rather than annotated-away.
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
     let yoe = y - era * 400; // [0, 399]
     let mp = if month > 2 { month - 3 } else { month + 9 }; // Mar=0 .. Feb=11
@@ -353,8 +362,15 @@ mod tests {
             "2026-07-24",
             "not-a-date-at-all!!",
             "20260724T135900Z",     // missing separators
-            "2026-07-24 13:59:00Z", // space where the 'T' separator must be
+            "2026-07-24 13:59:00Z", // space where the 'T' separator must be (pos 10)
             "2026-07-24T13:59:00",  // no zone at all (too short)
+            // Exactly ONE separator wrong, the rest correct — each isolates a
+            // single clause of the separator check (pos 10 covered above), so a
+            // mutation that weakens one `||` to `&&` produces a mis-parse here.
+            "2026x07-24T13:59:00Z", // pos 4: '-' -> 'x'
+            "2026-07x24T13:59:00Z", // pos 7
+            "2026-07-24T13x59:00Z", // pos 13
+            "2026-07-24T13:59x00Z", // pos 16
         ] {
             assert_eq!(
                 Rfc3339Utc::parse(s),
@@ -370,6 +386,7 @@ mod tests {
             "2026-13-01T00:00:00Z", // month 13
             "2026-00-01T00:00:00Z", // month 0
             "2026-07-32T00:00:00Z", // day 32
+            "2026-07-00T00:00:00Z", // day 0 (the only input caught solely by `day < 1`)
             "2026-02-29T00:00:00Z", // Feb 29 in a non-leap year
             "2026-07-24T24:00:00Z", // hour 24
             "2026-07-24T13:60:00Z", // minute 60
@@ -472,5 +489,50 @@ mod tests {
             !format!("{err}").contains("involves"),
             "error must not carry the offending input"
         );
+    }
+
+    #[test]
+    fn display_renders_and_eq_discriminates() {
+        // Display must render the canonical string, not a write-nothing no-op:
+        // as_str() is what the tests usually read, so `{}` needs its own witness.
+        let t = Rfc3339Utc::parse("2026-07-24T13:59:00Z").unwrap();
+        assert_eq!(format!("{t}"), "2026-07-24T13:59:00Z");
+        assert_eq!(format!("{t}"), t.as_str());
+        // Each ParseError variant Displays a specific, non-empty message.
+        assert_eq!(
+            format!("{}", ParseError::NotZulu),
+            "not a Z-terminated UTC (RFC 3339) timestamp"
+        );
+        assert_eq!(
+            format!("{}", ParseError::Malformed),
+            "malformed RFC 3339 timestamp"
+        );
+        assert_eq!(
+            format!("{}", ParseError::OutOfRange),
+            "RFC 3339 timestamp field out of range"
+        );
+        // Equality is by instant: distinct instants must NOT compare equal. Every
+        // other test asserts equality of EQUAL values, which an eq that always
+        // returned true would satisfy; this is the discriminating case.
+        let other = Rfc3339Utc::parse("2026-07-24T14:00:00Z").unwrap();
+        assert_ne!(t, other);
+    }
+
+    #[test]
+    fn from_epoch_rejects_every_instant_below_year_one() {
+        // Every instant before 0001-01-01 is unrepresentable and must yield None
+        // — the year guard decides this regardless of the civil-conversion
+        // internals. The scan crosses the point where civil_from_days's day
+        // count goes negative (~306 days before year 1), exercising its
+        // negative-day branch: no arithmetic slip there may turn a below-range
+        // instant into an accepted (Some) one.
+        let year_one = Rfc3339Utc::parse("0001-01-01T00:00:00Z").unwrap().epoch();
+        for d in 1..=1000i64 {
+            let secs = year_one - d * 86_400;
+            assert!(
+                Rfc3339Utc::from_epoch(secs).is_none(),
+                "instant {d} days before year 1 must be unrepresentable"
+            );
+        }
     }
 }
