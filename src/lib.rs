@@ -21,6 +21,7 @@ pub mod db;
 pub mod error;
 pub mod gh;
 pub mod identity;
+pub mod parse;
 pub mod queries;
 pub mod refs;
 pub mod report;

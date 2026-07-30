@@ -29,10 +29,10 @@
 //! this module. The `Deserialize` impls DO name the offending value — the
 //! config file is the operator's own text, and config errors name the entry
 //! and field by contract (DESIGN.md, Config). That echo is licensed ONLY by
-//! that precondition: ingest parse types (milestone 2) must carry API logins
-//! as plain data fields — stored as received, compared via [`login_eq`] —
-//! never deserialized through these impls, or third-party text lands in a
-//! CONFIGURATION message.
+//! that precondition: the ingest parse types carry API logins as plain data
+//! (`parse::ApiLogin` — stored as received, compared via [`login_eq`], no
+//! `Display`) and never deserialize through these impls, or third-party text
+//! would land in a CONFIGURATION message.
 
 use std::fmt;
 
@@ -177,8 +177,11 @@ pub fn is_bot(author_typename: &str) -> bool {
 /// bare semantics — bare-means-User cannot come back without reintroducing
 /// the silent under-filter.
 ///
-/// A deleted account (`author: null`) has no login and matches no pattern:
-/// that is ordinary data, never a filter hit (queries.rs, hydration notes).
+/// A null author has no login and matches no pattern: ordinary data, never
+/// a filter hit (queries.rs, hydration notes). Note the cause is not
+/// deletion — a deleted user renders as the `ghost` User, which HAS a login
+/// and can be excluded like any other; the observed null-author case is a
+/// legacy account converted to an Organization (parse.rs).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorPattern {
     login: Login,

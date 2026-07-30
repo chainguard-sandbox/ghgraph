@@ -1,0 +1,138 @@
+{
+  "data": {
+    "node": {
+      "author": {
+        "__typename": "User",
+        "databaseId": 37270480,
+        "login": "tommaso-moro"
+      },
+      "authorAssociation": "CONTRIBUTOR",
+      "baseRefName": "trunk",
+      "body": "## Summary\n- add Grok as a supported `gh skill` agent host\n- install project and user skills in `.grok/skills`\n\nFixes #13846",
+      "closedAt": "2026-07-13T10:27:31Z",
+      "closingIssuesReferences": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "databaseId": 84431724,
+              "login": "beingminimal"
+            },
+            "authorAssociation": "NONE",
+            "body": "Here is a draft for your GitHub feature request, structured exactly as you requested.\n\n---\n\n### Describe the feature or problem you’d like to solve\n\nWith the release of Grok Build, x.ai introduced native support for \"Skills\"—reusable folders containing markdown instructions, script files, and resources that help guide agent behavior. Currently, the `gh skill` CLI command extension does not recognize or support provisioning, managing, or interacting with Grok Build's custom skills structure (`.grok/skills/` or `~/.grok/skills/`).\n\nAs developers adopt Grok Build, managing these system-specific agent skills alongside existing workflows within GitHub CLI would streamline project onboarding and automation.\n\n### Proposed solution\n\nWe should update `gh skill` to detect, configure, and manage Grok Build skill folders. This will benefit the CLI and its users by:\n\n* **Providing unified agent management:** Allowing users to create, view, or link project-specific agent instructions directly via the CLI into the expected `.grok/skills/` paths.\n* **Streamlining workflow setup:** Enabling automated scaffolding of `.grok/` configuration trees when initializing repositories or adding agent-based development workflows.\n* **Slash-command parity:** Aligning with Grok's native capability where custom local skills dynamically surface as user-invocable slash commands (`/<skill-name>`).\n\n### Additional context\n\nThe core architectural specifications for how Grok handles skills, plugins, and configuration structures can be found directly in the official x.ai documentation:\n[https://docs.x.ai/build/features/skills-plugins-marketplaces#skills](https://docs.x.ai/build/features/skills-plugins-marketplaces#skills)\n\n**Key Discovery Details from x.ai Docs:**\n\n* Local repo skills are walked up to the repository root via: `./.grok/skills/`\n* Global user-level skills reside at: `~/.grok/skills/`\n* Grok also features deep backward compatibility with `~/.agents/skills/` and Claude Code rules, which `gh skill` could potentially map to or utilize as a fallback translation layer during local environment setup.",
+            "id": "I_kwDODKw3uc8AAAABIbJqJA",
+            "number": 13846,
+            "repository": {
+              "nameWithOwner": "cli/cli"
+            },
+            "state": "CLOSED",
+            "title": "feat: Add Grok Build skills directory support to gh skill",
+            "updatedAt": "2026-07-13T10:27:32Z",
+            "url": "https://github.com/cli/cli/issues/13846"
+          }
+        ],
+        "totalCount": 1
+      },
+      "comments": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "commits": {
+        "nodes": [
+          {
+            "commit": {
+              "committedDate": "2026-07-13T10:09:24Z",
+              "oid": "37f5259f27c655d88804e60d6ac21acb9cadd4cb"
+            }
+          }
+        ]
+      },
+      "createdAt": "2026-07-13T10:05:39Z",
+      "headRefName": "tommaso-moro-add-grok-skill-host",
+      "id": "PR_kwDODKw3uc7xAi-o",
+      "isDraft": false,
+      "latestOpinionatedReviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "databaseId": 36728931,
+              "login": "babakks"
+            },
+            "authorAssociation": "MEMBER",
+            "state": "APPROVED",
+            "submittedAt": "2026-07-13T10:12:08Z"
+          }
+        ],
+        "totalCount": 1
+      },
+      "mergedAt": "2026-07-13T10:27:31Z",
+      "number": 13864,
+      "repository": {
+        "nameWithOwner": "cli/cli"
+      },
+      "reviewDecision": "APPROVED",
+      "reviewRequests": {
+        "nodes": [
+          {
+            "requestedReviewer": null
+          },
+          {
+            "requestedReviewer": {
+              "login": "BagToad"
+            }
+          }
+        ],
+        "totalCount": 2
+      },
+      "reviewThreads": {
+        "nodes": [
+          {
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "Bot",
+                    "databaseId": 175728472,
+                    "login": "copilot-pull-request-reviewer"
+                  },
+                  "authorAssociation": "CONTRIBUTOR",
+                  "body": "The help text says it \"Scans all known agent host directories\" but then lists only a handful of examples in parentheses. Since the registry includes many more supported hosts, this wording is misleading; consider removing the incomplete list or marking it as examples.",
+                  "createdAt": "2026-07-13T10:07:45Z",
+                  "id": "PRRC_kwDODKw3uc7UxfCI",
+                  "isMinimized": false,
+                  "lastEditedAt": null,
+                  "url": "https://github.com/cli/cli/pull/13864#discussion_r3569741960"
+                }
+              ],
+              "totalCount": 1
+            },
+            "id": "PRRT_kwDODKw3uc6QWWXy",
+            "isOutdated": true,
+            "isResolved": true,
+            "line": null,
+            "path": "pkg/cmd/skills/update/update.go"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wNy0xM1QxMDowNzo0NVrOkFll8g==",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "state": "MERGED",
+      "title": "Add Grok skill host support",
+      "updatedAt": "2026-07-13T10:27:33Z",
+      "url": "https://github.com/cli/cli/pull/13864"
+    },
+    "rateLimit": {
+      "cost": 1,
+      "remaining": 4822,
+      "resetAt": "2026-07-30T22:01:39Z"
+    }
+  }
+}

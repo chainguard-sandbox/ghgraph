@@ -1,0 +1,86 @@
+{
+  "data": {
+    "node": {
+      "author": {
+        "__typename": "User",
+        "databaseId": 10137,
+        "login": "ghost"
+      },
+      "authorAssociation": "CONTRIBUTOR",
+      "baseRefName": "12.x",
+      "body": "- Change: [cnpAPI v12.49]: New simple element 'preferredCustomer' of type 'boolean' is added in  'authorization' and 'sale' request.\r\n- Change: [cnpAPI v12.49]: New simple element 'preferredCustomerDecision' of type 'boolean' is added in Authorization and sale response.\r\n- Change: [cnpAPI v12.49]: New complex element 'tlid' is added in sale response.\r\n- Change: [cnpAPI v12.49]: In existing enum 'tlidValidationActionIndicatorType'  new value \"3\" is added.\r\n- Change: [cnpAPI v12.49]: for existing request \"reserveCredit\" base type is changed from 'transactionTypeWithReportGroupAndRtp' to 'transactionTypeWithReportGroup'\r\n",
+      "closedAt": "2026-02-19T08:54:22Z",
+      "closingIssuesReferences": {
+        "nodes": [],
+        "totalCount": 0
+      },
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Mannequin",
+              "login": "mishravinod202"
+            },
+            "authorAssociation": "MANNEQUIN",
+            "body": "Merging changes!",
+            "createdAt": "2026-02-19T08:53:44Z",
+            "id": "IC_kwDOSbh2Nc8AAAABCDDtwA",
+            "isMinimized": false,
+            "lastEditedAt": null,
+            "url": "https://github.com/worldpay-saml/vantiv-sdk-for-python/pull/44#issuecomment-4432391616"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAAQgw7cA=",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "commits": {
+        "nodes": [
+          {
+            "commit": {
+              "committedDate": "2026-02-19T08:52:31Z",
+              "oid": "1a92544c5767648d47121dfee29c7018d0850bc9"
+            }
+          }
+        ]
+      },
+      "createdAt": "2026-02-17T05:33:44Z",
+      "headRefName": "V12.49",
+      "id": "PR_kwDOSbh2Nc7av-g3",
+      "isDraft": false,
+      "latestOpinionatedReviews": {
+        "nodes": [],
+        "totalCount": 0
+      },
+      "mergedAt": "2026-02-19T08:54:22Z",
+      "number": 44,
+      "repository": {
+        "nameWithOwner": "worldpay-saml/vantiv-sdk-for-python"
+      },
+      "reviewDecision": null,
+      "reviewRequests": {
+        "nodes": [],
+        "totalCount": 0
+      },
+      "reviewThreads": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "MERGED",
+      "title": "sdk upgrade for V12.49",
+      "updatedAt": "2026-05-12T15:58:08Z",
+      "url": "https://github.com/worldpay-saml/vantiv-sdk-for-python/pull/44"
+    },
+    "rateLimit": {
+      "cost": 1,
+      "remaining": 4820,
+      "resetAt": "2026-07-30T22:01:39Z"
+    }
+  }
+}

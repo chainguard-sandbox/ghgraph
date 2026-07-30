@@ -16,6 +16,12 @@ repository = "https://github.com/chainguard-sandbox/ghgraph"
 keywords = ["github", "cli", "sqlite", "pull-requests"]
 categories = ["command-line-utilities", "development-tools"]
 
+# `harness` gates the Serialize derives on the parse types (src/parse.rs):
+# only the fuzz workspace enables it, so shipped builds cannot serialize
+# API-derived data even by accident — the claim is a compile error, not prose.
+[features]
+harness = []
+
 # Dependency policy: every entry justified here, tree audited with `cargo vet`.
 # Network transport is the `gh` CLI as a subprocess — auth, SSO, retries, and
 # TLS are gh's problem, so no HTTP or TLS crates appear below.

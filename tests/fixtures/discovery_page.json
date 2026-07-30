@@ -1,0 +1,418 @@
+{
+  "data": {
+    "rateLimit": {
+      "cost": 1,
+      "remaining": 4823,
+      "resetAt": "2026-07-30T22:01:39Z"
+    },
+    "search": {
+      "issueCount": 51,
+      "nodes": [
+        {
+          "author": {
+            "__typename": "User",
+            "login": "BagToad"
+          },
+          "id": "PR_kwDODKw3uc73rj6E",
+          "updatedAt": "2026-07-30T20:20:05Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "williammartin"
+          },
+          "id": "PR_kwDODKw3uc73fure",
+          "updatedAt": "2026-07-30T18:20:26Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "williammartin"
+          },
+          "id": "PR_kwDODKw3uc74mB2N",
+          "updatedAt": "2026-07-30T15:26:17Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "williammartin"
+          },
+          "id": "PR_kwDODKw3uc73eheT",
+          "updatedAt": "2026-07-30T14:24:16Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "maxbeizer"
+          },
+          "id": "PR_kwDODKw3uc7VfEvu",
+          "updatedAt": "2026-07-30T13:47:33Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "tommaso-moro"
+          },
+          "id": "PR_kwDODKw3uc716bwB",
+          "updatedAt": "2026-07-30T13:43:55Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "williammartin"
+          },
+          "id": "PR_kwDODKw3uc73cO0l",
+          "updatedAt": "2026-07-30T13:34:08Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "tidy-dev"
+          },
+          "id": "PR_kwDODKw3uc74C2tf",
+          "updatedAt": "2026-07-30T13:05:10Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "williammartin"
+          },
+          "id": "PR_kwDODKw3uc73bPq7",
+          "updatedAt": "2026-07-30T12:58:35Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "williammartin"
+          },
+          "id": "PR_kwDODKw3uc73YX3c",
+          "updatedAt": "2026-07-30T11:46:04Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "BagToad"
+          },
+          "id": "PR_kwDODKw3uc73tVtB",
+          "updatedAt": "2026-07-30T11:19:15Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "williammartin"
+          },
+          "id": "PR_kwDODKw3uc74cI15",
+          "updatedAt": "2026-07-30T09:31:07Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "tidy-dev"
+          },
+          "id": "PR_kwDODKw3uc71jKC6",
+          "updatedAt": "2026-07-29T14:38:50Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "tidy-dev"
+          },
+          "id": "PR_kwDODKw3uc71e-q8",
+          "updatedAt": "2026-07-29T14:38:09Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "tommaso-moro"
+          },
+          "id": "PR_kwDODKw3uc73afq3",
+          "updatedAt": "2026-07-29T10:05:57Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "naufalfx805-source"
+          },
+          "id": "PR_kwDODKw3uc714n4B",
+          "updatedAt": "2026-07-29T05:01:48Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc728tdv",
+          "updatedAt": "2026-07-28T10:12:24Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc728s-q",
+          "updatedAt": "2026-07-28T10:11:43Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc728s05",
+          "updatedAt": "2026-07-28T10:10:02Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc728lWH",
+          "updatedAt": "2026-07-28T10:09:25Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "1fanwang"
+          },
+          "id": "PR_kwDODKw3uc73VB6F",
+          "updatedAt": "2026-07-28T08:36:28Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "Solaris-star"
+          },
+          "id": "PR_kwDODKw3uc71b0v8",
+          "updatedAt": "2026-07-28T05:01:06Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "offbyone"
+          },
+          "id": "PR_kwDODKw3uc71_X5n",
+          "updatedAt": "2026-07-27T14:52:35Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc728r49",
+          "updatedAt": "2026-07-27T14:15:28Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc728lgo",
+          "updatedAt": "2026-07-27T14:12:07Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc7142eq",
+          "updatedAt": "2026-07-27T11:17:17Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "williammartin"
+          },
+          "id": "PR_kwDODKw3uc710bt7",
+          "updatedAt": "2026-07-24T17:57:10Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc7143gR",
+          "updatedAt": "2026-07-24T14:24:10Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "alondahari"
+          },
+          "id": "PR_kwDODKw3uc71VtFy",
+          "updatedAt": "2026-07-24T14:22:05Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc71Z-6a",
+          "updatedAt": "2026-07-24T09:24:39Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc71Z2O8",
+          "updatedAt": "2026-07-24T09:24:13Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "fzipi"
+          },
+          "id": "PR_kwDODKw3uc71nDuB",
+          "updatedAt": "2026-07-23T23:23:38Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "dhaneshdutta"
+          },
+          "id": "PR_kwDODKw3uc71ixen",
+          "updatedAt": "2026-07-23T19:55:23Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc7086OZ",
+          "updatedAt": "2026-07-22T16:32:07Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "angelg84"
+          },
+          "id": "PR_kwDODKw3uc7089OH",
+          "updatedAt": "2026-07-22T15:48:15Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "williammartin"
+          },
+          "id": "PR_kwDODKw3uc7070D2",
+          "updatedAt": "2026-07-22T15:43:31Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc7059As",
+          "updatedAt": "2026-07-22T14:28:19Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc7058Gj",
+          "updatedAt": "2026-07-22T14:13:54Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "pstoeckle"
+          },
+          "id": "PR_kwDODKw3uc70z9wR",
+          "updatedAt": "2026-07-22T11:00:31Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc70ZWro",
+          "updatedAt": "2026-07-22T09:21:27Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc70ZWoj",
+          "updatedAt": "2026-07-22T09:17:27Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc70ZVx5",
+          "updatedAt": "2026-07-22T09:08:11Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc70ZWNv",
+          "updatedAt": "2026-07-22T09:05:21Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc70ZVr_",
+          "updatedAt": "2026-07-22T09:03:30Z"
+        },
+        {
+          "author": {
+            "__typename": "Bot",
+            "login": "dependabot"
+          },
+          "id": "PR_kwDODKw3uc70ZVii",
+          "updatedAt": "2026-07-22T09:02:45Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "kobihikri"
+          },
+          "id": "PR_kwDODKw3uc7x-KvU",
+          "updatedAt": "2026-07-21T15:32:00Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "babakks"
+          },
+          "id": "PR_kwDODKw3uc7U9Vc9",
+          "updatedAt": "2026-07-21T14:51:07Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "dsanders11"
+          },
+          "id": "PR_kwDODKw3uc7M4C9c",
+          "updatedAt": "2026-07-21T00:32:56Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "williammartin"
+          },
+          "id": "PR_kwDODKw3uc7ebM1g",
+          "updatedAt": "2026-07-13T16:06:23Z"
+        },
+        {
+          "author": {
+            "__typename": "User",
+            "login": "williammartin"
+          },
+          "id": "PR_kwDODKw3uc7WxuA7",
+          "updatedAt": "2026-07-02T20:39:36Z"
+        }
+      ],
+      "pageInfo": {
+        "endCursor": "Y3Vyc29yOjUw",
+        "hasNextPage": true
+      }
+    }
+  }
+}
