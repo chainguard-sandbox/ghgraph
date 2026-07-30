@@ -1,0 +1,173 @@
+{
+  "data": {
+    "node": {
+      "author": {
+        "__typename": "User",
+        "databaseId": 37270480,
+        "login": "tommaso-moro"
+      },
+      "authorAssociation": "CONTRIBUTOR",
+      "baseRefName": "trunk",
+      "body": "Fixes #13986\n\n- Replace the `windsurf` agent entry with `devin`\n- Install Devin skills in `.devin/skills` at project and user scope\n- Update install help text and registry tests\n\n## Testing\n\n- `go test ./internal/skills/... ./pkg/cmd/skills/...`",
+      "closedAt": "2026-07-29T10:05:19Z",
+      "closingIssuesReferences": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "databaseId": 1701557,
+              "login": "skarim"
+            },
+            "authorAssociation": "NONE",
+            "body": "### Describe the feature or problem you’d like to solve\n\nThe [Cognition](https://cognition.com/) team reached our asking to replace \"Windsurf\" with \"Devin\" in the list of agents, since Cognition has acquired Windsurf and rebranded the app to Devin.\n\nThe install path for any skill files should also be updated to `.devin/skills/`\n\n### Proposed solution\n\n- Rename \"Windsurf\" to \"Devin\" in the list of agents\n- Ensure this installs skill files in `.devin/skills/`\n\n### Additional context\n\nThe rebrand / renaming is documented here: https://docs.devin.ai/desktop/devin-desktop-faq\n",
+            "id": "I_kwDODKw3uc8AAAABKecQuQ",
+            "number": 13986,
+            "repository": {
+              "nameWithOwner": "cli/cli"
+            },
+            "state": "CLOSED",
+            "title": "Update Windsurf to Devin in `gh skill` agent list",
+            "updatedAt": "2026-07-29T10:51:08Z",
+            "url": "https://github.com/cli/cli/issues/13986"
+          }
+        ],
+        "totalCount": 1
+      },
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "databaseId": 1701557,
+              "login": "skarim"
+            },
+            "authorAssociation": "NONE",
+            "body": "Ran this by the Cognition team (makers of Devin / Windsurf), and they said this looks good to them ✅ \r\n\r\n> Should this actually remove `windsurf`? Are there still users out there you might be using windsurf and not updating?\r\n\r\nThey confirmed that most users have updated to \"Devin,\" so no need to keep around the legacy \"Windsurf\" option anymore.",
+            "createdAt": "2026-07-28T17:56:43Z",
+            "id": "IC_kwDODKw3uc8AAAABMHL0mw",
+            "isMinimized": false,
+            "lastEditedAt": null,
+            "url": "https://github.com/cli/cli/pull/13987#issuecomment-5107807387"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "databaseId": 1611510,
+              "login": "williammartin"
+            },
+            "authorAssociation": "MEMBER",
+            "body": "It is technically a breaking change for anyone who did in a script `gh skill install --agent windsurf`. Might be worth a quick check on code search. Probably not a huge deal though.",
+            "createdAt": "2026-07-28T18:18:29Z",
+            "id": "IC_kwDODKw3uc8AAAABMHaj5w",
+            "isMinimized": false,
+            "lastEditedAt": null,
+            "url": "https://github.com/cli/cli/pull/13987#issuecomment-5108048871"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "databaseId": 47394200,
+              "login": "BagToad"
+            },
+            "authorAssociation": "MEMBER",
+            "body": "@williammartin FWIW, `gh skill` is labelled as preview, so I'm fine with this change:\r\n\r\n\r\n```\r\ngh skill --help\r\n...\r\nWorking with agent skills in the GitHub CLI is in preview and subject to change without notice.\r\n...\r\n```\r\n",
+            "createdAt": "2026-07-29T04:57:18Z",
+            "id": "IC_kwDODKw3uc8AAAABMMiZ-g",
+            "isMinimized": false,
+            "lastEditedAt": null,
+            "url": "https://github.com/cli/cli/pull/13987#issuecomment-5113420282"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "databaseId": 37270480,
+              "login": "tommaso-moro"
+            },
+            "authorAssociation": "CONTRIBUTOR",
+            "body": "Merged! Thank you @williammartin @BagToad @skarim ",
+            "createdAt": "2026-07-29T10:05:57Z",
+            "id": "IC_kwDODKw3uc8AAAABMPNx_A",
+            "isMinimized": false,
+            "lastEditedAt": null,
+            "url": "https://github.com/cli/cli/pull/13987#issuecomment-5116228092"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHPAAAAATDzcfw=",
+          "hasNextPage": false
+        },
+        "totalCount": 4
+      },
+      "commits": {
+        "nodes": [
+          {
+            "commit": {
+              "committedDate": "2026-07-28T11:31:36Z",
+              "oid": "cb1d1ebf9febd07a7a8d432f2f3b4149e47b6e60"
+            }
+          }
+        ]
+      },
+      "createdAt": "2026-07-28T11:32:03Z",
+      "headRefName": "tommaso-moro-rename-windsurf-to-devin",
+      "id": "PR_kwDODKw3uc73afq3",
+      "isDraft": false,
+      "latestOpinionatedReviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "databaseId": 1611510,
+              "login": "williammartin"
+            },
+            "authorAssociation": "MEMBER",
+            "state": "APPROVED",
+            "submittedAt": "2026-07-29T05:48:03Z"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "databaseId": 47394200,
+              "login": "BagToad"
+            },
+            "authorAssociation": "MEMBER",
+            "state": "APPROVED",
+            "submittedAt": "2026-07-29T04:47:22Z"
+          }
+        ],
+        "totalCount": 2
+      },
+      "mergedAt": "2026-07-29T10:05:19Z",
+      "number": 13987,
+      "repository": {
+        "nameWithOwner": "cli/cli"
+      },
+      "reviewDecision": "APPROVED",
+      "reviewRequests": {
+        "nodes": [
+          {
+            "requestedReviewer": null
+          }
+        ],
+        "totalCount": 1
+      },
+      "reviewThreads": {
+        "nodes": [],
+        "pageInfo": {
+          "endCursor": null,
+          "hasNextPage": false
+        },
+        "totalCount": 0
+      },
+      "state": "MERGED",
+      "title": "Replace Windsurf with Devin in skill agents",
+      "updatedAt": "2026-07-29T10:05:57Z",
+      "url": "https://github.com/cli/cli/pull/13987"
+    },
+    "rateLimit": {
+      "cost": 1,
+      "remaining": 4821,
+      "resetAt": "2026-07-30T22:01:39Z"
+    }
+  }
+}

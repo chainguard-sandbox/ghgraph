@@ -1,0 +1,46 @@
+{
+  "data": {
+    "node": {
+      "reviewThreads": {
+        "nodes": [
+          {
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "Bot",
+                    "databaseId": 175728472,
+                    "login": "copilot-pull-request-reviewer"
+                  },
+                  "authorAssociation": "CONTRIBUTOR",
+                  "body": "The help text says it \"Scans all known agent host directories\" but then lists only a handful of examples in parentheses. Since the registry includes many more supported hosts, this wording is misleading; consider removing the incomplete list or marking it as examples.",
+                  "createdAt": "2026-07-13T10:07:45Z",
+                  "id": "PRRC_kwDODKw3uc7UxfCI",
+                  "isMinimized": false,
+                  "lastEditedAt": null,
+                  "url": "https://github.com/cli/cli/pull/13864#discussion_r3569741960"
+                }
+              ],
+              "totalCount": 1
+            },
+            "id": "PRRT_kwDODKw3uc6QWWXy",
+            "isOutdated": true,
+            "isResolved": true,
+            "line": null,
+            "path": "pkg/cmd/skills/update/update.go"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wNy0xM1QxMDowNzo0NVrOkFll8g==",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      }
+    },
+    "rateLimit": {
+      "cost": 1,
+      "remaining": 4819,
+      "resetAt": "2026-07-30T22:01:39Z"
+    }
+  }
+}

@@ -20,6 +20,11 @@
 //!     No silent caps.
 //!   * Search results lag and re-sort live; the caller overlaps the watermark
 //!     window (~10 min) and treats upserts as idempotent.
+//!   * Every document has a 1:1 response parse type in parse.rs, and the two
+//!     are pinned to each other mechanically (deny_unknown_fields both
+//!     directions) and empirically (captured live fixtures, re-captured by
+//!     tests/capture.rs running these consts verbatim). Change a document
+//!     and its parse type together.
 
 use crate::config::{RepoConfig, Scope};
 use crate::identity::Login;
@@ -88,11 +93,23 @@ pub fn discovery_terms(
 ///     Body extraction (refs.rs) covers the rest. "Related to #N" is missed
 ///     by design and documented as such.
 ///   * latestOpinionatedReviews gives per-reviewer APPROVED/CHANGES_REQUESTED
-///     without paging review history; with reviewRequests and the last
-///     commit's push time this feeds attention::effective_review_state.
-///     reviewDecision is stored raw and never trusted alone.
-///   * commits(last:1) carries head oid + pushedDate: an approval that
-///     predates the last push is a stale approval.
+///     without paging review history; with reviewRequests this feeds
+///     attention::effective_review_state. reviewDecision is stored raw and
+///     never trusted alone.
+///   * commits(last:1) carries head oid + committedDate. It does NOT carry
+///     push time: Commit.pushedDate — the field prs.last_pushed_at was
+///     designed around — is deprecated upstream ("no longer supported") and
+///     returns null on current PRs; selecting it is a null today and a
+///     broken hydration on every PR the day GitHub drops the field. OPEN QUESTION
+///     (milestone 2): the approval-staleness signal needs a replacement
+///     source — candidates are the force-push timeline event (in tension
+///     with the timeline standing rejection, DESIGN.md), the sync's own
+///     observed head_sha flip time (local, not server time), or
+///     committedDate as a lower bound (push ≥ commit, so approval <
+///     committedDate proves staleness but the converse proves nothing).
+///     Interim guarantee, already encoded: last_pushed_at stays NULL, and
+///     NULL/unknown ordering degrades a PR OUT of ready_to_merge
+///     (attention.rs polarity) — the bucket under-fills, it never lies.
 ///   * Every author selection in this hydration document carries __typename
 ///     (structural Bot detection at ingest, since sync --pr skips discovery)
 ///     plus databaseId via User/Bot fragments (NULL for the rare Mannequin/
@@ -129,7 +146,7 @@ query($id: ID!) {
       headRefName baseRefName
       reviewDecision
       createdAt updatedAt mergedAt closedAt
-      commits(last: 1) { nodes { commit { oid committedDate pushedDate } } }
+      commits(last: 1) { nodes { commit { oid committedDate } } }
       reviewRequests(first: 20) {
         totalCount
         nodes { requestedReviewer { ... on User { login } ... on Team { name } } }
@@ -171,11 +188,19 @@ query($id: ID!) {
 /// Follow-up page for any overflowed hydration connection, rooted at the
 /// parent node id. Variables: $id, $after. One document per connection kind;
 /// THREADS_PAGE shown, COMMENTS_PAGE analogous.
+///
+/// totalCount is re-selected on every page, not just the first: the count
+/// can move mid-walk (a thread lands during pagination), and a follow-up
+/// page that re-reads it lets the walker see the drift instead of trusting
+/// a stale first-page count — a scalar on a node already traversed, zero
+/// extra points. It also keeps the page shape identical to the first page's
+/// (parse::Paged), one parse type for both.
 pub const THREADS_PAGE: &str = r#"
 query($id: ID!, $after: String) {
   node(id: $id) {
     ... on PullRequest {
       reviewThreads(first: 100, after: $after) {
+        totalCount
         pageInfo { hasNextPage endCursor }
         nodes {
           id isResolved isOutdated path line

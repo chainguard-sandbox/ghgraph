@@ -227,6 +227,28 @@ impl Ord for Rfc3339Utc {
     }
 }
 
+// Serde at the ingest boundary (parse.rs): `Deserialize` validates through
+// `parse`, so a malformed API timestamp is unrepresentable past a parse type,
+// and `Serialize` emits the canonical form. Unlike the identity.rs impls —
+// whose error messages echo the offending value under the license that config
+// is the operator's own text — this error carries only the `ParseError`
+// class: API responses are third-party input and hold no such license.
+impl serde::Serialize for Rfc3339Utc {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.canonical)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Rfc3339Utc {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Rfc3339Utc::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Parse a run of ASCII digits into an `i64`, or `None` if empty or non-digit.
 fn digits(bytes: &[u8]) -> Option<i64> {
     if bytes.is_empty() {
@@ -545,6 +567,30 @@ mod tests {
         }
         assert_eq!(days_from_civil(1, 1, 1), -719_162);
         assert_eq!(days_from_civil(9999, 12, 31), 2_932_896);
+    }
+
+    #[test]
+    fn serde_validates_and_emits_canonical() {
+        // Deserialize goes through parse (a malformed API timestamp is
+        // unrepresentable past a parse type) and normalizes; Serialize
+        // emits the canonical form.
+        let t: Rfc3339Utc = serde_json::from_str(r#""2026-07-13T10:09:24.500Z""#).unwrap();
+        assert_eq!(t.as_str(), "2026-07-13T10:09:24Z");
+        assert_eq!(
+            serde_json::to_string(&t).unwrap(),
+            r#""2026-07-13T10:09:24Z""#
+        );
+        assert!(serde_json::from_str::<Rfc3339Utc>(r#""2026-07-13T10:09:24+02:00""#).is_err());
+        assert!(serde_json::from_str::<Rfc3339Utc>("42").is_err());
+    }
+
+    #[test]
+    fn serde_error_never_echoes_input() {
+        // The ingest-boundary counterpart of parse_error_never_echoes_input:
+        // the serde error carries the ParseError class, not the input.
+        let sneaky = r#""owner/repo involves:someone-else""#;
+        let err = serde_json::from_str::<Rfc3339Utc>(sneaky).unwrap_err();
+        assert!(!format!("{err} {err:?}").contains("involves"));
     }
 
     #[test]

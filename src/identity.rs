@@ -29,10 +29,10 @@
 //! this module. The `Deserialize` impls DO name the offending value — the
 //! config file is the operator's own text, and config errors name the entry
 //! and field by contract (DESIGN.md, Config). That echo is licensed ONLY by
-//! that precondition: ingest parse types (milestone 2) must carry API logins
-//! as plain data fields — stored as received, compared via [`login_eq`] —
-//! never deserialized through these impls, or third-party text lands in a
-//! CONFIGURATION message.
+//! that precondition: the ingest parse types carry API logins as plain data
+//! (`parse::ApiLogin` — stored as received, compared via [`login_eq`], no
+//! `Display`) and never deserialize through these impls, or third-party text
+//! would land in a CONFIGURATION message.
 
 use std::fmt;
 
