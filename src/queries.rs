@@ -22,6 +22,8 @@
 //!     window (~10 min) and treats upserts as idempotent.
 
 use crate::config::{RepoConfig, Scope};
+use crate::identity::Login;
+use crate::time::Rfc3339Utc;
 
 /// Discovery: ids, updatedAt, and author (for filter skips) only.
 /// Variables: $q, $after. One document for both streams — the search
@@ -41,20 +43,20 @@ query($q: String!, $after: String) {
 }"#;
 
 /// The discovery search strings for one configured repo.
-/// `since` is RFC 3339; the caller has already applied the overlap window.
-/// Interpolated identifiers are charset-validated at config load
-/// (config.rs: is_login / is_repo reject spaces and ':', so a value cannot
-/// smuggle a second qualifier). PLANNED (milestone 1): promote those checks
-/// to validating newtypes (RepoName, Login, Rfc3339Utc) enforced by this
-/// signature, so injection is unrepresentable by type rather than by a
-/// boundary check. `since` is a server-supplied timestamp, still validated
-/// only by convention until Rfc3339Utc lands — do not add interpolation
-/// sites that bypass config validation.
+/// `since` is the caller's watermark with the overlap window already applied.
+/// This signature is the injection boundary: every interpolated value is a
+/// validating newtype — RepoName and Login (identity.rs) admit no space or
+/// ':', Rfc3339Utc's canonical form is charset-bounded to [0-9:TZ-] with ':'
+/// only in the fixed HH:MM:SS positions — so a value that could smuggle a
+/// second qualifier ("owner/name involves:someone-else") is unrepresentable
+/// here, not filtered here. The counterexample strings live on as unit tests
+/// (identity.rs, config.rs). Do not add interpolation sites that take raw
+/// strings.
 pub fn discovery_terms(
     rc: &RepoConfig,
-    viewer: &str,
-    people: &[String],
-    since: &str,
+    viewer: &Login,
+    people: &[Login],
+    since: &Rfc3339Utc,
 ) -> Vec<String> {
     let base = format!("repo:{} updated:>={since} sort:updated-desc", rc.repo);
     let pr = format!("{base} is:pr");
@@ -97,8 +99,9 @@ pub fn discovery_terms(
 ///     Organization author). DISCOVERY fetches only login + __typename: its
 ///     results decide skip-or-hydrate and are never stored, so databaseId
 ///     there would be waste. databaseId is a stable id captured now so
-///     identity matching can move off logins in a later milestone — it is
-///     stored, not yet consulted (matching is login-keyed today). author is
+///     identity matching could move off logins (deferred; ROADMAP names the
+///     deciding evidence) — it is stored, not yet consulted (matching is
+///     login-keyed, identity.rs). author is
 ///     Option everywhere in the parse types: author:null (deleted account) is
 ///     ordinary data, ingested NULL, never an error or a filter match. All
 ///     scalars on nodes already traversed, so zero extra rate-limit points —
@@ -111,7 +114,8 @@ pub fn discovery_terms(
 ///     comments.kind='review' rows never leave author_assoc silently NULL.
 ///   * repository { nameWithOwner } is the PR's own view of its repo:
 ///     a mismatch against config — compared case-folded, since repo identity
-///     is case-insensitive (config.rs lowercases; fold nameWithOwner too) —
+///     is case-insensitive (RepoName folds at construction, identity.rs;
+///     fold nameWithOwner to match) —
 ///     detects a rename/transfer and surfaces as CONFIGURATION ("repo
 ///     renamed — update config"), never a silent follow or empty stream.
 pub const HYDRATE_PR: &str = r#"
@@ -186,3 +190,69 @@ query($id: ID!, $after: String) {
   }
   rateLimit { cost remaining resetAt }
 }"#;
+
+#[cfg(test)]
+mod tests {
+    use super::discovery_terms;
+    use crate::config::parse;
+    use crate::identity::Login;
+    use crate::time::Rfc3339Utc;
+
+    fn since() -> Rfc3339Utc {
+        Rfc3339Utc::parse("2026-07-01T00:00:00Z").unwrap()
+    }
+
+    // Working scope: exactly the three viewer flavors (involves: does not
+    // cover review-requested and does not reliably cover reviewed-by) plus
+    // one involves: per tracked person, in config order — the flavor set the
+    // sync fingerprint identifies.
+    #[test]
+    fn working_scope_emits_viewer_flavors_plus_people() {
+        let cfg = parse(
+            r#"{"viewer":"Viewer","repos":["O/N"],"people":["Alice"]}"#,
+            "<test>",
+        )
+        .unwrap();
+        let rc = cfg.repos[0].resolved();
+        let terms = discovery_terms(&rc, &cfg.viewer, &cfg.people, &since());
+        let base = "repo:o/n updated:>=2026-07-01T00:00:00Z sort:updated-desc is:pr";
+        assert_eq!(
+            terms,
+            vec![
+                format!("{base} involves:viewer"),
+                format!("{base} review-requested:viewer"),
+                format!("{base} reviewed-by:viewer"),
+                format!("{base} involves:alice"),
+            ],
+            "canonical (folded) identifiers, fixed flavor order"
+        );
+    }
+
+    // Project scope: one unqualified PR term, plus the issue term iff the
+    // issue stream is on (default at project scope; off explicitly here).
+    #[test]
+    fn project_scope_emits_pr_and_issue_terms() {
+        let cfg = parse(
+            r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"project"}]}"#,
+            "<test>",
+        )
+        .unwrap();
+        let rc = cfg.repos[0].resolved();
+        let people: Vec<Login> = Vec::new();
+        let terms = discovery_terms(&rc, &cfg.viewer, &people, &since());
+        let base = "repo:o/n updated:>=2026-07-01T00:00:00Z sort:updated-desc";
+        assert_eq!(
+            terms,
+            vec![format!("{base} is:pr"), format!("{base} is:issue")]
+        );
+
+        let no_issues = parse(
+            r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"project","issues":false}]}"#,
+            "<test>",
+        )
+        .unwrap();
+        let rc = no_issues.repos[0].resolved();
+        let terms = discovery_terms(&rc, &no_issues.viewer, &people, &since());
+        assert_eq!(terms, vec![format!("{base} is:pr")]);
+    }
+}

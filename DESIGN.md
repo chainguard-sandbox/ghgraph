@@ -79,8 +79,12 @@ bounds a busy monorepo's cold start by the lookback.
 Project scope defaults defensively, because a busy repo's stream is mostly
 machinery: bot-authored PRs (author type `Bot` — structural, never a login
 pattern) are excluded unless `bots: true`; `exclude_authors` drops named
-accounts through one login-equivalence function (`x[bot]` means login `x`
-with author type `Bot`; GitHub returns bare logins for bots); per-repo
+accounts through one login-equivalence function (identity.rs): a bare login
+matches by case-insensitive login regardless of author type, and the
+`x[bot]` suffix narrows the match to author type `Bot` (GitHub returns
+bare logins for bots; the suffix is ghgraph's affordance — the rejected
+bare-means-User draft and the rule's reversal condition are recorded at
+AuthorPattern); per-repo
 `lookback_days` makes a huge archive opt-in rather than the price of the
 scope; and the issue stream is on by default at project scope only —
 `issues: true` at working scope is a configuration error, never a silent
@@ -92,9 +96,10 @@ records each author's `authorAssociation` (OWNER/MEMBER/CONTRIBUTOR/
 FIRST_TIME_CONTRIBUTOR/…) and stable `databaseId` — both scalars on nodes
 already fetched, so zero extra rate-limit points. The association is a
 reliable external-vs-insider triage axis. The `databaseId` is stored now so
-identity matching can move off logins later (PLANNED, milestone 1): today
-`people`/`exclude_authors` match by login, so a login rename still breaks
-those matches — the stable id is captured, not yet consulted. A "service
+identity matching can move off logins later (deferred; the deciding
+evidence is named in ROADMAP.md): today `people`/`exclude_authors` match by
+login (identity.rs), so a login rename still breaks those matches — the
+stable id is captured, not yet consulted. A "service
 account" filter is deliberately absent: GitHub exposes no signal for it, so
 `exclude_authors` (explicit) is the honest tool, never a login heuristic.
 
@@ -266,9 +271,10 @@ constrained like one (src/config.rs). A `repos` entry is a bare "owner/name"
 `lookback_days`, `bots`, `exclude_authors`. The shape is closed
 (`deny_unknown_fields`), a malformed entry fails the whole config as
 CONFIGURATION naming the entry and field — never skip-and-continue, and
-never serde's opaque untagged-enum message — every identifier becomes a
-validating newtype before it can reach a search qualifier (milestone 1),
-and every default resolves in one place in code, so "what will this sync?"
+never serde's opaque untagged-enum message — every identifier is a
+validating newtype (identity.rs, validated inside Deserialize) before it
+can reach a search qualifier, and every default resolves in one place in
+code, so "what will this sync?"
 always has one checkable answer. Identifiers are case-insensitive, as
 GitHub treats them: repo names fold to lowercase at the config boundary
 (and API-ingested repos fold to match), so `Foo/Bar` and `foo/bar` never
@@ -295,10 +301,11 @@ text, or hints. Project scope widens the author pool from people the operator
 engaged to everyone who shows up, which changes nothing: the posture is not
 scope-conditional; derived fields come only from structural signals, and the one
 body→structure path (src/refs.rs) can annotate but never suppress attention.
-The config file is an interface: repos and logins become validating
-newtypes (milestone 1), making search-qualifier injection unrepresentable
-in `discovery_terms`' signature — until then the injection counterexamples
-are recorded there and no new interpolation sites are added. PR references
+The config file is an interface: repos and logins are validating newtypes
+(identity.rs) validated inside `Deserialize`, making search-qualifier
+injection unrepresentable in `discovery_terms`' signature — the injection
+counterexamples live on as unit tests, and no interpolation site takes a
+raw string. PR references
 (`owner/name#123`, URL, bare number via the cwd git remote) parse to a
 validated (repo, number) pair before crossing any module boundary; URL
 parsing pins the host, and the cwd remote is attacker-chosen content that

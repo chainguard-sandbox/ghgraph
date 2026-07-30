@@ -22,8 +22,7 @@ Currently a scaffold — the contracts are final-draft, the bodies are stubs.
   other — add a pointer.
 - This repo is contract prose over stub bodies. Never assert an unbuilt
   mechanism in the present tense: mark it `PLANNED (milestone N)` — as
-  queries.rs and gh.rs do — and remove the marker in the change that
-  builds it.
+  db.rs does — and remove the marker in the change that builds it.
 - Proofs have preconditions. "Watermark never leads data" holds only if
   every discovered id resolves to a defined outcome (hydrated, filtered,
   quarantined-with-a-durable-row, deferred) and the watermark folds over

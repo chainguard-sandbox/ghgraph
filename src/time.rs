@@ -40,11 +40,12 @@
 //!     schema's `ORDER BY` on timestamp columns relies on. Year is bounded to
 //!     `0001..=9999` precisely so the width (and therefore that order) holds.
 //!   * [`as_str`](Rfc3339Utc::as_str) is charset-bounded to `[0-9:TZ-]` — no
-//!     whitespace, no `:` outside the fixed `HH:MM:SS` positions — so when a
-//!     later milestone interpolates a watermark into a `gh` search qualifier it
-//!     cannot smuggle a second qualifier. That injection-safety argument is
-//!     A3/identity's to complete (via `discovery_terms`' signature); this module
-//!     only guarantees the charset of the canonical form.
+//!     whitespace, no `:` outside the fixed `HH:MM:SS` positions — so
+//!     interpolating a watermark into a `gh` search qualifier cannot smuggle a
+//!     second qualifier. `discovery_terms`' signature (queries.rs) completes
+//!     that injection-safety argument by admitting only this type and the
+//!     identity.rs newtypes; this module guarantees the charset of the
+//!     canonical form.
 //!
 //! Errors: `parse` returns a [`ParseError`] leaf, not a classified
 //! `crate::Error`. The actor who can fix a bad timestamp depends on where it
@@ -469,7 +470,8 @@ mod tests {
 
     #[test]
     fn canonical_charset_is_bounded() {
-        // The injection-safety argument (A3) depends on the canonical form
+        // The injection-safety argument (discovery_terms, queries.rs)
+        // depends on the canonical form
         // staying within [0-9:TZ-] — no whitespace, no ':' outside HH:MM:SS.
         // Check representative values AND the domain boundaries, where an extreme
         // epoch could otherwise widen or sign-prefix a field. (epoch_arith fuzzes
