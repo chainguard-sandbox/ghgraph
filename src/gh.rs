@@ -61,6 +61,12 @@ pub struct RateLimit {
 }
 
 pub struct Response {
+    /// Must be produced by default-config serde_json (its byte parser caps
+    /// nesting at 128): parse.rs's totality over this Value leans on that
+    /// cap — the Value-to-typed deserializer recurses per level with no
+    /// depth guard of its own, so an unbounded-depth Value could overflow
+    /// the stack. Holds by construction here; keep it true if the parsing
+    /// path ever changes.
     pub data: serde_json::Value,
     pub rate_limit: Option<RateLimit>,
 }

@@ -6,27 +6,45 @@
 //!
 //!   * Type = selection, mechanically. Every struct is
 //!     `deny_unknown_fields`, so a selection the type does not carry is a
-//!     parse error (selection ⊆ type), and every non-Option field is
-//!     required, so a typed field the document stopped selecting is a parse
-//!     error (type ⊆ selection). The captured fixtures
-//!     (tests/fixtures/*.json, re-captured by tests/capture.rs running the
-//!     real documents against live GitHub) witness the equality — a
-//!     document/type drift cannot land silently.
+//!     parse error (selection ⊆ type). In the other direction every field
+//!     is required — including Option fields, which serde would otherwise
+//!     treat as silently missing-tolerant: each nullable-but-always-selected
+//!     field carries `deserialize_with = "nullable"`, which restores
+//!     key-required (absent key = parse error, `null` = `None`), so a typed
+//!     field the document stopped selecting is a parse error (type ⊆
+//!     selection). The two deliberately missing-tolerant fields
+//!     (`Author::database_id`, the `rate_limit` envelopes) are exactly the
+//!     Option fields WITHOUT the marker, each justified where it stands.
+//!     The captured fixtures (tests/fixtures/*.json, re-captured by
+//!     tests/capture.rs running the real documents against live GitHub)
+//!     witness the equality — a document/type drift cannot land silently.
+//!     One caveat, accepted as a trade: these functions take an
+//!     already-parsed `&Value`, and serde_json's Value collapses duplicate
+//!     keys last-wins before the typed parse can reject them. The input
+//!     source (GitHub's GraphQL serializer via gh) does not emit duplicate
+//!     keys, and rejecting them would mean parsing typed structs from raw
+//!     bytes, forfeiting the shared in-band rateLimit handling — revisit if
+//!     the transport ever hands over bytes.
 //!   * API text is plain data. Logins arrive as [`ApiLogin`] — stored as
 //!     received, compared only via `identity::login_eq` /
 //!     `AuthorPattern::matches` — never through `identity::Login`'s
 //!     validating `Deserialize`, whose error message echoes its input under
 //!     a license (config is the operator's own text) that API responses do
 //!     not hold. `ApiLogin` deliberately implements no `Display`, so
-//!     interpolating one into a search term, an error message, or any other
-//!     string is a type error, not a review finding.
+//!     `format!`-interpolating one into a search term or an error message
+//!     is a type error. The derived `Debug` remains a formatting route
+//!     ({:?} prints the login); it is kept because the fixture and
+//!     round-trip harnesses need legible diagnostics, and no shipped code
+//!     formats a parse type — reweigh if one ever does.
 //!   * `author` is `Option` everywhere. The GraphQL schema keeps every
-//!     `author` field nullable, and a null author is ordinary data — the
-//!     blanket-`From` counterexample recorded in error.rs. In practice
-//!     GitHub materializes a deleted user as the `ghost` User
-//!     (tests/fixtures/hydrate_pr_ghost.json) rather than null, but the
-//!     schema permits null and `None` must stay an ordinary ingest value,
-//!     never an error or a filter match.
+//!     `author` field nullable, and a null author is ordinary, live data —
+//!     the blanket-`From` counterexample recorded in error.rs. GitHub
+//!     materializes a deleted user as the `ghost` User
+//!     (tests/fixtures/hydrate_pr_ghost.json) rather than null, but
+//!     `author: null` occurs in production for other causes (observed on
+//!     legacy accounts converted to Organizations, e.g. rails/rails#2);
+//!     `None` must stay an ordinary ingest value, never an error or a
+//!     filter match.
 //!   * Errors are shape-only. [`ParseError`] names the document, never the
 //!     content: serde's own messages echo scalar values on type mismatch,
 //!     and response text is third-party — it must not reach an error
@@ -39,12 +57,18 @@
 //!     variants (MANNEQUIN did not always exist); a closed enum would turn
 //!     each addition into a quarantine storm. The schema stores them raw and
 //!     judgment lives with the judge: `identity::is_bot` for `__typename`,
-//!     attention.rs for the rest.
+//!     attention.rs for the rest. Reversed only by a consumer needing
+//!     exhaustive matching at ingest — none exists, and judgment reads the
+//!     archive, so none is expected.
 //!   * Timestamps validate at ingest. Every DateTime field is
 //!     `time::Rfc3339Utc` (validated inside a non-echoing `Deserialize`;
 //!     time.rs), so a malformed timestamp is a loud parse error here and
 //!     unrepresentable past this boundary — the watermark fold and the
-//!     schema's lexicographic-order convention both rely on it.
+//!     schema's lexicographic-order convention both rely on it. The Z-only
+//!     grammar is safe because the documents select only `DateTime` scalars
+//!     (UTC-normalized, Z-terminated); GitHub's non-normalized git-time
+//!     scalar is a different type, `GitTimestamp`, which no document
+//!     selects — that is the evidence boundary for Z-only.
 //!
 //! Nullability is the introspected schema's, not a guess — with one
 //! deliberate narrowing, recorded here with its reversal condition. The
@@ -76,14 +100,32 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+#[cfg(feature = "harness")]
+use serde::Serialize;
 
 use crate::identity;
 use crate::time::Rfc3339Utc;
 
-// `Serialize` on every type here exists for the verification harness — the
+// `Serialize` on the types here exists for the verification harness — the
 // fuzz round-trip witness (parse → serialize → parse must be identity) needs
-// a render direction. Nothing shipped serializes these types.
+// a render direction. It is feature-gated (`harness`, enabled only by the
+// fuzz workspace) so "nothing shipped serializes these types" is a compile
+// error rather than a promise.
+
+/// Restores key-required on a nullable field: serde treats every `Option`
+/// field as missing-tolerant (an absent key silently becomes `None`), which
+/// would let a document drop a selection without any parse failing — the
+/// silent-drift direction `deny_unknown_fields` cannot see. Attached as
+/// `deserialize_with` (which makes the key required), it accepts `null` as
+/// `None` and nothing else by absence.
+fn nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
 
 /// Which document a response failed to match. The whole content of a
 /// [`ParseError`] — deliberately, see the module docs.
@@ -131,7 +173,8 @@ impl fmt::Display for ParseError {
 /// identity.rs). No `Display` impl, on purpose: an API login must never be
 /// interpolated into a search qualifier, an error message, or SQL text, and
 /// the missing impl makes `format!("{}", login)` a compile error.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(transparent)]
 pub struct ApiLogin(String);
 
@@ -147,17 +190,21 @@ impl ApiLogin {
 /// only) the stable `databaseId`. DISCOVERY omits `databaseId` — its hits
 /// decide skip-or-hydrate and are never stored — so the field defaults to
 /// `None` there rather than forcing two author types.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Author {
     pub login: ApiLogin,
     #[serde(rename = "__typename")]
     pub typename: String,
-    /// Stable numeric id; survives a login rename. `None` for the rare
-    /// Mannequin/Organization author (no User/Bot fragment matches) and in
-    /// discovery (not selected). Stored, not yet consulted — ROADMAP names
-    /// the evidence that would move matching onto it.
-    #[serde(default)]
+    /// Stable numeric id; survives a login rename. `None` for an author
+    /// matching neither databaseId-carrying fragment (schema-possible for
+    /// Mannequin; the one Organization author observed live nulls the whole
+    /// actor instead) and in discovery, which does not select it — this is
+    /// one of the two fields deliberately WITHOUT the `nullable` marker
+    /// (module docs): serde's plain-Option missing-tolerance is the wanted
+    /// behavior. Stored, not yet consulted — ROADMAP names the evidence
+    /// that would move matching onto it.
     pub database_id: Option<i64>,
 }
 
@@ -169,10 +216,12 @@ impl Author {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PageInfo {
     pub has_next_page: bool,
+    #[serde(deserialize_with = "nullable")]
     pub end_cursor: Option<String>,
 }
 
@@ -182,7 +231,8 @@ pub struct PageInfo {
 /// purpose: which of totalCount/pageInfo a document selects is part of the
 /// contract (pageInfo on comments is what makes "no silent caps" checkable),
 /// so dropping one is a parse error, not a silent narrowing.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Paged<T> {
     pub total_count: i64,
@@ -194,7 +244,8 @@ pub struct Paged<T> {
 /// selections (reviewRequests, latestOpinionatedReviews,
 /// closingIssuesReferences, a thread's comments). Truncation is detectable
 /// as `nodes.len() < total_count`; the hydrator owns that judgment.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Counted<T> {
     pub total_count: i64,
@@ -203,7 +254,8 @@ pub struct Counted<T> {
 
 /// A connection selected as nodes only: commits(last: 1), where the one
 /// node is the head commit and no count is wanted.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct NodesOnly<T> {
     pub nodes: Vec<T>,
@@ -214,7 +266,8 @@ pub struct NodesOnly<T> {
 
 /// One page of search results: ids, updatedAt, and the author needed for
 /// filter skips. Nothing here is ever stored.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DiscoveryPage {
     /// Total hits for the term across all pages — the discovery-cap
@@ -230,11 +283,13 @@ pub struct DiscoveryPage {
 /// One search hit. Both fragments (PullRequest, Issue) select these same
 /// three fields, so one type parses both streams — the search term's
 /// `is:pr` / `is:issue` already decided which arrives.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DiscoveryHit {
     pub id: String,
     pub updated_at: Rfc3339Utc,
+    #[serde(deserialize_with = "nullable")]
     pub author: Option<Author>,
 }
 
@@ -244,8 +299,8 @@ struct DiscoveryData {
     search: DiscoveryPage,
     /// Typed and consumed in gh.rs (every document appends it); carried
     /// loose here so parse neither re-validates nor depends on whether the
-    /// transport already stripped it.
-    #[serde(default)]
+    /// transport already stripped it — deliberately missing-tolerant, the
+    /// other field class WITHOUT the `nullable` marker (module docs).
     #[allow(dead_code)]
     rate_limit: Option<serde_json::Value>,
 }
@@ -264,27 +319,33 @@ pub fn discovery(data: &serde_json::Value) -> Result<DiscoveryPage, ParseError> 
 
 /// One hydrated PR: the full working-set context the writer turns into a
 /// PrBundle. Field set = the HYDRATE_PR selection, exactly.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PrNode {
     pub id: String,
     pub number: i64,
     pub title: String,
     pub body: String,
-    /// OPEN | CLOSED | MERGED today; raw on purpose (module docs).
+    /// PullRequestState (OPEN | CLOSED | MERGED); raw on purpose (module
+    /// docs).
     pub state: String,
     pub is_draft: bool,
     pub url: String,
+    #[serde(deserialize_with = "nullable")]
     pub author: Option<Author>,
     pub author_association: String,
     pub repository: RepoRef,
     pub head_ref_name: String,
     pub base_ref_name: String,
     /// Raw API value; never trusted alone (queries.rs).
+    #[serde(deserialize_with = "nullable")]
     pub review_decision: Option<String>,
     pub created_at: Rfc3339Utc,
     pub updated_at: Rfc3339Utc,
+    #[serde(deserialize_with = "nullable")]
     pub merged_at: Option<Rfc3339Utc>,
+    #[serde(deserialize_with = "nullable")]
     pub closed_at: Option<Rfc3339Utc>,
     pub commits: NodesOnly<CommitEdge>,
     /// `Option` on the connection itself: the schema marks these three
@@ -292,8 +353,11 @@ pub struct PrNode {
     /// error-masking — a failed sub-resolver bubbles null here instead of
     /// failing the query. `None` is that mask, and the hydrator must treat
     /// it as truncation, never as empty (PLANNED, milestone 2).
+    #[serde(deserialize_with = "nullable")]
     pub review_requests: Option<Counted<ReviewRequestNode>>,
+    #[serde(deserialize_with = "nullable")]
     pub latest_opinionated_reviews: Option<Counted<ReviewNode>>,
+    #[serde(deserialize_with = "nullable")]
     pub closing_issues_references: Option<Counted<LinkedIssueNode>>,
     pub comments: Paged<CommentNode>,
     pub review_threads: Paged<ThreadNode>,
@@ -302,13 +366,15 @@ pub struct PrNode {
 /// The PR's own view of its repo. Raw `nameWithOwner`; rename detection
 /// compares it case-folded against config at the comparison site
 /// (queries.rs records why).
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RepoRef {
     pub name_with_owner: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CommitEdge {
     pub commit: Commit,
@@ -319,32 +385,40 @@ pub struct CommitEdge {
 /// `prs.last_pushed_at` wanted has no API source in this document. The open
 /// question and its interim guarantee are recorded at the document
 /// (queries.rs) and the column (schema.sql).
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Commit {
     pub oid: String,
     pub committed_date: Rfc3339Utc,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ReviewRequestNode {
-    /// Null for a deleted reviewer — and for a reviewer matching neither
-    /// fragment: a Bot request (Copilot) arrives as `null`, not `{}`
-    /// (tests/fixtures/hydrate_pr_comments.json).
+    /// Null means the reviewer NODE is not visible to the viewer — a
+    /// private Team the viewer is not a member of is the common live case
+    /// (tests/fixtures/hydrate_pr_comments.json carries one), deletion
+    /// another. It does NOT mean "no reviewer": the request is real and
+    /// totalCount counts it, so a consumer must never read `None` as
+    /// gone/deleted (PLANNED, milestone 2 owns that judgment).
+    #[serde(deserialize_with = "nullable")]
     pub requested_reviewer: Option<RequestedReviewer>,
 }
 
 /// The requestedReviewer union, parsed by shape: the document's fragments
 /// select `login` for a User and `name` for a Team, and the two never
-/// collide. [`RequestedReviewer::Unresolved`] keeps the spec-permitted `{}`
-/// (a member with no matched fragment) as data — live capture shows GitHub
-/// rendering that case as `null` instead, so `{}` is defense against the
-/// spec, pinned by hand. Adding `__typename` to name the unresolved kind
-/// was considered and declined: the schema stores only user/team requests,
-/// so the name would be carried judgment-free into nothing; revisit if a
-/// real archive shows Mannequin/Bot requests mattering to attention.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+/// collide. The union has more members than the fragments cover (Bot,
+/// Mannequin, EnterpriseTeam), and a VISIBLE member matching neither
+/// fragment renders `{}` — [`RequestedReviewer::Unresolved`], live-reachable
+/// (a pending Copilot request is a Bot). Adding `__typename` to name the
+/// unresolved kind was considered and declined: the schema stores only
+/// user/team requests, so the name would be carried judgment-free into
+/// nothing; revisit if a real archive shows Bot/Mannequin requests
+/// mattering to attention.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(untagged)]
 pub enum RequestedReviewer {
     User(UserRef),
@@ -352,7 +426,8 @@ pub enum RequestedReviewer {
     Unresolved(EmptyObject),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields)]
 pub struct UserRef {
     pub login: ApiLogin,
@@ -362,7 +437,8 @@ pub struct UserRef {
 /// string; it stays a plain field (bound-parameter sink) rather than an
 /// `ApiLogin` because no equivalence discipline exists for team names —
 /// `ApiLogin` enforces the login_eq rule, not a general text taint.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields)]
 pub struct TeamRef {
     pub name: String,
@@ -371,26 +447,31 @@ pub struct TeamRef {
 /// The no-fragment-matched shape. `deny_unknown_fields` keeps it from
 /// swallowing anything but a literal `{}`, so untagged dispatch stays
 /// honest.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields)]
 pub struct EmptyObject {}
 
 /// One row of latestOpinionatedReviews: per-reviewer verdict without paging
 /// review history. Becomes a comments row (kind='review'; schema.sql).
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ReviewNode {
     /// APPROVED | CHANGES_REQUESTED | … — raw (module docs).
     pub state: String,
+    #[serde(deserialize_with = "nullable")]
     pub submitted_at: Option<Rfc3339Utc>,
     pub author_association: String,
+    #[serde(deserialize_with = "nullable")]
     pub author: Option<Author>,
 }
 
 /// A linked issue from closingIssuesReferences — GitHub's own parse of the
 /// closing keywords, cross-repo included; becomes a refs row
 /// (kind='fixes', source='api') and a fill-only issues row.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LinkedIssueNode {
     pub id: String,
@@ -400,6 +481,7 @@ pub struct LinkedIssueNode {
     pub state: String,
     pub body: String,
     pub updated_at: Rfc3339Utc,
+    #[serde(deserialize_with = "nullable")]
     pub author: Option<Author>,
     pub author_association: String,
     pub url: String,
@@ -408,21 +490,25 @@ pub struct LinkedIssueNode {
 
 /// A comment, top-level or review-thread — the two selections are
 /// identical, so one type serves both (`comments.kind` is the writer's).
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CommentNode {
     pub id: String,
     pub body: String,
     pub created_at: Rfc3339Utc,
+    #[serde(deserialize_with = "nullable")]
     pub last_edited_at: Option<Rfc3339Utc>,
     pub url: String,
     /// GitHub's own hostile-content label; load-bearing in attention.rs.
     pub is_minimized: bool,
     pub author_association: String,
+    #[serde(deserialize_with = "nullable")]
     pub author: Option<Author>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ThreadNode {
     pub id: String,
@@ -431,6 +517,7 @@ pub struct ThreadNode {
     /// Non-null in the schema (a thread is anchored to a file), unlike
     /// `line`, which nulls for file-level and outdated-position threads.
     pub path: String,
+    #[serde(deserialize_with = "nullable")]
     pub line: Option<i64>,
     pub comments: Counted<CommentNode>,
 }
@@ -438,8 +525,9 @@ pub struct ThreadNode {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct HydratePrData {
+    #[serde(deserialize_with = "nullable")]
     node: Option<PrNode>,
-    #[serde(default)]
+    /// See DiscoveryData::rate_limit.
     #[allow(dead_code)]
     rate_limit: Option<serde_json::Value>,
 }
@@ -463,7 +551,8 @@ pub fn hydrate_pr(data: &serde_json::Value) -> Result<Option<PrNode>, ParseError
 // THREADS_PAGE
 
 /// A follow-up reviewThreads page, rooted at the PR node id.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ThreadsPageNode {
     pub review_threads: Paged<ThreadNode>,
@@ -472,8 +561,9 @@ pub struct ThreadsPageNode {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct ThreadsPageData {
+    #[serde(deserialize_with = "nullable")]
     node: Option<ThreadsPageNode>,
-    #[serde(default)]
+    /// See DiscoveryData::rate_limit.
     #[allow(dead_code)]
     rate_limit: Option<serde_json::Value>,
 }
@@ -606,8 +696,10 @@ mod tests {
         assert!(!pr.comments.nodes.is_empty());
         assert!(!pr.comments.nodes[0].is_minimized);
 
-        // Live fact, pinned: a review request whose reviewer matches neither
-        // fragment (a Bot — Copilot) arrives as requestedReviewer: null.
+        // Live fact, pinned: a request whose reviewer node the viewer cannot
+        // see (here a private team, per the REST cross-check) arrives as
+        // requestedReviewer: null — while totalCount still counts it. None
+        // is "invisible", never "no request".
         let requests = pr.review_requests.as_ref().unwrap();
         assert!(requests.total_count >= 1);
         assert!(
@@ -729,10 +821,62 @@ mod tests {
         assert!(hydrate_pr(&json!({"node": extra})).is_err());
 
         // type ⊆ selection: a field the type carries but the document
-        // stopped selecting fails (required field).
+        // stopped selecting fails — for a required field (serde's own
+        // missing-field error)...
         let mut missing = minimal_pr();
         missing.as_object_mut().unwrap().remove("updatedAt");
         assert!(hydrate_pr(&json!({"node": missing})).is_err());
+
+        // ...and, the direction serde would silently forgive, for Option
+        // fields: the `nullable` marker makes the KEY required while null
+        // stays None, so dropping a nullable selection is just as loud.
+        for key in ["author", "mergedAt", "reviewDecision", "reviewRequests"] {
+            let mut dropped = minimal_pr();
+            dropped.as_object_mut().unwrap().remove(key);
+            assert!(
+                hydrate_pr(&json!({"node": dropped})).is_err(),
+                "dropping the {key} selection must not parse"
+            );
+        }
+        let mut page_info_narrowed = minimal_pr();
+        page_info_narrowed["comments"]["pageInfo"] = json!({"hasNextPage": false});
+        assert!(hydrate_pr(&json!({"node": page_info_narrowed})).is_err());
+
+        // The deliberate exception: databaseId is absent in DISCOVERY, so
+        // Author tolerates the missing key (and only this field does).
+        let mut no_db_id = minimal_pr();
+        no_db_id["author"] = json!({"login": "a", "__typename": "User"});
+        assert!(hydrate_pr(&json!({"node": no_db_id})).is_ok());
+    }
+
+    #[test]
+    fn missing_node_key_is_a_parse_error_not_a_deletion() {
+        // Ok(None) drains to deleted_at, so it must be producible only by a
+        // literal node:null — a response missing the key entirely (spec
+        // violation or transport mangling) must fail, not read as deleted.
+        assert!(hydrate_pr(&json!({})).is_err());
+        assert!(threads_page(&json!({})).is_err());
+    }
+
+    #[test]
+    fn rate_limit_at_the_parser_depth_cap_parses() {
+        // The rateLimit envelope is carried as a loose Value; its
+        // deserialization recurses per nesting level, bounded in production
+        // by serde_json's 128-level byte-parser cap (gh.rs, Response.data).
+        // Pin that a Value at that cap parses with margin to spare.
+        let mut deep = json!(1);
+        for _ in 0..127 {
+            deep = json!([deep]);
+        }
+        let doc = json!({
+            "search": {
+                "issueCount": 0,
+                "pageInfo": {"hasNextPage": false, "endCursor": null},
+                "nodes": []
+            },
+            "rateLimit": deep
+        });
+        assert!(discovery(&doc).is_ok());
     }
 
     #[test]
@@ -757,8 +901,8 @@ mod tests {
             Some(RequestedReviewer::Team(t)) => assert_eq!(t.name, "platform"),
             other => panic!("expected Team, got {other:?}"),
         }
-        // Spec-permitted fragment-less member; live renders null instead
-        // (fixture), both are data.
+        // A visible union member matching neither fragment (Bot, Mannequin,
+        // EnterpriseTeam) — live-reachable, e.g. a pending Copilot request.
         assert_eq!(
             parse(json!({})),
             Some(RequestedReviewer::Unresolved(EmptyObject {}))

@@ -232,7 +232,9 @@ impl Ord for Rfc3339Utc {
 // and `Serialize` emits the canonical form. Unlike the identity.rs impls —
 // whose error messages echo the offending value under the license that config
 // is the operator's own text — this error carries only the `ParseError`
-// class: API responses are third-party input and hold no such license.
+// class on BOTH arms: the wrong-JSON-type arm discards the deserializer's
+// own message too (serde's invalid-type errors echo scalar values), so the
+// fixed-message property holds without depending on callers discarding it.
 impl serde::Serialize for Rfc3339Utc {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.canonical)
@@ -244,7 +246,8 @@ impl<'de> serde::Deserialize<'de> for Rfc3339Utc {
     where
         D: serde::Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
+        let s = String::deserialize(deserializer)
+            .map_err(|_| serde::de::Error::custom(ParseError::Malformed))?;
         Rfc3339Utc::parse(&s).map_err(serde::de::Error::custom)
     }
 }
@@ -587,10 +590,15 @@ mod tests {
     #[test]
     fn serde_error_never_echoes_input() {
         // The ingest-boundary counterpart of parse_error_never_echoes_input:
-        // the serde error carries the ParseError class, not the input.
+        // the serde error carries the ParseError class, not the input — on
+        // both arms. String values reach parse()'s fieldless error; wrong
+        // JSON types get a fixed message rather than serde's own, which
+        // would echo the scalar ("invalid type: integer 42, ...").
         let sneaky = r#""owner/repo involves:someone-else""#;
         let err = serde_json::from_str::<Rfc3339Utc>(sneaky).unwrap_err();
         assert!(!format!("{err} {err:?}").contains("involves"));
+        let err = serde_json::from_str::<Rfc3339Utc>("42424242").unwrap_err();
+        assert!(!format!("{err} {err:?}").contains("42424242"));
     }
 
     #[test]

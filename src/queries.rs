@@ -99,28 +99,32 @@ pub fn discovery_terms(
 ///   * commits(last:1) carries head oid + committedDate. It does NOT carry
 ///     push time: Commit.pushedDate — the field prs.last_pushed_at was
 ///     designed around — is deprecated upstream ("no longer supported") and
-///     returns null on current PRs; selecting it is a null today and a
-///     broken hydration on every PR the day GitHub drops the field. OPEN QUESTION
+///     returns null on current PRs; selecting it buys nothing and breaks
+///     every hydration whenever GitHub drops the field. OPEN QUESTION
 ///     (milestone 2): the approval-staleness signal needs a replacement
 ///     source — candidates are the force-push timeline event (in tension
 ///     with the timeline standing rejection, DESIGN.md), the sync's own
 ///     observed head_sha flip time (local, not server time), or
 ///     committedDate as a lower bound (push ≥ commit, so approval <
 ///     committedDate proves staleness but the converse proves nothing).
-///     Interim guarantee, already encoded: last_pushed_at stays NULL, and
-///     NULL/unknown ordering degrades a PR OUT of ready_to_merge
-///     (attention.rs polarity) — the bucket under-fills, it never lies.
+///     Interim guarantee: last_pushed_at stays NULL, and attention's
+///     polarity contract degrades NULL/unknown ordering OUT of
+///     ready_to_merge (PLANNED, milestone 3 — attention.rs) — the bucket
+///     under-fills, it never lies.
 ///   * Every author selection in this hydration document carries __typename
 ///     (structural Bot detection at ingest, since sync --pr skips discovery)
-///     plus databaseId via User/Bot fragments (NULL for the rare Mannequin/
-///     Organization author). DISCOVERY fetches only login + __typename: its
-///     results decide skip-or-hydrate and are never stored, so databaseId
-///     there would be waste. databaseId is a stable id captured now so
-///     identity matching could move off logins (deferred; ROADMAP names the
-///     deciding evidence) — it is stored, not yet consulted (matching is
-///     login-keyed, identity.rs). author is
-///     Option everywhere in the parse types: author:null (deleted account) is
-///     ordinary data, ingested NULL, never an error or a filter match. All
+///     plus databaseId via User/Bot fragments (NULL when neither fragment
+///     matches — schema-possible for Mannequin; the Organization-author
+///     case observed live nulls the whole actor instead). DISCOVERY fetches
+///     only login + __typename: its results decide skip-or-hydrate and are
+///     never stored, so databaseId there would be waste. databaseId is a
+///     stable id captured now so identity matching could move off logins
+///     (deferred; ROADMAP names the deciding evidence) — it is stored, not
+///     yet consulted (matching is login-keyed, identity.rs). author is
+///     Option everywhere in the parse types: author:null is ordinary, live
+///     data (deleted users render as the `ghost` User, but legacy accounts
+///     converted to Organizations null the actor — observed on
+///     rails/rails#2), ingested NULL, never an error or a filter match. All
 ///     scalars on nodes already traversed, so zero extra rate-limit points —
 ///     only a few response bytes.
 ///   * authorAssociation on every author-bearing node — the PR, its reviews,

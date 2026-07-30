@@ -4,8 +4,12 @@
 //!
 //! Properties, over arbitrary bytes:
 //!   1. Totality: JSON or not, matched shape or not, no parse function
-//!      panics — accept or reject, never abort. (serde recursion depth is
-//!      covered too: serde_json's default 128-level limit errors first.)
+//!      panics — accept or reject, never abort. Precondition, named: the
+//!      Value comes from serde_json's byte parser, whose default 128-level
+//!      nesting cap is what bounds the typed deserializer's recursion — the
+//!      same precondition production holds (gh.rs, Response.data). A
+//!      hand-built Value deeper than a few thousand levels would overflow;
+//!      none is constructible through either path.
 //!   2. Round-trip stability, the direction a fixture cannot witness: every
 //!      ACCEPTED value re-serializes (the harness-only Serialize) and
 //!      re-parses to the same value. With deny_unknown_fields + required

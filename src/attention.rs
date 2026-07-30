@@ -5,7 +5,11 @@
 //! effective_review_state per PR, from three raw signals:
 //!   1. latestOpinionatedReviews — per-reviewer APPROVED / CHANGES_REQUESTED
 //!   2. review_requests          — who is currently asked
-//!   3. last head push time      — a review older than the last push is stale
+//!   3. last head push time      — a review older than the last push is
+//!      stale. Its source is an OPEN QUESTION (queries.rs, HYDRATE_PR:
+//!      Commit.pushedDate is deprecated upstream); until resolved the signal
+//!      is NULL, which this module's polarity degrades OUT of
+//!      ready_to_merge — the bucket under-fills, it never lies.
 //!
 //! reviewDecision (the raw API field) is stored but never trusted alone:
 //! branch protection makes it read REVIEW_REQUIRED over a human approval, and

@@ -177,8 +177,11 @@ pub fn is_bot(author_typename: &str) -> bool {
 /// bare semantics — bare-means-User cannot come back without reintroducing
 /// the silent under-filter.
 ///
-/// A deleted account (`author: null`) has no login and matches no pattern:
-/// that is ordinary data, never a filter hit (queries.rs, hydration notes).
+/// A null author has no login and matches no pattern: ordinary data, never
+/// a filter hit (queries.rs, hydration notes). Note the cause is not
+/// deletion — a deleted user renders as the `ghost` User, which HAS a login
+/// and can be excluded like any other; the observed null-author case is a
+/// legacy account converted to an Organization (parse.rs).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorPattern {
     login: Login,

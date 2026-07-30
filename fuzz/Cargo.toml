@@ -18,6 +18,9 @@ serde_json = "1"
 
 [dependencies.ghgraph]
 path = ".."
+# `harness` turns on the parse types' Serialize derives, which the
+# response_parse round-trip witness needs; shipped builds never enable it.
+features = ["harness"]
 
 [[bin]]
 name = "config_gate"
