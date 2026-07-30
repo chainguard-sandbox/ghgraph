@@ -740,6 +740,14 @@ mod tests {
         // — the Paged shape holds for page one and page N alike.
         assert!(node.review_threads.total_count >= 1);
         assert!(!node.review_threads.nodes.is_empty());
+        // Independent structural evidence, not just shape-parses: this is a
+        // real follow-up page, so pin the same load-bearing facts the
+        // first-page fixture pins.
+        let t = &node.review_threads.nodes[0];
+        assert!(!t.path.is_empty(), "path is schema-non-null");
+        assert!(t.comments.total_count >= 1);
+        assert!(!t.comments.nodes.is_empty());
+        assert!(t.comments.nodes[0].author.is_some());
     }
 
     // ------------------------------------------------------------------
@@ -830,7 +838,15 @@ mod tests {
         // ...and, the direction serde would silently forgive, for Option
         // fields: the `nullable` marker makes the KEY required while null
         // stays None, so dropping a nullable selection is just as loud.
-        for key in ["author", "mergedAt", "reviewDecision", "reviewRequests"] {
+        for key in [
+            "author",
+            "mergedAt",
+            "closedAt",
+            "reviewDecision",
+            "reviewRequests",
+            "latestOpinionatedReviews",
+            "closingIssuesReferences",
+        ] {
             let mut dropped = minimal_pr();
             dropped.as_object_mut().unwrap().remove(key);
             assert!(
@@ -955,14 +971,15 @@ mod tests {
             "pageInfo": {"hasNextPage": false, "endCursor": null},
             "nodes": []
         });
+        let rl = json!({"cost": 1, "remaining": 4999, "resetAt": "2026-01-01T00:00:00Z"});
         assert!(discovery(&json!({"search": search})).is_ok());
-        assert!(
-            discovery(&json!({
-                "search": search,
-                "rateLimit": {"cost": 1, "remaining": 4999, "resetAt": "2026-01-01T00:00:00Z"}
-            }))
-            .is_ok()
-        );
+        assert!(discovery(&json!({"search": search, "rateLimit": rl})).is_ok());
+        // Same leniency on the other two wrappers — one test per envelope,
+        // so a refactor cannot narrow one of them unnoticed.
+        assert!(hydrate_pr(&json!({"node": null})).is_ok());
+        assert!(hydrate_pr(&json!({"node": null, "rateLimit": rl})).is_ok());
+        assert!(threads_page(&json!({"node": null})).is_ok());
+        assert!(threads_page(&json!({"node": null, "rateLimit": rl})).is_ok());
     }
 
     #[test]
