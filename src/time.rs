@@ -470,7 +470,8 @@ mod tests {
 
     #[test]
     fn canonical_charset_is_bounded() {
-        // The injection-safety argument (A3) depends on the canonical form
+        // The injection-safety argument (discovery_terms, queries.rs)
+        // depends on the canonical form
         // staying within [0-9:TZ-] — no whitespace, no ':' outside HH:MM:SS.
         // Check representative values AND the domain boundaries, where an extreme
         // epoch could otherwise widen or sign-prefix a field. (epoch_arith fuzzes

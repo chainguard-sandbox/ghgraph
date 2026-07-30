@@ -129,8 +129,10 @@ pub struct RepoConfig {
     /// dependabot bot — the rationale is recorded at AuthorPattern);
     /// "x[bot]" NARROWS the match to GraphQL author type Bot (the API
     /// returns bare logins for bots — a literal bracket match would never
-    /// fire). Applied at discovery (excluded PRs are skipped before
-    /// hydration, so they cost discovery only) and enforced at ingest.
+    /// fire). PLANNED (milestone 2 sync applies it at discovery — excluded
+    /// PRs are skipped before hydration, so they cost discovery only — and
+    /// enforces it at ingest; milestone 4 lands the project-scope filter
+    /// defaults around it).
     /// Filters govern ingest, never deletion: excluding an author later
     /// does not touch their archived rows. Note bot-typed authors are
     /// already excluded by default at project scope — exclude_authors is
@@ -425,6 +427,23 @@ mod tests {
             )
             .is_ok(),
             "valid exclude_authors (incl. [bot]) must be accepted"
+        );
+    }
+
+    // Duplicate keys are rejected, never last-wins (ROADMAP milestone 1:
+    // "rejects duplicate keys explicitly, or closure regresses while
+    // diagnosability improves"). serde's duplicate-field detection is the
+    // mechanism; this pins it so a Deserialize rewrite cannot drop it.
+    #[test]
+    fn duplicate_keys_are_rejected() {
+        assert!(
+            serde_json::from_str::<Config>(r#"{"viewer":"a","viewer":"b","repos":["o/n"]}"#)
+                .is_err(),
+            "duplicate top-level key must be rejected"
+        );
+        assert!(
+            serde_json::from_str::<RepoEntry>(r#"{"repo":"a/b","repo":"c/d"}"#).is_err(),
+            "duplicate key in a repos object entry must be rejected"
         );
     }
 

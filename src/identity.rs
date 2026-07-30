@@ -28,7 +28,11 @@
 //! echo its input, so untrusted text can never reach an error message through
 //! this module. The `Deserialize` impls DO name the offending value — the
 //! config file is the operator's own text, and config errors name the entry
-//! and field by contract (DESIGN.md, Config).
+//! and field by contract (DESIGN.md, Config). That echo is licensed ONLY by
+//! that precondition: ingest parse types (milestone 2) must carry API logins
+//! as plain data fields — stored as received, compared via [`login_eq`] —
+//! never deserialized through these impls, or third-party text lands in a
+//! CONFIGURATION message.
 
 use std::fmt;
 
@@ -51,7 +55,8 @@ impl fmt::Display for IdentityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             IdentityError::Login => {
-                "not a valid GitHub login (letters, digits, interior hyphens; 1\u{2013}39 chars)"
+                "not a valid GitHub login (letters, digits, '-' or '_', \
+                 not starting with '-'; 1\u{2013}39 chars)"
             }
             IdentityError::Repo => "not of the form owner/name",
             IdentityError::AuthorPattern => "not a valid login (optionally with a [bot] suffix)",
@@ -75,7 +80,7 @@ impl Login {
         }
     }
 
-    /// The canonical (lowercase) login. Charset `[a-z0-9-]` — no whitespace,
+    /// The canonical (lowercase) login. Charset `[a-z0-9-_]` — no whitespace,
     /// no ':' — so interpolating it into a search qualifier cannot smuggle a
     /// second qualifier.
     pub fn as_str(&self) -> &str {
@@ -220,17 +225,24 @@ impl<'de> Deserialize<'de> for AuthorPattern {
 }
 
 fn is_login(s: &str) -> bool {
-    // GitHub logins are 1–39 chars of [A-Za-z0-9-] and may not begin or end
-    // with a hyphen. The leading/trailing-hyphen check is not injection defense
-    // (a hyphen smuggles no qualifier — space and ':' are excluded by the
-    // charset regardless); it keeps the gate's admitted set from being wider
-    // than GitHub's, so a bad login earns a clean CONFIGURATION message here
-    // instead of an opaque API rejection later.
+    // GitHub's LIVE login set, not the signup form's: 1–39 chars of
+    // [A-Za-z0-9-_]. The signup rule ("alphanumeric or single interior
+    // hyphens") is narrower than what exists — trailing-hyphen accounts
+    // (`a-`, `b-`, org `Test-`) and consecutive-hyphen accounts
+    // (`foo--bar`) are live grandfathered users, and Enterprise Managed
+    // Users get `_` in their `IDP-USERNAME_SHORT-CODE` logins (probed and
+    // cited 2026-07-29). A gate narrower than GitHub hard-rejects a valid
+    // config; a gate slightly wider only trades a clean CONFIGURATION
+    // message for an empty search result. Injection defense needs none of
+    // this: space and ':' are excluded by the charset regardless.
+    // A LEADING hyphen stays rejected: no live account was found by probe,
+    // and '-' is the search syntax's negation prefix (`-involves:x`) —
+    // revisit on the first real leading-hyphen login.
     !s.is_empty()
         && s.len() <= 39
         && s.bytes().next() != Some(b'-')
-        && s.bytes().next_back() != Some(b'-')
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 fn is_repo(s: &str) -> bool {
@@ -263,14 +275,20 @@ mod tests {
             "a:b",
             "has space",
             "",
-            "-foo", // leading hyphen: GitHub disallows, and so does the gate
-            "bar-", // trailing hyphen: likewise
+            "-foo", // leading hyphen: search's negation prefix; no live account found
             &"x".repeat(40),
         ] {
             assert!(Login::new(bad).is_err(), "should reject {bad:?}");
         }
         assert!(Login::new("octocat").is_ok());
         assert!(Login::new("a-b-1").is_ok()); // interior hyphens are fine
+        // Live GitHub accounts the signup-form rule would deny (probed
+        // 2026-07-29): trailing hyphen (`b-`, org `Test-`), consecutive
+        // hyphens (`foo--bar`), and EMU underscore logins. The gate admits
+        // what exists, not what the form allows.
+        assert!(Login::new("b-").is_ok());
+        assert!(Login::new("foo--bar").is_ok());
+        assert!(Login::new("mona-cat_octo").is_ok());
     }
 
     // is_repo must reject malformed forms ("/owner/name", "owner//name",
@@ -360,7 +378,8 @@ mod tests {
     fn error_display_states_the_rule() {
         assert_eq!(
             IdentityError::Login.to_string(),
-            "not a valid GitHub login (letters, digits, interior hyphens; 1\u{2013}39 chars)"
+            "not a valid GitHub login (letters, digits, '-' or '_', \
+             not starting with '-'; 1\u{2013}39 chars)"
         );
         assert_eq!(
             IdentityError::Repo.to_string(),
@@ -382,9 +401,9 @@ mod tests {
         fn reference(s: &str) -> bool {
             !s.is_empty()
                 && s.len() <= 39
-                && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
                 && !s.starts_with('-')
-                && !s.ends_with('-')
         }
         for a in 0u8..=127 {
             let s1 = String::from_utf8(vec![a]).unwrap();

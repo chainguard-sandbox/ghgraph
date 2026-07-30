@@ -23,9 +23,9 @@ use ghgraph::identity::{AuthorPattern, Login, RepoName, is_bot, login_eq};
 fn valid_login_chars(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 39
-        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
         && !s.starts_with('-')
-        && !s.ends_with('-')
 }
 
 fuzz_target!(|data: &[u8]| {

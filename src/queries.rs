@@ -99,8 +99,9 @@ pub fn discovery_terms(
 ///     Organization author). DISCOVERY fetches only login + __typename: its
 ///     results decide skip-or-hydrate and are never stored, so databaseId
 ///     there would be waste. databaseId is a stable id captured now so
-///     identity matching can move off logins in a later milestone — it is
-///     stored, not yet consulted (matching is login-keyed today). author is
+///     identity matching could move off logins (deferred; ROADMAP names the
+///     deciding evidence) — it is stored, not yet consulted (matching is
+///     login-keyed, identity.rs). author is
 ///     Option everywhere in the parse types: author:null (deleted account) is
 ///     ordinary data, ingested NULL, never an error or a filter match. All
 ///     scalars on nodes already traversed, so zero extra rate-limit points —
@@ -113,7 +114,8 @@ pub fn discovery_terms(
 ///     comments.kind='review' rows never leave author_assoc silently NULL.
 ///   * repository { nameWithOwner } is the PR's own view of its repo:
 ///     a mismatch against config — compared case-folded, since repo identity
-///     is case-insensitive (config.rs lowercases; fold nameWithOwner too) —
+///     is case-insensitive (RepoName folds at construction, identity.rs;
+///     fold nameWithOwner to match) —
 ///     detects a rename/transfer and surfaces as CONFIGURATION ("repo
 ///     renamed — update config"), never a silent follow or empty stream.
 pub const HYDRATE_PR: &str = r#"

@@ -80,12 +80,11 @@ Project scope defaults defensively, because a busy repo's stream is mostly
 machinery: bot-authored PRs (author type `Bot` — structural, never a login
 pattern) are excluded unless `bots: true`; `exclude_authors` drops named
 accounts through one login-equivalence function (identity.rs): a bare login
-matches by case-insensitive login regardless of author type — excluding
-"dependabot" must filter the dependabot bot, the common intent, so an
-earlier bare-means-User draft was rejected as a silent under-filter — and
-the `x[bot]` suffix narrows the match to author type `Bot` (GitHub returns
-bare logins for bots; the suffix is ghgraph's affordance, and the rationale
-and its reversal condition are recorded at AuthorPattern); per-repo
+matches by case-insensitive login regardless of author type, and the
+`x[bot]` suffix narrows the match to author type `Bot` (GitHub returns
+bare logins for bots; the suffix is ghgraph's affordance — the rejected
+bare-means-User draft and the rule's reversal condition are recorded at
+AuthorPattern); per-repo
 `lookback_days` makes a huge archive opt-in rather than the price of the
 scope; and the issue stream is on by default at project scope only —
 `issues: true` at working scope is a configuration error, never a silent
