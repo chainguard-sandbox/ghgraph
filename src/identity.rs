@@ -349,6 +349,12 @@ mod tests {
             RepoName::new("Foo/Bar").unwrap(),
             RepoName::new("foo/bar").unwrap()
         );
+        // Display renders the canonical form — discovery_terms interpolates
+        // via {}, so Display == as_str is what the qualifier actually gets.
+        let l = Login::new("OctoCat").unwrap();
+        assert_eq!(format!("{l}"), l.as_str());
+        let r = RepoName::new("Foo/Bar").unwrap();
+        assert_eq!(format!("{r}"), r.as_str());
     }
 
     #[test]
@@ -369,6 +375,10 @@ mod tests {
         let e: IdentityError = Login::new("has space").unwrap_err();
         let copied: IdentityError = e; // Copy: no room for captured input
         assert!(!copied.to_string().contains("has space"));
+        // Debug is an error surface too (tracing events, unwrap panics) —
+        // pinned like time.rs's ParseError, so a hand-rolled Debug impl
+        // echoing input could never land silently.
+        assert!(!format!("{e:?}").contains("has space"));
     }
 
     // The Display strings are the operator-facing rule text the Deserialize
@@ -480,6 +490,13 @@ mod tests {
             "suffix must be terminal"
         );
         assert!(AuthorPattern::parse("[bot]").is_err(), "empty core rejects");
+        // The suffix is byte-exact: "[BOT]" strips nothing, the brackets
+        // then fail the login charset — a loud reject, never a silent
+        // bare-pattern misparse.
+        assert!(
+            AuthorPattern::parse("alice[BOT]").is_err(),
+            "[BOT] uppercase rejects"
+        );
     }
 
     // Deserialize IS validation: serde paths cannot yield unvalidated values,
