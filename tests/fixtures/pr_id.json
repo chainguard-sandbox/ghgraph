@@ -1,0 +1,14 @@
+{
+  "data": {
+    "rateLimit": {
+      "cost": 1,
+      "remaining": 4941,
+      "resetAt": "2026-07-31T22:40:00Z"
+    },
+    "repository": {
+      "pullRequest": {
+        "id": "PR_kwDODKw3uc7xAi-o"
+      }
+    }
+  }
+}

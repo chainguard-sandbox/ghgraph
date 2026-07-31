@@ -27,6 +27,15 @@
 //!   deleted author (the `ghost` User; the schema-permitted `author: null`
 //!   is pinned by hand in parse.rs instead).
 //! * threads_page.json — THREADS_PAGE against cli/cli#13864, no cursor.
+//! * comments_page.json — COMMENTS_PAGE against cli/cli#13987, no cursor.
+//! * pr_id.json — PR_ID for cli/cli#13864; the capture asserts it returns
+//!   the node id the hydration fixtures pin, tying the two documents to
+//!   one PR.
+//!
+//! One `#[ignore]` test per fixture group, so a single fixture can be
+//! re-captured without churning the others — the pinned targets were chosen
+//! for properties (a bot in the discovery page, a private-team request) a
+//! later full re-capture is not guaranteed to reproduce.
 //!
 //! All public data. `gh` must be authenticated (`make doctor`).
 
@@ -73,7 +82,7 @@ fn write_fixture(name: &str, raw: &str) {
 
 #[test]
 #[ignore = "talks to live GitHub and rewrites tests/fixtures/ — run explicitly"]
-fn capture_fixtures() {
+fn capture_discovery_page() {
     // The discovery term goes through the real builder, not a hand-written
     // string: config::parse + discovery_terms are part of what is captured.
     let cfg = ghgraph::config::parse(
@@ -87,13 +96,18 @@ fn capture_fixtures() {
         &cfg.viewer,
         &cfg.people,
         &since,
+        None,
     );
     // terms[0] is the involves: flavor (queries.rs pins the order).
     write_fixture(
         "discovery_page.json",
         &gh_graphql(ghgraph::queries::DISCOVERY, &[("q", &terms[0])]),
     );
+}
 
+#[test]
+#[ignore = "talks to live GitHub and rewrites tests/fixtures/ — run explicitly"]
+fn capture_hydrations() {
     for (name, id) in [
         ("hydrate_pr_threads.json", "PR_kwDODKw3uc7xAi-o"),
         ("hydrate_pr_comments.json", "PR_kwDODKw3uc73afq3"),
@@ -104,7 +118,11 @@ fn capture_fixtures() {
             &gh_graphql(ghgraph::queries::HYDRATE_PR, &[("id", id)]),
         );
     }
+}
 
+#[test]
+#[ignore = "talks to live GitHub and rewrites tests/fixtures/ — run explicitly"]
+fn capture_threads_page() {
     write_fixture(
         "threads_page.json",
         &gh_graphql(
@@ -112,4 +130,34 @@ fn capture_fixtures() {
             &[("id", "PR_kwDODKw3uc7xAi-o")],
         ),
     );
+}
+
+#[test]
+#[ignore = "talks to live GitHub and rewrites tests/fixtures/ — run explicitly"]
+fn capture_comments_page() {
+    write_fixture(
+        "comments_page.json",
+        &gh_graphql(
+            ghgraph::queries::COMMENTS_PAGE,
+            &[("id", "PR_kwDODKw3uc73afq3")],
+        ),
+    );
+}
+
+#[test]
+#[ignore = "talks to live GitHub and rewrites tests/fixtures/ — run explicitly"]
+fn capture_pr_id() {
+    let raw = gh_graphql(
+        &ghgraph::queries::pr_id_document(13864),
+        &[("owner", "cli"), ("name", "cli")],
+    );
+    // The lookup and the hydration fixtures must name the same PR: the id
+    // returned here is the id capture_threads_page hydrates.
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("JSON");
+    assert_eq!(
+        v["data"]["repository"]["pullRequest"]["id"],
+        "PR_kwDODKw3uc7xAi-o",
+        "PR_ID must resolve cli/cli#13864 to the pinned hydration id"
+    );
+    write_fixture("pr_id.json", &raw);
 }

@@ -32,6 +32,20 @@ fn default_workers() -> usize {
     3
 }
 
+// Retry policy is OWNED by ghgraph (gh does not retry; the operator should
+// not have to babysit) — mechanics live in gh.rs, these are the knobs. Both
+// defaults are conservative ships to be tuned from sync_runs telemetry
+// (ROADMAP, deferred list): 3 attempts rides out a blip without hammering a
+// down API; the per-repo budget stops a pathological repo from spending the
+// whole run's wall clock on backoff sleeps.
+fn default_retry_attempts() -> u32 {
+    3
+}
+
+fn default_retry_budget() -> u32 {
+    20
+}
+
 fn default_rate_limit_floor() -> u32 {
     // The GraphQL point budget (5,000/hr) is shared with the operator's
     // interactive gh use and anything else on the token. When `remaining`
@@ -212,6 +226,13 @@ pub struct Config {
     /// this; the deferral is recorded, never silent.
     #[serde(default = "default_rate_limit_floor")]
     pub rate_limit_floor: u32,
+    /// Attempts per gh call before the failure escalates (quarantine for a
+    /// hydration, Failed for discovery). Only transient classes retry.
+    #[serde(default = "default_retry_attempts")]
+    pub retry_attempts: u32,
+    /// Total retries one repo may spend per run, across all its calls.
+    #[serde(default = "default_retry_budget")]
+    pub retry_budget: u32,
 }
 
 impl Config {
@@ -380,6 +401,8 @@ mod tests {
         assert_eq!(c.reverify_closed_days, 30);
         assert_eq!(c.workers, 3);
         assert_eq!(c.rate_limit_floor, 500);
+        assert_eq!(c.retry_attempts, 3);
+        assert_eq!(c.retry_budget, 20);
     }
 
     // validate() must reject a malformed repo (not just a bad viewer) and the

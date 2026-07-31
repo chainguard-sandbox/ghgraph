@@ -48,13 +48,18 @@ query($q: String!, $after: String) {
 }"#;
 
 /// The discovery search strings for one configured repo.
-/// `since` is the caller's watermark with the overlap window already applied.
+/// `since` is the caller's watermark with the overlap window already applied;
+/// `until`, when present, closes the window (`updated:since..until`) — the
+/// cap-splitting walk (sync.rs) halves a window that GitHub's ~1,000-result
+/// search cap truncated, and the halves need a bounded range. `None` is the
+/// open form (`updated:>=since`), the ordinary single-window case.
 /// This signature is the injection boundary: every interpolated value is a
 /// validating newtype — RepoName and Login (identity.rs) admit no space or
 /// ':', Rfc3339Utc's canonical form is charset-bounded to [0-9:TZ-] with ':'
 /// only in the fixed HH:MM:SS positions — so a value that could smuggle a
 /// second qualifier ("owner/name involves:someone-else") is unrepresentable
-/// here, not filtered here. The counterexample strings live on as unit tests
+/// here, not filtered here (the ".." separator is this function's own
+/// literal, not data). The counterexample strings live on as unit tests
 /// (identity.rs, config.rs). Do not add interpolation sites that take raw
 /// strings.
 pub fn discovery_terms(
@@ -62,8 +67,13 @@ pub fn discovery_terms(
     viewer: &Login,
     people: &[Login],
     since: &Rfc3339Utc,
+    until: Option<&Rfc3339Utc>,
 ) -> Vec<String> {
-    let base = format!("repo:{} updated:>={since} sort:updated-desc", rc.repo);
+    let updated = match until {
+        Some(until) => format!("updated:{since}..{until}"),
+        None => format!("updated:>={since}"),
+    };
+    let base = format!("repo:{} {updated} sort:updated-desc", rc.repo);
     let pr = format!("{base} is:pr");
     match rc.scope {
         Scope::Project => {
@@ -190,8 +200,8 @@ query($id: ID!) {
 }"#;
 
 /// Follow-up page for any overflowed hydration connection, rooted at the
-/// parent node id. Variables: $id, $after. One document per connection kind;
-/// THREADS_PAGE shown, COMMENTS_PAGE analogous.
+/// parent node id. Variables: $id, $after. One document per connection kind:
+/// THREADS_PAGE here, COMMENTS_PAGE below.
 ///
 /// totalCount is re-selected on every page, not just the first: the count
 /// can move mid-walk (a thread lands during pagination), and a follow-up
@@ -220,6 +230,46 @@ query($id: ID!, $after: String) {
   rateLimit { cost remaining resetAt }
 }"#;
 
+/// Follow-up page for the top-level comments connection — same shape rules
+/// as THREADS_PAGE (totalCount re-selected every page; parse::Paged both
+/// pages). Until this document existed, a PR with more than 50 top-level
+/// comments could only be marked truncated (the second-round B1 panel
+/// caught the "analogous" comment standing in for the const).
+pub const COMMENTS_PAGE: &str = r#"
+query($id: ID!, $after: String) {
+  node(id: $id) {
+    ... on PullRequest {
+      comments(first: 100, after: $after) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes { id body createdAt lastEditedAt url isMinimized authorAssociation
+                author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}"#;
+
+/// The node-id lookup for `sync --pr`: hydration is by node id, but the
+/// operator names a (repo, number). Variables: $owner, $name — the number is
+/// inlined into the document text instead of passed as a variable, because
+/// `gh -f` sends string variables only and `pullRequest(number:)` takes an
+/// Int; the inlined value is a validated `u64`, so its rendering is
+/// digits-only — the same argument that lets `discovery_terms` interpolate
+/// its newtypes. Do not extend this precedent to any non-numeric type.
+/// `repository` and `pullRequest` are both schema-nullable: null means "not
+/// found or not visible", which is data for the caller (USER_INPUT naming
+/// the reference), never a parse error.
+pub fn pr_id_document(number: u64) -> String {
+    format!(
+        r#"
+query($owner: String!, $name: String!) {{
+  repository(owner: $owner, name: $name) {{ pullRequest(number: {number}) {{ id }} }}
+  rateLimit {{ cost remaining resetAt }}
+}}"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::discovery_terms;
@@ -243,7 +293,7 @@ mod tests {
         )
         .unwrap();
         let rc = cfg.repos[0].resolved();
-        let terms = discovery_terms(&rc, &cfg.viewer, &cfg.people, &since());
+        let terms = discovery_terms(&rc, &cfg.viewer, &cfg.people, &since(), None);
         let base = "repo:o/n updated:>=2026-07-01T00:00:00Z sort:updated-desc is:pr";
         assert_eq!(
             terms,
@@ -268,7 +318,7 @@ mod tests {
         .unwrap();
         let rc = cfg.repos[0].resolved();
         let people: Vec<Login> = Vec::new();
-        let terms = discovery_terms(&rc, &cfg.viewer, &people, &since());
+        let terms = discovery_terms(&rc, &cfg.viewer, &people, &since(), None);
         let base = "repo:o/n updated:>=2026-07-01T00:00:00Z sort:updated-desc";
         assert_eq!(
             terms,
@@ -281,7 +331,39 @@ mod tests {
         )
         .unwrap();
         let rc = no_issues.repos[0].resolved();
-        let terms = discovery_terms(&rc, &no_issues.viewer, &people, &since());
+        let terms = discovery_terms(&rc, &no_issues.viewer, &people, &since(), None);
         assert_eq!(terms, vec![format!("{base} is:pr")]);
+    }
+
+    // The bounded window form the cap-splitting walk uses: a closed
+    // updated:since..until range, same injection-safe interpolation.
+    #[test]
+    fn bounded_window_emits_closed_range() {
+        let cfg = parse(
+            r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"project","issues":false}]}"#,
+            "<test>",
+        )
+        .unwrap();
+        let rc = cfg.repos[0].resolved();
+        let until = Rfc3339Utc::parse("2026-07-15T12:00:00Z").unwrap();
+        let terms = discovery_terms(&rc, &cfg.viewer, &[], &since(), Some(&until));
+        assert_eq!(
+            terms,
+            vec![
+                "repo:o/n updated:2026-07-01T00:00:00Z..2026-07-15T12:00:00Z \
+                 sort:updated-desc is:pr"
+                    .to_string()
+            ]
+        );
+    }
+
+    // pr_id_document inlines only a validated u64 (digits); the two string
+    // identifiers stay variables. Pin the rendered shape.
+    #[test]
+    fn pr_id_document_inlines_digits_only() {
+        let doc = super::pr_id_document(13864);
+        assert!(doc.contains("pullRequest(number: 13864)"), "{doc}");
+        assert!(doc.contains("$owner: String!"), "{doc}");
+        assert!(doc.contains("rateLimit"), "{doc}");
     }
 }

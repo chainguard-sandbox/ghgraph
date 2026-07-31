@@ -43,11 +43,15 @@
 //!     and no data is still a failure even when the exit code says 0.
 //!     Reversal: a masked-null case parse.rs cannot express as a defined
 //!     outcome would force errors-array inspection here — none is known.
-//!   * Retry policy is owned here, bounded, and configured: attempts per
-//!     call, per-repo budget. PLANNED (milestone 2, landing with the
-//!     scheduler that consumes it — a config field with no consumer is the
-//!     telemetry rule's counterexample). Primary rate limits fold into the
-//!     floor's defer-record-exit path — one budget, one mechanism.
+//!   * Retry policy is owned here, bounded, and configured (config.rs:
+//!     `retry_attempts` per call, `retry_budget` per repo): the caller hands
+//!     [`graphql`] a per-repo [`GhCtx`] and gh.rs decides what retries.
+//!     Only transient classes retry — secondary rate limits on a long
+//!     backoff, watchdog kills and unclassified failures on a short one.
+//!     A PRIMARY rate limit never retries: it folds into the floor's
+//!     defer-record-exit path (one budget, one mechanism), which is why the
+//!     failure carries a typed kind ([`FailureKind::RateExhausted`]) the
+//!     scheduler can match without string-sniffing.
 //!   * gh's output is redacted for token shapes before any of it reaches
 //!     an envelope: `gh[pousr]_` and `github_pat_` prefixes followed by
 //!     8+ `[A-Za-z0-9_]` (see [`scrub_tokens`]), then capped at ~1KB.
@@ -58,8 +62,8 @@
 //!     them; the failure class is parsed from stderr:
 //!
 //! ```text
-//! "secondary rate limit"      → TRANSIENT, backoff with jitter
-//! "API rate limit exceeded"   → TRANSIENT, sleep toward resetAt
+//! "secondary rate limit"      → TRANSIENT, retried on a long backoff
+//! "API rate limit exceeded"   → TRANSIENT, RateExhausted: defer, never retry
 //! "Bad credentials"           → CONFIGURATION (token invalid/expired)
 //! exit code 4                 → CONFIGURATION (gh auth login needed)
 //! gh binary absent            → CONFIGURATION
@@ -114,6 +118,19 @@ const WATCHDOG_DEADLINE: Duration = Duration::from_secs(120);
 
 /// `gh --version` prints instantly or something is wrong with the install.
 const VERSION_DEADLINE: Duration = Duration::from_secs(10);
+
+/// `gh api user` is one tiny REST round trip; a healthy call is
+/// sub-second, and 30s absorbs a slow link without letting a wedged
+/// credential helper stall the run's first step for the full watchdog span.
+const IDENTITY_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Backoff bases for the two retried classes. Fixed schedules, no jitter:
+/// jitter decorrelates fleets, and a sync is one client (the no-RNG rule
+/// keeps summaries byte-stable anyway — sleep timing is not output, but a
+/// second mechanism needs a reason). Constants until sync_runs telemetry
+/// names a consumer, like WATCHDOG_DEADLINE.
+const SECONDARY_BACKOFF: Duration = Duration::from_secs(30);
+const TRANSIENT_BACKOFF: Duration = Duration::from_secs(1);
 
 /// try_wait poll granularity: cheap enough to be negligible against a
 /// network round trip, fine enough that the deadline error is small.
@@ -182,21 +199,139 @@ pub struct Response {
     pub rate_limit: Option<RateLimit>,
 }
 
-/// One GraphQL round trip. `vars` become string variables; typed variables
-/// are not needed by any current query.
-pub fn graphql(query: &str, vars: &[(&str, &str)]) -> Result<Response> {
-    graphql_with(Path::new("gh"), WATCHDOG_DEADLINE, query, vars)
+/// Why a call failed, typed for the scheduler — the summary and the defer
+/// path match on this, never on message text (the "never string-sniffs"
+/// rule). `error` carries the operator-facing classification (its `code`
+/// already names the actor); `kind` carries the retry semantics.
+#[derive(Debug)]
+pub struct GhError {
+    pub kind: FailureKind,
+    pub error: Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// Primary point budget exhausted: never retried here — the scheduler
+    /// folds it into the rate-limit floor's defer path (one mechanism).
+    RateExhausted,
+    /// Secondary (abuse) rate limit: retried on the long backoff.
+    SecondaryLimit,
+    /// The watchdog killed a stalled gh: retried on the short backoff,
+    /// counted per call into [`Telemetry::watchdog_kills`].
+    Watchdog,
+    /// Operator-fixable (auth, missing binary): never retried.
+    Config,
+    /// Everything else on the classification table's default row: retried
+    /// on the short backoff.
+    Other,
+}
+
+/// Per-call accounting, accumulated per repo in [`GhCtx`] and folded into
+/// the sync summary's `cost`/`health` groups. Every field feeds a named
+/// summary field (the telemetry rule); durations are integer milliseconds
+/// internally and print as whole seconds (no floats in output).
+#[derive(Debug, Default, Clone)]
+pub struct Telemetry {
+    pub subprocess_count: u64,
+    pub subprocess_ms: u64,
+    pub bytes_parsed: u64,
+    pub rate_cost: u64,
+    pub sleeps: u64,
+    pub sleep_ms: u64,
+    pub watchdog_kills: u64,
+    /// Successful responses whose rateLimit envelope was missing or
+    /// malformed — the floor flew blind for that call. Nonzero detects a
+    /// transport/envelope regression (its named consumer).
+    pub rate_limit_unknown: u64,
+    /// Latest observed budget state; the floor check reads these.
+    pub remaining: Option<u32>,
+    pub reset_at: Option<Rfc3339Utc>,
+}
+
+/// Per-repo call context: the configured retry policy, the repo's remaining
+/// retry budget, and the accumulated telemetry. gh.rs owns what happens
+/// between attempts; the caller owns what a final failure means.
+#[derive(Debug)]
+pub struct GhCtx {
+    pub attempts_per_call: u32,
+    pub retry_budget: u32,
+    pub tel: Telemetry,
+}
+
+impl GhCtx {
+    pub fn new(attempts_per_call: u32, retry_budget: u32) -> GhCtx {
+        GhCtx {
+            attempts_per_call,
+            retry_budget,
+            tel: Telemetry::default(),
+        }
+    }
+
+    /// One attempt, no budget: the version-gate/test form.
+    fn single() -> GhCtx {
+        GhCtx::new(1, 0)
+    }
+}
+
+/// One GraphQL round trip with the configured retry policy. `vars` become
+/// string variables; typed variables are not needed by any current query
+/// (PR_ID inlines its one Int — queries.rs records why).
+pub fn graphql(query: &str, vars: &[(&str, &str)], ctx: &mut GhCtx) -> std::result::Result<Response, GhError> {
+    graphql_ctx(Path::new("gh"), WATCHDOG_DEADLINE, query, vars, ctx)
 }
 
 /// [`graphql`] with the binary and deadline injectable, so the tests can run
 /// a fake gh from a scratch directory without mutating process env (set_var
 /// is `unsafe` in edition 2024; unsafe is forbidden crate-wide).
-fn graphql_with(
+fn graphql_ctx(
     bin: &Path,
     deadline: Duration,
     query: &str,
     vars: &[(&str, &str)],
-) -> Result<Response> {
+    ctx: &mut GhCtx,
+) -> std::result::Result<Response, GhError> {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let err = match graphql_once(bin, deadline, query, vars, &mut ctx.tel) {
+            Ok(resp) => return Ok(resp),
+            Err(err) => err,
+        };
+        let retryable = matches!(
+            err.kind,
+            FailureKind::SecondaryLimit | FailureKind::Watchdog | FailureKind::Other
+        );
+        if !retryable || attempt >= ctx.attempts_per_call.max(1) || ctx.retry_budget == 0 {
+            return Err(err);
+        }
+        ctx.retry_budget -= 1;
+        let pause = backoff(err.kind, attempt);
+        ctx.tel.sleeps += 1;
+        ctx.tel.sleep_ms += u64::try_from(pause.as_millis()).unwrap_or(u64::MAX);
+        thread::sleep(pause);
+    }
+}
+
+/// The pause before retry `attempt + 1`, by failure class: secondary rate
+/// limits get the long linear schedule (GitHub's guidance is a generous
+/// pause, and hammering converts throttling into a ban); everything else
+/// gets a short doubling schedule capped at 8s (a blip either clears fast
+/// or is not a blip).
+fn backoff(kind: FailureKind, attempt: u32) -> Duration {
+    match kind {
+        FailureKind::SecondaryLimit => SECONDARY_BACKOFF * attempt,
+        _ => TRANSIENT_BACKOFF * (1u32 << (attempt - 1).min(3)),
+    }
+}
+
+/// One spawn-to-reap round trip, telemetry recorded, no retry.
+fn graphql_once(
+    bin: &Path,
+    deadline: Duration,
+    query: &str,
+    vars: &[(&str, &str)],
+    tel: &mut Telemetry,
+) -> std::result::Result<Response, GhError> {
     let mut args = vec![
         "api".to_string(),
         "graphql".to_string(),
@@ -207,19 +342,83 @@ fn graphql_with(
         args.push("-f".to_string());
         args.push(format!("{k}={v}"));
     }
-    let out = run_gh(bin, &args, Some(query), deadline)?;
+    let start = Instant::now();
+    let out = run_gh(bin, &args, Some(query), deadline).map_err(|error| GhError {
+        kind: FailureKind::Config,
+        error,
+    })?;
+    tel.subprocess_count += 1;
+    tel.subprocess_ms += u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tel.bytes_parsed += out.stdout.len() as u64;
+    if out.killed {
+        tel.watchdog_kills += 1;
+    }
     // Body first, unconditionally: a complete, data-bearing response is a
     // success even from a child the watchdog had to kill after it wrote one.
     if let Some(resp) = body_success(&out.stdout) {
+        match &resp.rate_limit {
+            Some(rl) => {
+                tel.rate_cost += u64::from(rl.cost);
+                tel.remaining = Some(rl.remaining);
+                tel.reset_at = Some(rl.reset_at.clone());
+            }
+            None => tel.rate_limit_unknown += 1,
+        }
         return Ok(resp);
     }
     if out.killed {
+        return Err(GhError {
+            kind: FailureKind::Watchdog,
+            error: Error::transient(format!(
+                "gh produced no exit within {}s and was killed by the watchdog",
+                deadline.as_secs()
+            )),
+        });
+    }
+    Err(classify(out.status, &out.stderr))
+}
+
+/// The single-shot form the unit tests drive (one attempt, classification
+/// flattened to the envelope error). Shipped code goes through [`graphql`].
+#[cfg(test)]
+fn graphql_with(
+    bin: &Path,
+    deadline: Duration,
+    query: &str,
+    vars: &[(&str, &str)],
+) -> Result<Response> {
+    graphql_ctx(bin, deadline, query, vars, &mut GhCtx::single()).map_err(|e| e.error)
+}
+
+/// The authenticated account's login, via `gh api user` (REST) — run once at
+/// sync start beside the version gate. A viewer/config mismatch means every
+/// working-scope search returns someone else's involvement (or nothing),
+/// silently; the caller compares via `identity::login_eq` and refuses. The
+/// returned login is API text: compared, bound, never interpolated into an
+/// error message (the caller's mismatch envelope echoes only the config
+/// value, whose echo is licensed).
+pub fn viewer_login() -> Result<String> {
+    viewer_login_with(Path::new("gh"), IDENTITY_DEADLINE)
+}
+
+fn viewer_login_with(bin: &Path, deadline: Duration) -> Result<String> {
+    let args = ["api".to_string(), "user".to_string()];
+    let out = run_gh(bin, &args, None, deadline)?;
+    if out.killed {
         return Err(Error::transient(format!(
-            "gh produced no exit within {}s and was killed by the watchdog",
+            "gh api user produced no exit within {}s and was killed by the watchdog",
             deadline.as_secs()
         )));
     }
-    Err(classify(out.status, &out.stderr))
+    // Body decides, REST edition: the success body is the user object
+    // itself (no `data` wrapper), and `login` is its required key.
+    if out.status.is_some_and(|s| s.success())
+        && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        && let Some(login) = v.get("login").and_then(|l| l.as_str())
+    {
+        return Ok(login.to_string());
+    }
+    Err(classify(out.status, &out.stderr).error)
 }
 
 /// The body-decides rule (module docs): Some iff stdout parses as JSON and
@@ -240,23 +439,37 @@ fn body_success(stdout: &[u8]) -> Option<Response> {
 /// The stderr classification table (module docs), applied in table order.
 /// stderr is scrubbed before any of it reaches an envelope; the two
 /// rate-limit rows emit fixed strings and admit no stderr text at all.
-fn classify(status: Option<ExitStatus>, stderr: &[u8]) -> Error {
+/// Each row carries its typed [`FailureKind`] so retry and defer decisions
+/// never re-derive the class from the message.
+fn classify(status: Option<ExitStatus>, stderr: &[u8]) -> GhError {
     let text = String::from_utf8_lossy(stderr);
     // `lower` is classification-only; the scrub runs on the original case
     // (token prefixes are already lowercase, and admitting case-folded
     // text would distort the diagnostic).
     let lower = text.to_ascii_lowercase();
     if lower.contains("secondary rate limit") {
-        return Error::transient("gh: secondary rate limit hit; back off before retrying");
+        return GhError {
+            kind: FailureKind::SecondaryLimit,
+            error: Error::transient("gh: secondary rate limit hit; back off before retrying"),
+        };
     }
     if lower.contains("api rate limit exceeded") {
-        return Error::transient("gh: API rate limit exceeded; defer until the limit resets");
+        return GhError {
+            kind: FailureKind::RateExhausted,
+            error: Error::transient("gh: API rate limit exceeded; defer until the limit resets"),
+        };
     }
     if lower.contains("bad credentials") {
-        return Error::config("gh token was rejected (bad credentials) — run: gh auth login");
+        return GhError {
+            kind: FailureKind::Config,
+            error: Error::config("gh token was rejected (bad credentials) — run: gh auth login"),
+        };
     }
     if status.and_then(|s| s.code()) == Some(4) {
-        return Error::config("gh is not authenticated — run: gh auth login");
+        return GhError {
+            kind: FailureKind::Config,
+            error: Error::config("gh is not authenticated — run: gh auth login"),
+        };
     }
     let scrubbed = scrub_tokens(&text);
     let detail = match cap(scrubbed.trim_end()) {
@@ -267,7 +480,10 @@ fn classify(status: Option<ExitStatus>, stderr: &[u8]) -> Error {
         Some(s) => format!(" ({s})"),
         None => String::new(),
     };
-    Error::transient(format!("gh failed{suffix}: {detail}"))
+    GhError {
+        kind: FailureKind::Other,
+        error: Error::transient(format!("gh failed{suffix}: {detail}")),
+    }
 }
 
 /// First STDERR_CAP bytes, backed off to a char boundary. The backoff is a
@@ -385,7 +601,7 @@ fn version_gate_with(bin: &Path, deadline: Duration) -> Result<()> {
         )));
     }
     if !out.status.is_some_and(|s| s.success()) {
-        return Err(classify(out.status, &out.stderr));
+        return Err(classify(out.status, &out.stderr).error);
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let v = parse_gh_version(&text).ok_or_else(|| {
@@ -929,6 +1145,129 @@ mod tests {
             "killed promptly, not after the child's 30s: {:?}",
             start.elapsed()
         );
+    }
+
+    // --- retry policy and telemetry ---
+
+    /// A fake gh that fails with `stderr_line`/exit 1 until the counter file
+    /// records `fails` prior runs, then succeeds with `body`.
+    fn flaky(fails: u32, stderr_line: &str, body: &str) -> FakeGh {
+        let fake = FakeGh::new("");
+        fs::write(fake.side("body.json"), body).unwrap();
+        let script = format!(
+            "cat > /dev/null\n\
+             n=$(cat '{count}' 2>/dev/null || echo 0)\n\
+             echo $((n + 1)) > '{count}'\n\
+             if [ \"$n\" -lt {fails} ]; then echo '{stderr_line}' >&2; exit 1; fi\n\
+             cat '{body}'",
+            count = fake.side("count").display(),
+            body = fake.side("body.json").display(),
+        );
+        fs::write(fake.bin(), format!("#!/bin/sh\n{script}\n")).unwrap();
+        fake
+    }
+
+    #[test]
+    fn transient_failure_retries_to_success_and_counts() {
+        let fake = flaky(1, "flagrant blip", r#"{"data":{"ok":true}}"#);
+        let mut ctx = GhCtx::new(3, 10);
+        let resp = graphql_ctx(&fake.bin(), deadline(), "q", &[], &mut ctx).unwrap();
+        assert_eq!(resp.data.get("ok"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(ctx.tel.subprocess_count, 2, "one failure, one success");
+        assert_eq!(ctx.tel.sleeps, 1);
+        assert_eq!(ctx.retry_budget, 9, "one retry consumed");
+        // No rateLimit selected: the blind-call counter must say so.
+        assert_eq!(ctx.tel.rate_limit_unknown, 1);
+    }
+
+    #[test]
+    fn attempts_per_call_bounds_the_retries() {
+        let fake = flaky(99, "always down", r#"{"data":{}}"#);
+        let mut ctx = GhCtx::new(2, 10);
+        let err = graphql_ctx(&fake.bin(), deadline(), "q", &[], &mut ctx).unwrap_err();
+        assert_eq!(err.kind, FailureKind::Other);
+        assert_eq!(err.error.code, Code::Transient);
+        assert_eq!(ctx.tel.subprocess_count, 2, "attempts_per_call=2");
+        assert_eq!(ctx.retry_budget, 9);
+    }
+
+    #[test]
+    fn exhausted_budget_means_single_attempts() {
+        let fake = flaky(99, "always down", r#"{"data":{}}"#);
+        let mut ctx = GhCtx::new(3, 0);
+        let _ = graphql_ctx(&fake.bin(), deadline(), "q", &[], &mut ctx).unwrap_err();
+        assert_eq!(ctx.tel.subprocess_count, 1, "no budget, no retry");
+        assert_eq!(ctx.tel.sleeps, 0);
+    }
+
+    #[test]
+    fn rate_exhausted_and_config_never_retry() {
+        // Primary rate limit: typed RateExhausted, exactly one attempt even
+        // with attempts and budget to spare — the scheduler defers, gh must
+        // not burn the budget the defer exists to protect.
+        let fake = flaky(99, "API rate limit exceeded for user ID 1.", "{}");
+        let mut ctx = GhCtx::new(3, 10);
+        let err = graphql_ctx(&fake.bin(), deadline(), "q", &[], &mut ctx).unwrap_err();
+        assert_eq!(err.kind, FailureKind::RateExhausted);
+        assert_eq!(ctx.tel.subprocess_count, 1);
+
+        let fake = flaky(99, "gh: Bad credentials (HTTP 401)", "{}");
+        let mut ctx = GhCtx::new(3, 10);
+        let err = graphql_ctx(&fake.bin(), deadline(), "q", &[], &mut ctx).unwrap_err();
+        assert_eq!(err.kind, FailureKind::Config);
+        assert_eq!(err.error.code, Code::Configuration);
+        assert_eq!(ctx.tel.subprocess_count, 1);
+    }
+
+    #[test]
+    fn successful_calls_accumulate_rate_telemetry() {
+        let fixture = include_str!("../tests/fixtures/discovery_page.json");
+        let fake = FakeGh::with_body(fixture, 0);
+        let mut ctx = GhCtx::new(1, 0);
+        graphql_ctx(&fake.bin(), deadline(), "q", &[], &mut ctx).unwrap();
+        graphql_ctx(&fake.bin(), deadline(), "q", &[], &mut ctx).unwrap();
+        assert_eq!(ctx.tel.rate_cost, 2, "fixture costs 1, twice");
+        assert_eq!(ctx.tel.remaining, Some(4823));
+        assert_eq!(
+            ctx.tel.reset_at.as_ref().map(|t| t.as_str()),
+            Some("2026-07-30T22:01:39Z")
+        );
+        assert_eq!(ctx.tel.rate_limit_unknown, 0);
+        assert!(ctx.tel.bytes_parsed > 0);
+    }
+
+    #[test]
+    fn backoff_schedule_shape() {
+        use super::backoff;
+        // Secondary: long and linear. Others: short doubling, capped at 8s.
+        assert_eq!(backoff(FailureKind::SecondaryLimit, 1).as_secs(), 30);
+        assert_eq!(backoff(FailureKind::SecondaryLimit, 2).as_secs(), 60);
+        assert_eq!(backoff(FailureKind::Other, 1).as_secs(), 1);
+        assert_eq!(backoff(FailureKind::Other, 2).as_secs(), 2);
+        assert_eq!(backoff(FailureKind::Watchdog, 4).as_secs(), 8);
+        assert_eq!(backoff(FailureKind::Other, 40).as_secs(), 8, "cap holds");
+    }
+
+    // --- the viewer identity call ---
+
+    #[test]
+    fn viewer_login_parses_the_user_object() {
+        let fake = FakeGh::with_body(r#"{"login":"OctoCat","id":1,"type":"User"}"#, 0);
+        let login = viewer_login_with(&fake.bin(), deadline()).unwrap();
+        assert_eq!(login, "OctoCat", "as received — folding is the caller's");
+    }
+
+    #[test]
+    fn viewer_login_failures_classify() {
+        let fake = FakeGh::new("cat > /dev/null 2>/dev/null\nexit 4");
+        let err = viewer_login_with(&fake.bin(), deadline()).unwrap_err();
+        assert_eq!(err.code, Code::Configuration);
+
+        // Exit 0 with a non-JSON body (or JSON without login) is not a
+        // success — it classifies from stderr's default row.
+        let fake = FakeGh::with_body("not json", 0);
+        let err = viewer_login_with(&fake.bin(), deadline()).unwrap_err();
+        assert_eq!(err.code, Code::Transient);
     }
 
     // --- the version gate ---
