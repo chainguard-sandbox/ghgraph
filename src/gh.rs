@@ -79,6 +79,7 @@
 //! gate below keeps that heuristic honest.
 
 use std::io::{Read, Write};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
@@ -231,15 +232,24 @@ fn classify(status: Option<ExitStatus>, stderr: &[u8]) -> Error {
     Error::transient(format!("gh failed{suffix}: {detail}"))
 }
 
-/// First STDERR_CAP bytes, backed off to a char boundary.
+/// First STDERR_CAP bytes, backed off to a char boundary. The backoff is a
+/// bounded search over 4 offsets, not a decrement loop: a UTF-8 boundary
+/// occurs at least every 4 bytes, so non-termination is unrepresentable
+/// rather than merely avoided (the same discipline as scrub_tokens'
+/// progress assert).
 fn cap(s: &str) -> &str {
     if s.len() <= STDERR_CAP {
         return s;
     }
-    let mut end = STDERR_CAP;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
+    // Known-equivalent mutant: lowering the range's floor (e.g. `- 3` →
+    // `/ 3`) survives, and stays. The floor is a proof bound — the
+    // descending search always terminates within 4 offsets of the top, so
+    // any lower floor is behavior-identical; only raising it above
+    // STDERR_CAP - 3 could change results, and that direction is caught.
+    let end = (STDERR_CAP - 3..=STDERR_CAP)
+        .rev()
+        .find(|&e| s.is_char_boundary(e))
+        .expect("any 4 consecutive byte offsets contain a UTF-8 char boundary");
     &s[..end]
 }
 
@@ -261,13 +271,21 @@ pub fn scrub_tokens(s: &str) -> String {
         match token_at(&b[i..]) {
             Some(len) => {
                 out.extend_from_slice(b"[REDACTED]");
-                i += len;
+                i += len.get();
             }
             None => {
                 out.push(b[i]);
                 i += 1;
             }
         }
+        // Progress invariant: every consumed input byte contributes at most
+        // 10 output bytes ("[REDACTED]".len()), so out.len() <= 10*i at
+        // every loop head. NonZeroUsize makes a zero-length match
+        // unrepresentable; this witnesses the rest — a loop that stops
+        // advancing i is an unbounded allocator (observed as an OOM under
+        // mutation testing), and this converts that into an instant panic
+        // in debug/test builds at zero release cost.
+        debug_assert!(out.len() <= 10 * i, "scrub loop stopped advancing");
     }
     // Only ASCII runs are replaced, with ASCII; every other byte is copied
     // verbatim in order, so a valid-UTF-8 input yields a valid-UTF-8 output.
@@ -278,8 +296,13 @@ fn is_word(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Length of the token shape starting at `rest[0]`, if one does.
-fn token_at(rest: &[u8]) -> Option<usize> {
+/// Length of the token shape starting at `rest[0]`, if one does. NonZero by
+/// type, not by luck: the scrub loop advances by this value, so a zero here
+/// is an infinite loop that appends "[REDACTED]" at memory-bandwidth speed —
+/// a mutation-testing run demonstrated it as an OOM, not a hang. A match is
+/// always at least the prefix (4+), and the signature makes the
+/// non-advancing case unrepresentable rather than merely absent.
+fn token_at(rest: &[u8]) -> Option<NonZeroUsize> {
     const MIN_RUN: usize = 8;
     let prefix = if rest.starts_with(b"github_pat_") {
         b"github_pat_".len()
@@ -294,13 +317,22 @@ fn token_at(rest: &[u8]) -> Option<usize> {
         return None;
     };
     let run = rest[prefix..].iter().take_while(|&&c| is_word(c)).count();
-    (run >= MIN_RUN).then_some(prefix + run)
+    (run >= MIN_RUN)
+        .then_some(prefix + run)
+        .and_then(NonZeroUsize::new)
 }
 
 /// The minimum-version gate, run once at sync start (PLANNED: milestone 2
 /// wires the call when sync::run lands). Below MIN_GH_VERSION the stderr
 /// heuristic and exit-code taxonomy are unverified claims, so the run
 /// refuses with the remedy instead of degrading silently.
+///
+/// Known-equivalent mutant: replacing this body with `Ok(())` survives
+/// mutation testing, and stays. The wrapper's only content is the real
+/// binary name and deadline, so a hermetic test cannot distinguish it from
+/// `Ok(())` without a real gh on PATH; the mechanism lives in
+/// [`version_gate_with`], which the tests cover including both boundary
+/// sides. The same applies to [`graphql`]'s wrapper.
 pub fn version_gate() -> Result<()> {
     version_gate_with(Path::new("gh"), VERSION_DEADLINE)
 }
@@ -833,6 +865,12 @@ mod tests {
         // token at the very start and very end of the input
         assert_eq!(scrub_tokens("ghp_ABCDEFGH"), "[REDACTED]");
         assert_eq!(scrub_tokens("x ghp_ABCDEFGH"), "x [REDACTED]");
+        // A bare prefix as the FINAL bytes of the input: the discriminating
+        // case for token_at's length guard (`len > 3`), whose off-by-one
+        // reads rest[3] past the end and panics instead of passing through.
+        assert_eq!(scrub_tokens("ghp"), "ghp");
+        assert_eq!(scrub_tokens("trailing ghs"), "trailing ghs");
+        assert_eq!(scrub_tokens("gh"), "gh");
     }
 
     #[test]
