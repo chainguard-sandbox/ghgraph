@@ -15,7 +15,7 @@ SECS ?= 60
 # Mutation-testing knobs (see the `mutants` target). Scoped to the implemented
 # modules by default — mutating the todo!() stubs only yields false survivors;
 # widen MUTANTS_FILES as modules land.
-MUTANTS_FILES ?= --file src/db.rs --file src/config.rs --file src/time.rs --file src/identity.rs --file src/queries.rs --file src/parse.rs
+MUTANTS_FILES ?= --file src/db.rs --file src/config.rs --file src/time.rs --file src/identity.rs --file src/queries.rs --file src/parse.rs --file src/gh.rs
 JOBS ?= 4
 TIMEOUT ?= 60
 

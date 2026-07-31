@@ -57,5 +57,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "scrub_tokens"
+path = "fuzz_targets/scrub_tokens.rs"
+test = false
+doc = false
+bench = false
+
 # Own workspace so the root `cargo build` never descends into the fuzz crate.
 [workspace]
