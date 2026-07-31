@@ -155,8 +155,12 @@ pub struct RateLimit {
     /// A GraphQL DateTime scalar, validated at ingest like every other
     /// timestamp (parse.rs invariant): the milestone-2 scheduler sleeps
     /// toward this value, and a bare String would hand it unvalidated
-    /// text. Extraction is missing-tolerant (a malformed envelope yields
-    /// `rate_limit: None`), so validation here narrows, never breaks.
+    /// text. Extraction is missing-tolerant (a malformed envelope —
+    /// missing keys, wrong types — yields `rate_limit: None`; extra keys
+    /// are silently ignored for forward compatibility — deliberately no
+    /// `deny_unknown_fields`, unlike the parse.rs types whose
+    /// type=selection contract needs it), so validation here narrows,
+    /// never breaks.
     pub reset_at: Rfc3339Utc,
 }
 
@@ -238,6 +242,9 @@ fn body_success(stdout: &[u8]) -> Option<Response> {
 /// rate-limit rows emit fixed strings and admit no stderr text at all.
 fn classify(status: Option<ExitStatus>, stderr: &[u8]) -> Error {
     let text = String::from_utf8_lossy(stderr);
+    // `lower` is classification-only; the scrub runs on the original case
+    // (token prefixes are already lowercase, and admitting case-folded
+    // text would distort the diagnostic).
     let lower = text.to_ascii_lowercase();
     if lower.contains("secondary rate limit") {
         return Error::transient("gh: secondary rate limit hit; back off before retrying");
@@ -450,6 +457,9 @@ fn run_gh(
     // child that exited before reading is ignored — the exit status and
     // body decide the outcome, not this write), and joining it could block
     // behind a stdin pipe a grandchild still holds after a kill.
+    // SIGPIPE precondition: "EPIPE is an Err, not a signal" holds because
+    // Rust's runtime sets SIGPIPE to SIG_IGN before main — in a C host
+    // that write would kill the thread instead.
     if let Some(doc) = stdin_doc {
         let mut pipe = child.stdin.take().expect("stdin was piped above");
         let doc = doc.to_string();
@@ -466,6 +476,14 @@ fn run_gh(
             Ok(Some(status)) => break (Some(status), false),
             Ok(None) if start.elapsed() >= deadline => {
                 let _ = child.kill();
+                // Rare, high-consequence: the operator watching a stalled
+                // sync deserves more than the final envelope. stderr is
+                // non-contract noise space; the counted telemetry field
+                // (watchdog_kills) lands with the milestone-2 summary.
+                eprintln!(
+                    "ghgraph: gh produced no exit within {}s; killed by the watchdog",
+                    deadline.as_secs()
+                );
                 break (child.wait().ok(), true);
             }
             Ok(None) => thread::sleep(POLL_INTERVAL),
@@ -494,9 +512,18 @@ fn run_gh(
             let left = deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(left) {
                 Ok(chunk) => buf.extend_from_slice(&chunk),
-                // Disconnected = EOF or read error (complete, the normal
-                // case); Timeout = a held-open pipe (bounded prefix).
-                Err(_) => break,
+                // EOF or read error: complete, the normal case.
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                // A held-open pipe: bounded prefix, and a drain thread
+                // just leaked (until the pipe closes) — worth a line.
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    eprintln!(
+                        "ghgraph: a gh pipe was still open {}s after exit; \
+                         keeping what arrived",
+                        DRAIN_GRACE.as_secs()
+                    );
+                    break;
+                }
             }
         }
         buf
@@ -518,7 +545,15 @@ fn run_gh(
 /// whenever a grandchild delays EOF past the grace. A send fails only if
 /// the collector already gave up; the thread then exits on its next read.
 fn drain(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel();
+    // Bounded (1024 chunks × 64KB = 64MB per pipe): the channel is the only
+    // unbounded allocation a misbehaving child could drive (the collector
+    // reads nothing until the child is reaped), and 64MB is an order of
+    // magnitude above any legitimate response (document shapes bound
+    // hydration to single-digit MB). A legit child never feels the cap; a
+    // firehose child blocks on a full channel, stops draining its pipe,
+    // and stalls into the watchdog. A blocked send exits cleanly when the
+    // collector drops the receiver.
+    let (tx, rx) = mpsc::sync_channel(1024);
     thread::spawn(move || {
         // Chunk size is a throughput tuning constant: ANY positive size is
         // correct (smaller sizes just mean more sends), so mutants on this
