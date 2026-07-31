@@ -123,7 +123,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(15);
 const STDERR_CAP: usize = 1024;
 
 /// Once the child is reaped (normal exit, watchdog kill, or wait error),
-/// how long the collector waits between drain chunks. The child's own exit
+/// the TOTAL further wall time the collector may spend on both pipes (one
+/// deadline spans them). The child's own exit
 /// leaves at most a pipe buffer of residue, delivered in milliseconds; only
 /// a descendant that inherited the pipe fds (gh spawns credential helpers)
 /// can hold EOF open past that, on ANY exit path — so the bound is
@@ -483,9 +484,11 @@ fn run_gh(
     // never block unconditionally: an early `killed=false` bug here once
     // routed the wait-error kill path into an unbounded recv (caught in
     // review); the bound being unconditional makes that class of routing
-    // mistake unrepresentable.
+    // mistake unrepresentable. ONE deadline spans both pipes, so
+    // DRAIN_GRACE is the total post-reap bound, not per-pipe (the closure
+    // lens caught the doubled per-pipe reading).
+    let deadline = Instant::now() + DRAIN_GRACE;
     let collect = |rx: mpsc::Receiver<Vec<u8>>| {
-        let deadline = Instant::now() + DRAIN_GRACE;
         let mut buf = Vec::new();
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -517,6 +520,9 @@ fn run_gh(
 fn drain(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
+        // Chunk size is a throughput tuning constant: ANY positive size is
+        // correct (smaller sizes just mean more sends), so mutants on this
+        // expression are equivalent by construction.
         let mut chunk = [0u8; 64 * 1024];
         loop {
             match pipe.read(&mut chunk) {
@@ -813,6 +819,25 @@ mod tests {
         let err = graphql_with(&fake.bin(), deadline(), "q", &[]).unwrap_err();
         assert_eq!(err.code, Code::Transient);
         assert!(err.message.contains("<no stderr>"), "{err}");
+    }
+
+    // The grace window's semantics, pinned by its discriminating input: a
+    // chunk written entirely AFTER the child exited, within DRAIN_GRACE,
+    // is kept (the deadline is real waiting, not just take-what's-queued —
+    // the mutant that collapses it to zero fails here).
+    #[test]
+    fn straggler_chunk_within_grace_is_kept() {
+        let fake = FakeGh::new(concat!(
+            "( sleep 0.5; printf '{\"data\":{\"late\":true}}' ) &\n",
+            "cat > /dev/null\n",
+            "exit 0",
+        ));
+        let resp = graphql_with(&fake.bin(), deadline(), "q", &[]).unwrap();
+        assert_eq!(
+            resp.data.get("late"),
+            Some(&serde_json::Value::Bool(true)),
+            "a body written 0.5s after exit, inside the 2s grace, must arrive"
+        );
     }
 
     // A malformed rateLimit envelope degrades to None (missing-tolerant),
