@@ -15,8 +15,13 @@ SECS ?= 60
 # Mutation-testing knobs (see the `mutants` target). Scoped to the implemented
 # modules by default — mutating the todo!() stubs only yields false survivors;
 # widen MUTANTS_FILES as modules land.
-MUTANTS_FILES ?= --file src/db.rs --file src/config.rs --file src/time.rs --file src/identity.rs --file src/queries.rs --file src/parse.rs
-JOBS ?= 4
+# JOBS is deliberately modest: each job is a full build tree plus a test
+# suite, and a mutant that breaks a loop's progress can allocate at memory-
+# bandwidth speed until TIMEOUT kills it — 4 concurrent runaways have OOMed
+# a 16GB machine. Loop-bearing code should also carry a progress
+# debug_assert (see gh::scrub_tokens) so that class dies by panic instead.
+MUTANTS_FILES ?= --file src/db.rs --file src/config.rs --file src/time.rs --file src/identity.rs --file src/queries.rs --file src/parse.rs --file src/gh.rs
+JOBS ?= 2
 TIMEOUT ?= 60
 
 help: ## Show this help
