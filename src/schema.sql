@@ -43,12 +43,14 @@ CREATE TABLE IF NOT EXISTS prs (
                                          -- approval older than it is stale.
                                          -- NULL/unknown ordering degrades a PR
                                          -- OUT of ready_to_merge (attention.rs).
-                                         -- No defined writer yet: the intended
-                                         -- source (Commit.pushedDate) is
-                                         -- deprecated upstream and returns
-                                         -- null — replacement is an OPEN
-                                         -- QUESTION (queries.rs, HYDRATE_PR);
-                                         -- until then NULL, which fails closed
+                                         -- No defined writer, DECIDED: the
+                                         -- intended source (Commit.pushedDate)
+                                         -- is deprecated upstream; staleness
+                                         -- derives from committedDate + the
+                                         -- observations head_sha flip row
+                                         -- instead (queries.rs HYDRATE_PR,
+                                         -- sync.rs OBSERVED). Stays NULL,
+                                         -- which fails closed
   review_decision TEXT,                  -- raw API value; never trusted alone
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL,

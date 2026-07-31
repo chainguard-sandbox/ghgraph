@@ -95,6 +95,32 @@ pub fn discovery_terms(
     }
 }
 
+/// The targeted-backfill terms for people ADDED to a working-scope repo's
+/// config (the fingerprint transition that does not cold-start the stream):
+/// just the new `involves:` flavors, over the caller's window. Same
+/// injection boundary and same interpolation discipline as
+/// [`discovery_terms`] — newtypes only.
+pub fn backfill_terms(
+    rc: &RepoConfig,
+    added: &[Login],
+    since: &Rfc3339Utc,
+    until: Option<&Rfc3339Utc>,
+) -> Vec<String> {
+    let updated = match until {
+        Some(until) => format!("updated:{since}..{until}"),
+        None => format!("updated:>={since}"),
+    };
+    added
+        .iter()
+        .map(|p| {
+            format!(
+                "repo:{} {updated} sort:updated-desc is:pr involves:{p}",
+                rc.repo
+            )
+        })
+        .collect()
+}
+
 /// Hydration: one PR's full working-set context by node id. Variables: $id.
 ///
 /// Shape notes:
@@ -110,17 +136,18 @@ pub fn discovery_terms(
 ///     push time: Commit.pushedDate — the field prs.last_pushed_at was
 ///     designed around — is deprecated upstream ("no longer supported") and
 ///     returns null on current PRs; selecting it buys nothing and breaks
-///     every hydration whenever GitHub drops the field. OPEN QUESTION
-///     (milestone 2): the approval-staleness signal needs a replacement
-///     source — candidates are the force-push timeline event (in tension
-///     with the timeline standing rejection, DESIGN.md), the sync's own
-///     observed head_sha flip time (local, not server time), or
-///     committedDate as a lower bound (push ≥ commit, so approval <
-///     committedDate proves staleness but the converse proves nothing).
-///     Interim guarantee: last_pushed_at stays NULL, and attention's
+///     every hydration whenever GitHub drops the field. DECIDED (milestone
+///     2, recorded at sync.rs OBSERVED): the approval-staleness signal's
+///     replacement is two bounds the sync already stores — committedDate as
+///     the stale-side proof (push ≥ commit, so approval < committedDate
+///     proves staleness, server time, no skew) and the observations table's
+///     own head_sha flip row (observed_at ≥ push, local time, so approval ≥
+///     observed_at proves freshness modulo clock skew) — no new column
+///     writer; the force-push timeline event stays rejected with the
+///     timeline (DESIGN.md). prs.last_pushed_at stays NULL, and attention's
 ///     polarity contract degrades NULL/unknown ordering OUT of
-///     ready_to_merge (PLANNED, milestone 3 — attention.rs) — the bucket
-///     under-fills, it never lies.
+///     ready_to_merge (PLANNED, milestone 3 — attention.rs, which owns the
+///     skew margin) — the bucket under-fills, it never lies.
 ///   * Every author selection in this hydration document carries __typename
 ///     (structural Bot detection at ingest, since sync --pr skips discovery)
 ///     plus databaseId via User/Bot fragments (NULL when neither fragment
@@ -167,7 +194,7 @@ query($id: ID!) {
       }
       latestOpinionatedReviews(first: 20) {
         totalCount
-        nodes { state submittedAt authorAssociation
+        nodes { id state submittedAt body url authorAssociation
                 author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
       }
       closingIssuesReferences(first: 10) {
