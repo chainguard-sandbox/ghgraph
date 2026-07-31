@@ -19,9 +19,11 @@
 //!     from another thread in a process whose cancellation story is the
 //!     absence of signal handlers. Command::output() was the first design
 //!     and was abandoned: it blocks forever on a stalled child and nothing
-//!     inside a no-signal-handler process can unstick it. After a kill the
-//!     wait for the drains is bounded (DRAIN_GRACE): killing the direct
-//!     child cannot close a pipe end a grandchild inherited. Kill-anytime
+//!     inside a no-signal-handler process can unstick it. Once the child
+//!     is reaped — normal exit included — the wait for the drains is
+//!     bounded (DRAIN_GRACE) and keeps what arrived: neither a kill nor
+//!     the child's own exit can close a pipe end a grandchild inherited,
+//!     so an unbounded post-exit read is a wedge on ANY path. Kill-anytime
 //!     safety rests on replay idempotence (a killed window's redo is a
 //!     no-op); a mid-walk kill marks truncated, never sweeps — the
 //!     completeness witness guarantees it. The deadline is a constant
@@ -46,9 +48,12 @@
 //!     scheduler that consumes it — a config field with no consumer is the
 //!     telemetry rule's counterexample). Primary rate limits fold into the
 //!     floor's defer-record-exit path — one budget, one mechanism.
-//!   * gh stderr is redacted for token shapes before it reaches any
-//!     envelope: `gh[pousr]_` and `github_pat_` prefixes followed by 8+
-//!     `[A-Za-z0-9_]` (see [`scrub_tokens`]), then capped at ~1KB.
+//!   * gh's output is redacted for token shapes before any of it reaches
+//!     an envelope: `gh[pousr]_` and `github_pat_` prefixes followed by
+//!     8+ `[A-Za-z0-9_]` (see [`scrub_tokens`]), then capped at ~1KB.
+//!     Two admission points exist, both scrub-then-cap: stderr on the
+//!     classification table's default row, and `gh --version` stdout on
+//!     the gate's parse-failure path.
 //!   * gh does not retry rate limits, and its exit code cannot distinguish
 //!     them; the failure class is parsed from stderr:
 //!
@@ -98,6 +103,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
+use crate::time::Rfc3339Utc;
 
 /// Kill a gh call that produces no exit within this deadline. A healthy
 /// hydration is single-digit MB and completes in seconds even on a slow
@@ -116,13 +122,17 @@ const POLL_INTERVAL: Duration = Duration::from_millis(15);
 /// stderr detail admitted into a TRANSIENT envelope, after scrubbing.
 const STDERR_CAP: usize = 1024;
 
-/// After a watchdog kill, how long to wait for the pipe drains. Killing the
-/// direct child does not close a pipe a grandchild inherited (gh spawns
-/// credential helpers), so an unconditional join could re-wedge the exact
-/// path the watchdog exists to unwedge. On expiry the output is treated as
-/// empty and the drain thread is left blocked until the pipe finally closes
-/// — a leak bounded by the number of watchdog kills, which quarantine
-/// backoff bounds in turn.
+/// Once the child is reaped (normal exit, watchdog kill, or wait error),
+/// how long the collector waits between drain chunks. The child's own exit
+/// leaves at most a pipe buffer of residue, delivered in milliseconds; only
+/// a descendant that inherited the pipe fds (gh spawns credential helpers)
+/// can hold EOF open past that, on ANY exit path — so the bound is
+/// unconditional, not a kill-path special case. On expiry the collector
+/// keeps every chunk that arrived (a complete body written before a
+/// lingering grandchild still parses; a truncated one fails parse and
+/// classifies TRANSIENT — both defined) and the drain thread is left
+/// blocked until the pipe finally closes — a leak bounded by the number of
+/// affected calls, which quarantine backoff bounds in turn.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// The oldest gh this build claims its exit-code taxonomy (4 = requires
@@ -141,7 +151,12 @@ pub const MIN_GH_VERSION: (u32, u32, u32) = (2, 40, 0);
 pub struct RateLimit {
     pub cost: u32,
     pub remaining: u32,
-    pub reset_at: String,
+    /// A GraphQL DateTime scalar, validated at ingest like every other
+    /// timestamp (parse.rs invariant): the milestone-2 scheduler sleeps
+    /// toward this value, and a bare String would hand it unvalidated
+    /// text. Extraction is missing-tolerant (a malformed envelope yields
+    /// `rate_limit: None`), so validation here narrows, never breaks.
+    pub reset_at: Rfc3339Utc,
 }
 
 // Debug exists for test diagnostics (unwrap_err needs it); no shipped code
@@ -383,8 +398,10 @@ fn version_gate_with(bin: &Path, deadline: Duration) -> Result<()> {
 
 /// First line is "gh version X.Y.Z (date)"; distro builds append suffixes
 /// ("2.4.0+dfsg1"), so each component parses its leading digits and requires
-/// at least one.
-fn parse_gh_version(text: &str) -> Option<(u32, u32, u32)> {
+/// at least one. Public for the fuzz harness (fuzz_targets/gh_version.rs),
+/// which witnesses totality over arbitrary input; not part of the transport
+/// surface.
+pub fn parse_gh_version(text: &str) -> Option<(u32, u32, u32)> {
     let mut words = text.lines().next()?.split_whitespace();
     if words.next()? != "gh" || words.next()? != "version" {
         return None;
@@ -461,14 +478,25 @@ fn run_gh(
         }
     };
     // Normal exit closes the child's pipe ends, so the drains hit EOF and
-    // deliver promptly. After a kill, a grandchild may still hold the pipes
-    // open (see DRAIN_GRACE) — wait bounded, then settle for empty.
+    // deliver promptly. On ANY exit path a grandchild may still hold the
+    // pipes open (see DRAIN_GRACE) — collect what arrived, bounded, and
+    // never block unconditionally: an early `killed=false` bug here once
+    // routed the wait-error kill path into an unbounded recv (caught in
+    // review); the bound being unconditional makes that class of routing
+    // mistake unrepresentable.
     let collect = |rx: mpsc::Receiver<Vec<u8>>| {
-        if killed {
-            rx.recv_timeout(DRAIN_GRACE).unwrap_or_default()
-        } else {
-            rx.recv().expect("drain thread panicked")
+        let deadline = Instant::now() + DRAIN_GRACE;
+        let mut buf = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(chunk) => buf.extend_from_slice(&chunk),
+                // Disconnected = EOF or read error (complete, the normal
+                // case); Timeout = a held-open pipe (bounded prefix).
+                Err(_) => break,
+            }
         }
+        buf
     };
     let stdout = collect(stdout_rx);
     let stderr = collect(stderr_rx);
@@ -480,17 +508,28 @@ fn run_gh(
     })
 }
 
-/// Drain a pipe to EOF on its own thread, delivering through a channel so
+/// Drain a pipe on its own thread, streaming chunks through a channel so
 /// the caller can bound its wait (a JoinHandle cannot be joined with a
-/// timeout). The send fails only if the caller already gave up — ignored.
+/// timeout) AND keep everything that arrived before a held-open pipe
+/// stopped progress — an all-at-EOF send would forfeit a complete body
+/// whenever a grandchild delays EOF past the grace. A send fails only if
+/// the collector already gave up; the thread then exits on its next read.
 fn drain(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut buf = Vec::new();
-        // A mid-read error keeps the prefix; the classification path caps
-        // and scrubs whatever arrived.
-        let _ = pipe.read_to_end(&mut buf);
-        let _ = tx.send(buf);
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            match pipe.read(&mut chunk) {
+                // EOF, or a read error (the prefix already sent stands):
+                // dropping the sender tells the collector "complete".
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(chunk[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
     });
     rx
 }
@@ -613,7 +652,7 @@ mod tests {
         assert!(resp.data.get("search").is_some(), "data is the data object");
         let rl = resp.rate_limit.expect("fixture selects rateLimit");
         assert_eq!((rl.cost, rl.remaining), (1, 4823));
-        assert_eq!(rl.reset_at, "2026-07-30T22:01:39Z");
+        assert_eq!(rl.reset_at.as_str(), "2026-07-30T22:01:39Z");
     }
 
     // The ghost-author fixture through the gh path and into the typed parse:
@@ -776,7 +815,44 @@ mod tests {
         assert!(err.message.contains("<no stderr>"), "{err}");
     }
 
+    // A malformed rateLimit envelope degrades to None (missing-tolerant),
+    // never to a failed call — including a timestamp Rfc3339Utc rejects.
+    #[test]
+    fn malformed_rate_limit_envelope_is_none() {
+        let fake = FakeGh::with_body(
+            r#"{"data":{"ok":true,"rateLimit":{"cost":1,"remaining":2,"resetAt":"not a time"}}}"#,
+            0,
+        );
+        let resp = graphql_with(&fake.bin(), deadline(), "q", &[]).unwrap();
+        assert!(resp.rate_limit.is_none());
+        assert_eq!(resp.data.get("ok"), Some(&serde_json::Value::Bool(true)));
+    }
+
     // --- the watchdog ---
+
+    // A grandchild that inherits the pipes and outlives a NORMALLY-exited
+    // gh must not wedge the caller, and the fully-written body must
+    // survive: EOF never arrives, so an unbounded post-exit read blocks
+    // 30s here, while the chunked drain returns the complete body within
+    // DRAIN_GRACE of the exit. The review panel caught the kill-path
+    // variant of this; the bound is unconditional now.
+    #[test]
+    fn lingering_grandchild_after_normal_exit_is_bounded_and_keeps_body() {
+        let fake = FakeGh::new(concat!(
+            "sleep 30 &\n",
+            "cat > /dev/null\n",
+            "printf '{\"data\":{\"ok\":true}}'\n",
+            "exit 0",
+        ));
+        let start = Instant::now();
+        let resp = graphql_with(&fake.bin(), deadline(), "q", &[]).unwrap();
+        assert_eq!(resp.data.get("ok"), Some(&serde_json::Value::Bool(true)));
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "bounded by DRAIN_GRACE, not the grandchild's 30s: {:?}",
+            start.elapsed()
+        );
+    }
 
     // A stalled gh (never reads stdin, never writes, never exits) is killed
     // within the deadline and reaped; the caller gets TRANSIENT promptly
@@ -822,6 +898,18 @@ mod tests {
         let err = version_gate_with(&garbage.bin(), deadline()).unwrap_err();
         assert_eq!(err.code, Code::Configuration);
         assert!(err.message.contains("cannot parse"), "{err}");
+    }
+
+    // The no-echo pin for the gate's one output-admitting error path
+    // (mirrors the pins in time.rs/identity.rs/parse.rs): a token shape in
+    // `gh --version` output must reach the envelope only as [REDACTED].
+    #[test]
+    fn version_gate_parse_error_scrubs_tokens() {
+        let bad = version_fake("broken ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 wrapper");
+        let err = version_gate_with(&bad.bin(), deadline()).unwrap_err();
+        assert_eq!(err.code, Code::Configuration);
+        assert!(err.message.contains("[REDACTED]"), "{err}");
+        assert!(!err.message.contains("ghp_A"), "token must not leak: {err}");
     }
 
     #[test]
