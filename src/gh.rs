@@ -55,6 +55,7 @@
 //! ```text
 //! "secondary rate limit"      → TRANSIENT, backoff with jitter
 //! "API rate limit exceeded"   → TRANSIENT, sleep toward resetAt
+//! "Bad credentials"           → CONFIGURATION (token invalid/expired)
 //! exit code 4                 → CONFIGURATION (gh auth login needed)
 //! gh binary absent            → CONFIGURATION
 //! anything else               → TRANSIENT with first ~1KB of stderr
@@ -62,7 +63,15 @@
 //!
 //! The rows are checked in table order (stderr strings before the exit
 //! code, ASCII-case-insensitively); classification never inspects stdout,
-//! whose failure modes the body-decides rule above already owns.
+//! whose failure modes the body-decides rule above already owns. Exit 4 is
+//! strictly "no credentials at all" (gh refuses before calling); a REJECTED
+//! token is exit 1 with the API's "Bad credentials" relayed on stderr —
+//! both probed live — and without its own row it would read TRANSIENT,
+//! sending a retry loop after a failure only the operator can fix. The two
+//! rate-limit strings are likewise API text relayed by gh, so they are
+//! stable across gh versions; the sync-time viewer identity check
+//! (milestone 2) catches dead auth up front, and these rows catch it
+//! mid-run (tokens expire while syncs run).
 //!
 //!   * Every query appends `rateLimit { cost remaining resetAt }` (costs 0);
 //!     callers accumulate cost for the sync summary.
@@ -116,12 +125,15 @@ const STDERR_CAP: usize = 1024;
 /// backoff bounds in turn.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// The oldest gh this build claims its stderr classification table, exit-code
-/// taxonomy (4 = auth), stdin document passing, and prompt-disable env for.
-/// 2.40.0 (2023-11) comfortably postdates every mechanism used here; the
-/// table strings were verified live against 2.96.0. Raising the floor is
-/// cheap (CONFIGURATION with an upgrade remedy); lowering it requires
-/// re-verifying the table against the older release.
+/// The oldest gh this build claims its exit-code taxonomy (4 = requires
+/// auth, probed live at 2.96.0 alongside the bad-token and
+/// partial-data-relay behaviors), stdin document passing (`-F query=@-`),
+/// and prompt-disable env for. 2.40.0 (2023-11) comfortably postdates every
+/// mechanism used here. The stderr strings themselves are GitHub API text
+/// relayed by gh, so they barely depend on gh's version — the floor is for
+/// the RELAY behaviors (exit codes, body-to-stdout passthrough). Raising it
+/// is cheap (CONFIGURATION with an upgrade remedy); lowering it requires
+/// re-verifying those behaviors against the older release.
 pub const MIN_GH_VERSION: (u32, u32, u32) = (2, 40, 0);
 
 #[derive(Debug, Clone, Deserialize)]
@@ -216,6 +228,9 @@ fn classify(status: Option<ExitStatus>, stderr: &[u8]) -> Error {
     }
     if lower.contains("api rate limit exceeded") {
         return Error::transient("gh: API rate limit exceeded; defer until the limit resets");
+    }
+    if lower.contains("bad credentials") {
+        return Error::config("gh token was rejected (bad credentials) — run: gh auth login");
     }
     if status.and_then(|s| s.code()) == Some(4) {
         return Error::config("gh is not authenticated — run: gh auth login");
@@ -688,6 +703,28 @@ mod tests {
         let err = graphql_with(&fake.bin(), deadline(), "q", &[]).unwrap_err();
         assert_eq!(err.code, Code::Transient);
         assert!(err.message.contains("rate limit exceeded"), "{err}");
+    }
+
+    // A REJECTED token is not exit 4: gh makes the call, the API answers
+    // 401, gh exits 1 relaying "Bad credentials" on stderr (probed live).
+    // Without this row the failure would read TRANSIENT and retry forever
+    // against a token only the operator can replace. The fake reproduces
+    // the probed shape: REST error body on stdout, relay line on stderr.
+    #[test]
+    fn bad_credentials_is_configuration() {
+        let fake = FakeGh::new(concat!(
+            "cat > /dev/null\n",
+            "printf '{\"message\":\"Bad credentials\",\"status\":\"401\"}'\n",
+            "echo 'gh: Bad credentials (HTTP 401)' >&2\n",
+            "exit 1",
+        ));
+        let err = graphql_with(&fake.bin(), deadline(), "q", &[]).unwrap_err();
+        assert_eq!(err.code, Code::Configuration);
+        assert!(err.message.contains("gh auth login"), "{err}");
+        assert!(
+            !err.message.contains("(HTTP 401)"),
+            "fixed string, not stderr echo: {err}"
+        );
     }
 
     #[test]
