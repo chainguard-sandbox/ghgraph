@@ -941,11 +941,24 @@ fn filtered_authors_cost_no_hydration_and_still_advance() {
     botty.author_login = "botty".into();
     botty.author_type = "Bot";
     install_prs(&fake, &[&ok, &bot, &spam, &botty]);
+    // Splice in a masked hit (item-level null: a visibility domain the
+    // viewer cannot see into): it has no id, counts as seen, and is
+    // disclosed — never an error, never a watermark contribution.
+    let mut d: Value =
+        serde_json::from_str(&std::fs::read_to_string(fake.dir.join("disc-default.json")).unwrap())
+            .unwrap();
+    d["data"]["search"]["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(Value::Null);
+    d["data"]["search"]["issueCount"] = json!(5);
+    fake.write("disc-default.json", &d.to_string());
 
     let doc = fake.sync_ok();
     let s = fake.repo_summary(&doc, "o/n");
     assert_eq!(s["counts"]["fetched"], 1);
     assert_eq!(s["counts"]["filtered"], 3, "{s}");
+    assert_eq!(s["health"]["masked_hits"], 1, "{s}");
     assert_eq!(
         fake.hydrations(1),
         vec!["PR_OK"],
@@ -1129,6 +1142,27 @@ fn targeted_pr_hydrates_and_refuses_by_type() {
     assert!(doc["error"]["message"].as_str().unwrap().contains("bots"));
     let stored: i64 = fake.query_one("SELECT count(*) FROM prs WHERE number=7");
     assert_eq!(stored, 0, "a refused --pr writes nothing");
+
+    // A transport-broken hydration quarantines with the transient class
+    // and one consumed attempt.
+    fake.write(
+        "prid.json",
+        &json!({"data": {"repository": {"pullRequest": {"id": "PR_T"}},
+                 "rateLimit": rate_limit(4000)}})
+        .to_string(),
+    );
+    let (code, doc, _) = fake.run(&["sync", "--pr", "o/n#9"]); // no hyd-PR_T.json
+    assert_eq!(code, 2);
+    assert_eq!(doc.unwrap()["error"]["code"], "TRANSIENT");
+    let (attempts, class): (i64, String) = fake
+        .db()
+        .query_row(
+            "SELECT attempts, error_class FROM quarantine WHERE id='PR_T'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((attempts, class.as_str()), (1, "transient"));
 
     // The vanished-PR arc: each explicit demand consumes one retry attempt
     // through backoff; the third node:null drains.
