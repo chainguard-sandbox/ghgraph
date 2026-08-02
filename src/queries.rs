@@ -28,6 +28,7 @@
 
 use crate::config::{RepoConfig, Scope};
 use crate::identity::Login;
+use crate::sync::Stream;
 use crate::time::Rfc3339Utc;
 
 /// Discovery: ids, updatedAt, and author (for filter skips) only.
@@ -47,7 +48,14 @@ query($q: String!, $after: String) {
   rateLimit { cost remaining resetAt }
 }"#;
 
-/// The discovery search strings for one configured repo.
+/// The discovery search strings for one configured repo and ONE stream —
+/// the caller walks per (repo, stream) and each stream has its own
+/// watermark, so a stream-typed term set is what keeps an Issue node id
+/// out of PR hydration (the B2 panel's S1: an untyped term list fed
+/// project-scope issue hits into HYDRATE_PR, where every one became an
+/// eternal parse-class quarantine row). Stream::Issue emits terms only at
+/// project scope with the issue stream on; its consumer is the milestone-4
+/// walk.
 /// `since` is the caller's watermark with the overlap window already applied;
 /// `until`, when present, closes the window (`updated:since..until`) — the
 /// cap-splitting walk (sync.rs) halves a window that GitHub's ~1,000-result
@@ -68,22 +76,23 @@ pub fn discovery_terms(
     people: &[Login],
     since: &Rfc3339Utc,
     until: Option<&Rfc3339Utc>,
+    stream: Stream,
 ) -> Vec<String> {
     let updated = match until {
         Some(until) => format!("updated:{since}..{until}"),
         None => format!("updated:>={since}"),
     };
     let base = format!("repo:{} {updated} sort:updated-desc", rc.repo);
-    let pr = format!("{base} is:pr");
-    match rc.scope {
-        Scope::Project => {
-            let mut terms = vec![pr];
-            if rc.issues() {
-                terms.push(format!("{base} is:issue"));
-            }
-            terms
+    match (stream, rc.scope) {
+        (Stream::Issue, Scope::Project) if rc.issues() => {
+            vec![format!("{base} is:issue")]
         }
-        Scope::Working => {
+        // Working scope has no issue stream (config.rs rejects the
+        // combination); a project repo with issues off has none either.
+        (Stream::Issue, _) => Vec::new(),
+        (Stream::Pr, Scope::Project) => vec![format!("{base} is:pr")],
+        (Stream::Pr, Scope::Working) => {
+            let pr = format!("{base} is:pr");
             let mut terms = vec![
                 format!("{pr} involves:{viewer}"),
                 format!("{pr} review-requested:{viewer}"),
@@ -302,6 +311,7 @@ mod tests {
     use super::discovery_terms;
     use crate::config::parse;
     use crate::identity::Login;
+    use crate::sync::Stream;
     use crate::time::Rfc3339Utc;
 
     fn since() -> Rfc3339Utc {
@@ -320,7 +330,7 @@ mod tests {
         )
         .unwrap();
         let rc = cfg.repos[0].resolved();
-        let terms = discovery_terms(&rc, &cfg.viewer, &cfg.people, &since(), None);
+        let terms = discovery_terms(&rc, &cfg.viewer, &cfg.people, &since(), None, Stream::Pr);
         let base = "repo:o/n updated:>=2026-07-01T00:00:00Z sort:updated-desc is:pr";
         assert_eq!(
             terms,
@@ -345,12 +355,14 @@ mod tests {
         .unwrap();
         let rc = cfg.repos[0].resolved();
         let people: Vec<Login> = Vec::new();
-        let terms = discovery_terms(&rc, &cfg.viewer, &people, &since(), None);
         let base = "repo:o/n updated:>=2026-07-01T00:00:00Z sort:updated-desc";
-        assert_eq!(
-            terms,
-            vec![format!("{base} is:pr"), format!("{base} is:issue")]
-        );
+        // The PR stream never carries the issue term, whatever the issue
+        // setting: stream-typed terms are what keep an Issue node id out of
+        // PR hydration (the B2 panel's S1).
+        let terms = discovery_terms(&rc, &cfg.viewer, &people, &since(), None, Stream::Pr);
+        assert_eq!(terms, vec![format!("{base} is:pr")]);
+        let terms = discovery_terms(&rc, &cfg.viewer, &people, &since(), None, Stream::Issue);
+        assert_eq!(terms, vec![format!("{base} is:issue")]);
 
         let no_issues = parse(
             r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"project","issues":false}]}"#,
@@ -358,8 +370,22 @@ mod tests {
         )
         .unwrap();
         let rc = no_issues.repos[0].resolved();
-        let terms = discovery_terms(&rc, &no_issues.viewer, &people, &since(), None);
+        let terms = discovery_terms(&rc, &no_issues.viewer, &people, &since(), None, Stream::Pr);
         assert_eq!(terms, vec![format!("{base} is:pr")]);
+        let terms = discovery_terms(
+            &rc,
+            &no_issues.viewer,
+            &people,
+            &since(),
+            None,
+            Stream::Issue,
+        );
+        assert_eq!(terms, Vec::<String>::new(), "issues off: no issue term");
+        // Working scope: no issue stream exists at all.
+        let working = parse(r#"{"viewer":"v","repos":["o/n"]}"#, "<test>").unwrap();
+        let rc = working.repos[0].resolved();
+        let terms = discovery_terms(&rc, &working.viewer, &people, &since(), None, Stream::Issue);
+        assert_eq!(terms, Vec::<String>::new());
     }
 
     // The bounded window form the cap-splitting walk uses: a closed
@@ -373,12 +399,30 @@ mod tests {
         .unwrap();
         let rc = cfg.repos[0].resolved();
         let until = Rfc3339Utc::parse("2026-07-15T12:00:00Z").unwrap();
-        let terms = discovery_terms(&rc, &cfg.viewer, &[], &since(), Some(&until));
+        let terms = discovery_terms(&rc, &cfg.viewer, &[], &since(), Some(&until), Stream::Pr);
         assert_eq!(
             terms,
             vec![
                 "repo:o/n updated:2026-07-01T00:00:00Z..2026-07-15T12:00:00Z \
                  sort:updated-desc is:pr"
+                    .to_string()
+            ]
+        );
+    }
+
+    // The backfill flavor's exact rendered string, pinned like its
+    // siblings: a future edit adding a non-newtype interpolation must fail
+    // a string-level test, not just an end-to-end count.
+    #[test]
+    fn backfill_terms_render_exactly() {
+        let cfg = parse(r#"{"viewer":"v","repos":["o/n"]}"#, "<test>").unwrap();
+        let rc = cfg.repos[0].resolved();
+        let added = vec![Login::new("Bob").unwrap()];
+        let terms = super::backfill_terms(&rc, &added, &since(), None);
+        assert_eq!(
+            terms,
+            vec![
+                "repo:o/n updated:>=2026-07-01T00:00:00Z sort:updated-desc is:pr involves:bob"
                     .to_string()
             ]
         );

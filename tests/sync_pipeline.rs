@@ -1329,3 +1329,34 @@ fn floor_boundary_is_strict() {
         assert_eq!(s["counts"]["fetched"], expected, "remaining={remaining}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// 17. The default project-scope config (issues on) syncs its PR stream
+// cleanly: the stream-typed discovery terms keep Issue ids out of PR
+// hydration entirely (the B2 panel's S1 — before the fix, every issue in
+// a project repo became an eternal parse-class quarantine row).
+
+#[test]
+fn default_project_scope_never_discovers_issues_into_pr_hydration() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}], // issues default ON
+        "workers": 1,
+        "retry_attempts": 1,
+        "retry_budget": 5
+    }));
+    let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    install_prs(&fake, &[&a]);
+
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["quarantined"], 0, "{s}");
+    assert_eq!(s["counts"]["fetched"], 1);
+    for call in fake.calls() {
+        assert!(
+            !call.contains("is:issue"),
+            "the milestone-2 PR walk must never emit an issue term: {call}"
+        );
+    }
+}

@@ -1088,6 +1088,7 @@ impl StreamCtx<'_> {
                 &self.cfg.people,
                 since,
                 until,
+                Stream::Pr,
             ),
             TermSource::Backfill(added) => {
                 queries::backfill_terms(&self.plan.rc, added, since, until)
@@ -1482,11 +1483,9 @@ fn hydrate_one(
     // first:30 selection has no follow-up document yet (module docs — the
     // deferred tail), so an overflowing thread withholds the witness.
     let threads_complete = threads_paged
-        && node
-            .review_threads
-            .nodes
-            .iter()
-            .all(|t| t.comments.nodes.len() as i64 >= t.comments.total_count);
+        && node.review_threads.nodes.iter().all(|t| {
+            i64::try_from(t.comments.nodes.len()).is_ok_and(|n| n >= t.comments.total_count)
+        });
 
     let requests_complete = counted_complete(&node.review_requests);
     let reviews_complete = counted_complete(&node.latest_opinionated_reviews);
@@ -1511,8 +1510,11 @@ fn hydrate_one(
 /// The judgment on parse::Counted the hydrator owns (parse.rs carries, this
 /// decides).
 fn counted_complete<T>(c: &Option<parse::Counted<T>>) -> bool {
+    // An unrepresentable length fails CLOSED (no witness): this gates
+    // sweeps, and the permissive direction was the alarming one even while
+    // physically unreachable (B2 panel, S5).
     c.as_ref()
-        .is_some_and(|c| i64::try_from(c.nodes.len()).unwrap_or(i64::MAX) >= c.total_count)
+        .is_some_and(|c| i64::try_from(c.nodes.len()).is_ok_and(|n| n >= c.total_count))
 }
 
 fn hydrate_failure(e: gh::GhError) -> HydrateEnd {
@@ -3194,6 +3196,26 @@ mod tests {
         assert_eq!(r2.next_retry_at, "2026-07-01T02:00:00Z", "doubled");
         assert_eq!(r9.next_retry_at, "2026-07-08T00:00:00Z", "capped at 7d");
         assert_eq!(r1.attempts, 1);
+    }
+
+    // --- the writer's SQL failure classification ---
+
+    // One case per arm: busy retries (TRANSIENT), a full disk is
+    // operator-fixable with the disposable-cache remedy (CONFIGURATION),
+    // and anything else in our own statements is a ghgraph bug (INTERNAL).
+    #[test]
+    fn classify_sql_names_the_actor_per_arm() {
+        use crate::error::Code;
+        let sqlite = |code: std::os::raw::c_int| {
+            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
+        };
+        let busy = classify_sql(&sqlite(rusqlite::ffi::SQLITE_BUSY));
+        assert_eq!(busy.code, Code::Transient);
+        let full = classify_sql(&sqlite(rusqlite::ffi::SQLITE_FULL));
+        assert_eq!(full.code, Code::Configuration);
+        assert!(full.message.contains("disposable"), "{}", full.message);
+        let other = classify_sql(&rusqlite::Error::QueryReturnedNoRows);
+        assert_eq!(other.code, Code::Internal);
     }
 
     // --- incremental since: overlap + lookback clamp ---

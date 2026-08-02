@@ -324,7 +324,16 @@ fn graphql_ctx(
 fn backoff(kind: FailureKind, attempt: u32) -> Duration {
     match kind {
         FailureKind::SecondaryLimit => SECONDARY_BACKOFF * attempt,
-        _ => TRANSIENT_BACKOFF * (1u32 << (attempt - 1).min(3)),
+        FailureKind::Watchdog | FailureKind::Other => {
+            TRANSIENT_BACKOFF * (1u32 << (attempt - 1).min(3))
+        }
+        // Never retried (graphql_ctx filters them before any backoff): a
+        // wildcard here would hand a future caller a plausible schedule for
+        // a class that must not sleep-and-retry; a panic is a ghgraph bug
+        // announcing itself (B2 panel, S4).
+        FailureKind::RateExhausted | FailureKind::Config => {
+            unreachable!("non-retryable FailureKind reached backoff()")
+        }
     }
 }
 

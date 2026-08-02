@@ -296,6 +296,15 @@ pub fn parse(raw: &str, source: &str) -> Result<Config> {
 /// value exists, every identifier is validated — so what remains here are
 /// the rules that span fields.
 fn validate(cfg: &Config) -> Result<()> {
+    // A zero period has no meaning the schedule could honor (its jitter is
+    // modulo the period), and the panic it once caused violated "workers
+    // return control on every fallible path" — config is external data
+    // (B2 panel, S2). "Every run" is not a re-verify tier; it is --full.
+    if cfg.reverify_open_days == 0 || cfg.reverify_closed_days == 0 {
+        return Err(Error::config(
+            "reverify_open_days and reverify_closed_days must be at least 1              (for a full refetch every run, use sync --full)",
+        ));
+    }
     for entry in &cfg.repos {
         let rc = entry.resolved();
         if rc.scope == Scope::Working && rc.issues() {
@@ -428,6 +437,19 @@ mod tests {
             .is_ok(),
             "a clean config must parse"
         );
+    }
+
+    // A zero re-verify period would make the schedule's jitter a modulo
+    // zero; it must be a CONFIGURATION refusal, never a panic (config is
+    // external data — B2 panel, S2).
+    #[test]
+    fn zero_reverify_periods_are_refused() {
+        for field in ["reverify_open_days", "reverify_closed_days"] {
+            let raw = format!(r#"{{"viewer":"v","repos":["o/n"],"{field}":0}}"#);
+            let err = parse(&raw, "<test>").err().expect("zero must be refused");
+            assert_eq!(err.code, crate::error::Code::Configuration);
+            assert!(err.message.contains("at least 1"), "{}", err.message);
+        }
     }
 
     // exclude_authors are gated too (by AuthorPattern's Deserialize): a

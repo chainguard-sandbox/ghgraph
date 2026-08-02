@@ -97,6 +97,7 @@ fn capture_discovery_page() {
         &cfg.people,
         &since,
         None,
+        ghgraph::sync::Stream::Pr,
     );
     // terms[0] is the involves: flavor (queries.rs pins the order).
     write_fixture(
