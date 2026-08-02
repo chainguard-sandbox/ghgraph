@@ -20,7 +20,7 @@ SECS ?= 60
 # bandwidth speed until TIMEOUT kills it — 4 concurrent runaways have OOMed
 # a 16GB machine. Loop-bearing code should also carry a progress
 # debug_assert (see gh::scrub_tokens) so that class dies by panic instead.
-MUTANTS_FILES ?= --file src/db.rs --file src/config.rs --file src/time.rs --file src/identity.rs --file src/queries.rs --file src/parse.rs --file src/gh.rs
+MUTANTS_FILES ?= --file src/db.rs --file src/config.rs --file src/time.rs --file src/identity.rs --file src/queries.rs --file src/parse.rs --file src/gh.rs --file src/refs.rs --file src/sync.rs
 JOBS ?= 2
 TIMEOUT ?= 60
 

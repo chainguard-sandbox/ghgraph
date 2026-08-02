@@ -71,5 +71,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "refs_extract"
+path = "fuzz_targets/refs_extract.rs"
+test = false
+doc = false
+bench = false
+
 # Own workspace so the root `cargo build` never descends into the fuzz crate.
 [workspace]
