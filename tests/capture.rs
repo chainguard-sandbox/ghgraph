@@ -155,8 +155,7 @@ fn capture_pr_id() {
     // returned here is the id capture_threads_page hydrates.
     let v: serde_json::Value = serde_json::from_str(&raw).expect("JSON");
     assert_eq!(
-        v["data"]["repository"]["pullRequest"]["id"],
-        "PR_kwDODKw3uc7xAi-o",
+        v["data"]["repository"]["pullRequest"]["id"], "PR_kwDODKw3uc7xAi-o",
         "PR_ID must resolve cli/cli#13864 to the pinned hydration id"
     );
     write_fixture("pr_id.json", &raw);

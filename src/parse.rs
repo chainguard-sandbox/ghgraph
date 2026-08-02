@@ -457,15 +457,24 @@ pub struct TeamRef {
 pub struct EmptyObject {}
 
 /// One row of latestOpinionatedReviews: per-reviewer verdict without paging
-/// review history. Becomes a comments row (kind='review'; schema.sql).
+/// review history. Becomes a comments row (kind='review'; schema.sql) —
+/// which is why it selects `id` (comments.id is NOT NULL UNIQUE), `body`
+/// (review summaries join comments_fts like any other comment text), and
+/// `url`. `submittedAt` is schema-nullable; a `None` cannot become a
+/// comments row (created_at is NOT NULL) and the writer skips it — an
+/// opinionated review always carries one in practice, so the skip is
+/// disclosure-free (sync.rs records the decision).
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ReviewNode {
+    pub id: String,
     /// APPROVED | CHANGES_REQUESTED | … — raw (module docs).
     pub state: String,
     #[serde(deserialize_with = "nullable")]
     pub submitted_at: Option<Rfc3339Utc>,
+    pub body: String,
+    pub url: String,
     pub author_association: String,
     #[serde(deserialize_with = "nullable")]
     pub author: Option<Author>,

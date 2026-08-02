@@ -276,7 +276,11 @@ impl GhCtx {
 /// One GraphQL round trip with the configured retry policy. `vars` become
 /// string variables; typed variables are not needed by any current query
 /// (PR_ID inlines its one Int — queries.rs records why).
-pub fn graphql(query: &str, vars: &[(&str, &str)], ctx: &mut GhCtx) -> std::result::Result<Response, GhError> {
+pub fn graphql(
+    query: &str,
+    vars: &[(&str, &str)],
+    ctx: &mut GhCtx,
+) -> std::result::Result<Response, GhError> {
     graphql_ctx(Path::new("gh"), WATCHDOG_DEADLINE, query, vars, ctx)
 }
 

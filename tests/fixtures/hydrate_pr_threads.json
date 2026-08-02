@@ -64,8 +64,11 @@
               "login": "babakks"
             },
             "authorAssociation": "MEMBER",
+            "body": "LGTM! Thanks! 🍻 ",
+            "id": "PRR_kwDODKw3uc8AAAABFywNLw",
             "state": "APPROVED",
-            "submittedAt": "2026-07-13T10:12:08Z"
+            "submittedAt": "2026-07-13T10:12:08Z",
+            "url": "https://github.com/cli/cli/pull/13864#pullrequestreview-4683730223"
           }
         ],
         "totalCount": 1
@@ -131,8 +134,8 @@
     },
     "rateLimit": {
       "cost": 1,
-      "remaining": 4822,
-      "resetAt": "2026-07-30T22:01:39Z"
+      "remaining": 4992,
+      "resetAt": "2026-07-31T23:44:34Z"
     }
   }
 }
