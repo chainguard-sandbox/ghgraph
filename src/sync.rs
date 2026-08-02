@@ -1028,6 +1028,11 @@ impl StreamCtx<'_> {
                 extend(&mut watermark, &hit.updated_at);
                 continue;
             }
+            // The floor gates every hydration, mid-window included: a
+            // deferral here sends no Done, so the watermark holds at the
+            // last completed window — the mid-run banking the module docs
+            // promise.
+            self.gate()?;
             match self.hydrate(&hit.id, Origin::Discovery)? {
                 Hydrated::Bundle(bundle) => {
                     extend(&mut watermark, &bundle.pr.updated_at);
@@ -1170,9 +1175,14 @@ impl StreamCtx<'_> {
     }
 
     fn hydrate(&mut self, id: &str, origin: Origin) -> std::result::Result<Hydrated, Stop> {
-        match hydrate_one(&mut self.gh, &self.plan.repo, id, origin, || {
-            self.floor.load(Ordering::Relaxed)
-        }) {
+        match hydrate_one(
+            &mut self.gh,
+            &self.plan.repo,
+            id,
+            origin,
+            self.cfg.rate_limit_floor,
+            || self.floor.load(Ordering::Relaxed),
+        ) {
             HydrateEnd::Bundle(b) => Ok(Hydrated::Bundle(b)),
             HydrateEnd::Vanished => Ok(Hydrated::Quarantine("node_null")),
             HydrateEnd::ParseDrift => Ok(Hydrated::Quarantine("parse")),
@@ -1383,8 +1393,14 @@ fn hydrate_one(
     repo: &str,
     id: &str,
     origin: Origin,
+    floor: u32,
     floor_tripped: impl Fn() -> bool,
 ) -> HydrateEnd {
+    // Between follow-up pages the budget check reads this call context's
+    // own telemetry (the run-wide flag arrives via the closure): a floor
+    // trip mid-walk stops paging and the connection simply loses its
+    // witness — truncated, disclosed, never wedged.
+    let floor_hit = |ctx: &GhCtx| ctx.tel.remaining.is_some_and(|r| r < floor) || floor_tripped();
     let resp = match gh::graphql(queries::HYDRATE_PR, &[("id", id)], gh_ctx) {
         Ok(resp) => resp,
         Err(e) => return hydrate_failure(e),
@@ -1405,7 +1421,7 @@ fn hydrate_one(
     let mut cursor = node.comments.page_info.end_cursor.clone();
     let mut pages: u32 = 0;
     while !comments_complete {
-        if floor_tripped() || pages >= MAX_CONNECTION_PAGES {
+        if floor_hit(gh_ctx) || pages >= MAX_CONNECTION_PAGES {
             break;
         }
         let Some(after) = cursor.clone() else { break };
@@ -1437,7 +1453,7 @@ fn hydrate_one(
     let mut cursor = node.review_threads.page_info.end_cursor.clone();
     let mut pages: u32 = 0;
     while !threads_paged {
-        if floor_tripped() || pages >= MAX_CONNECTION_PAGES {
+        if floor_hit(gh_ctx) || pages >= MAX_CONNECTION_PAGES {
             break;
         }
         let Some(after) = cursor.clone() else { break };
@@ -1805,6 +1821,11 @@ fn apply_bundle(
     b: &PrBundle,
     t: &mut RepoTally,
 ) -> Result<()> {
+    // Two flags, deliberately distinct: `changed` is CONTENT (fields,
+    // children, sweeps — what replay idempotence forbids on unchanged
+    // input); the verified_at re-stamp a re-verify performs is a row write
+    // but not a mutation FOUND, so it feeds neither quiet_mutations_found
+    // nor upserted.
     let mut changed = false;
 
     let pk = upsert_pr(tx, now, b, t, &mut changed)?;
@@ -1819,8 +1840,8 @@ fn apply_bundle(
         t.truncated += 1;
     }
     if b.origin == Origin::Reverify && changed {
-        // The tier exists to catch quiet mutations; a re-verify that
-        // changed anything found one. Feeds the tier defaults.
+        // The tier exists to catch quiet mutations; a re-verify whose
+        // refetch changed CONTENT found one. Feeds the tier defaults.
         t.quiet_mutations_found += 1;
     }
     Ok(())
@@ -1996,8 +2017,10 @@ fn upsert_pr(
                     || old["truncated"].as_deref() == Some("1")
                     || b.origin == Origin::Reverify
                     || b.origin == Origin::Targeted);
-            if field_changed || stamp {
+            if field_changed {
                 *changed = true;
+            }
+            if field_changed || stamp {
                 let verified_at = if stamp {
                     Some(now.as_str().to_string())
                 } else {
@@ -2753,7 +2776,10 @@ fn run_targeted(cfg: &Config, archive: &mut RwArchive, reference: &str) -> Resul
         .map_err(|e| classify_sql(&e))?;
 
     // Floor-exempt on purpose (doc on `run`); the closure never trips.
-    match hydrate_one(&mut gh_ctx, repo.as_str(), &id, Origin::Targeted, || false) {
+    // Floor-exempt on purpose (doc on `run`): u32::MIN floor, inert closure.
+    match hydrate_one(&mut gh_ctx, repo.as_str(), &id, Origin::Targeted, 0, || {
+        false
+    }) {
         HydrateEnd::Bundle(bundle) => {
             if let Some(author) = &bundle.pr.author {
                 let bot_excluded = author.is_bot() && !rc.bots();
@@ -3027,6 +3053,43 @@ mod tests {
     }
 
     #[test]
+    fn bots_and_exclusion_swaps_classify_correctly() {
+        // bots false→true is a relaxation (cold start); true→false is a
+        // tightening (nothing). Project scope so the default is false.
+        let off = r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"project","issues":false}]}"#;
+        let on = r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"project","issues":false,"bots":true}]}"#;
+        let off_state = (
+            "2026-07-01T00:00:00Z".to_string(),
+            serde_json::to_string(&fp(off)).unwrap(),
+        );
+        assert!(matches!(
+            transition(Some(&off_state), &fp(on)),
+            Transition::ColdStart
+        ));
+        let on_state = (
+            "2026-07-01T00:00:00Z".to_string(),
+            serde_json::to_string(&fp(on)).unwrap(),
+        );
+        assert!(matches!(
+            transition(Some(&on_state), &fp(off)),
+            Transition::Incremental
+        ));
+
+        // Swapping one exclusion for another both removes and adds: the
+        // removal is the relaxation, and it dominates.
+        let x = r#"{"viewer":"v","repos":[{"repo":"o/n","exclude_authors":["x"]}]}"#;
+        let y = r#"{"viewer":"v","repos":[{"repo":"o/n","exclude_authors":["y"]}]}"#;
+        let x_state = (
+            "2026-07-01T00:00:00Z".to_string(),
+            serde_json::to_string(&fp(x)).unwrap(),
+        );
+        assert!(matches!(
+            transition(Some(&x_state), &fp(y)),
+            Transition::ColdStart
+        ));
+    }
+
+    #[test]
     fn person_added_and_filter_relaxed_together_cold_starts() {
         // Backfill covers only the new involves: flavor; a simultaneous
         // relaxation needs history no backfill reaches, so cold start wins.
@@ -3062,9 +3125,61 @@ mod tests {
 
     #[test]
     fn fnv_jitter_is_stable_and_spreads() {
-        assert_eq!(fnv1a("o/n", 1), fnv1a("o/n", 1), "deterministic");
+        // FNV-1a is a published algorithm; the vector below was computed
+        // independently of this implementation, so a mutation of the hash
+        // (or of its byte feed) cannot self-consistently pass.
+        assert_eq!(fnv1a("o/n", 1), 15_678_916_660_073_372_886);
         assert_ne!(fnv1a("o/n", 1), fnv1a("o/n", 2));
         assert_ne!(fnv1a("o/n", 1), fnv1a("o/m", 1));
+    }
+
+    // The re-verify due boundary, pinned to the second: due at exactly
+    // verified_at + period + (fnv1a(repo, number) mod period). The jitter
+    // constant is computed independently of fnv1a (the vector above mod
+    // 604800 = 457686), so the schedule arithmetic cannot drift
+    // self-consistently. NULL verified_at leads; quarantined ids never
+    // re-verify, whatever their age.
+    #[test]
+    fn reverify_due_boundary_and_exclusions() {
+        let dir = std::env::temp_dir().join(format!("ghgraph-reverify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let archive = crate::db::open_rw(&dir.join("g.db")).unwrap();
+        let conn = archive.conn();
+        let insert = |id: &str, number: i64, verified_at: Option<&str>| {
+            conn.execute(
+                "INSERT INTO prs (id, repo, number, title, body, state, created_at, \
+                                  updated_at, url, verified_at) \
+                 VALUES (?1, 'o/n', ?2, 't', '', 'OPEN', '2026-06-01T00:00:00Z', \
+                         '2026-06-01T00:00:00Z', 'u', ?3)",
+                rusqlite::params![id, number, verified_at],
+            )
+            .unwrap();
+        };
+        insert("PR_1", 1, Some("2026-07-01T00:00:00Z")); // epoch 1782864000
+        insert("PR_2", 2, None); // never witnessed: always due, and first
+        insert("PR_Q", 3, None); // quarantined: excluded
+
+        let cfg = cfg(r#"{"viewer":"v","repos":["o/n"]}"#); // open tier: 7d
+        let quarantined: HashSet<String> = [String::from("PR_Q")].into();
+        let boundary = 1_782_864_000 + 7 * 86_400 + 457_686;
+
+        let before = Rfc3339Utc::from_epoch(boundary - 1).unwrap();
+        let due = reverify_due(conn, "o/n", &cfg, &before, &quarantined).unwrap();
+        assert_eq!(
+            due,
+            vec![("PR_2".to_string(), 2)],
+            "one second early: only the never-verified row is due"
+        );
+
+        let at = Rfc3339Utc::from_epoch(boundary).unwrap();
+        let due = reverify_due(conn, "o/n", &cfg, &at, &quarantined).unwrap();
+        assert_eq!(
+            due,
+            vec![("PR_2".to_string(), 2), ("PR_1".to_string(), 1)],
+            "at the jittered boundary the aged row joins, after the NULL"
+        );
+        drop(archive);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- quarantine backoff ---

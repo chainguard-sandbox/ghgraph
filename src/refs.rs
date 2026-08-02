@@ -472,6 +472,65 @@ mod tests {
         );
     }
 
+    // The kind strings are a schema contract (refs.kind values, schema.sql);
+    // a silent rename would strand every archived row.
+    #[test]
+    fn kind_strings_match_the_schema() {
+        assert_eq!(RefKind::Fixes.as_str(), "fixes");
+        assert_eq!(RefKind::DependsOn.as_str(), "depends_on");
+        assert_eq!(RefKind::BlockedBy.as_str(), "blocked_by");
+        assert_eq!(RefKind::Blocks.as_str(), "blocks");
+        assert_eq!(RefKind::Mentions.as_str(), "mentions");
+    }
+
+    // A keyword as the FINAL bytes of the body: bind_target's bounds check
+    // (`i < b.len()`) is what stands between this and an out-of-bounds
+    // panic — the discriminating input for its `<=` mutant.
+    #[test]
+    fn trailing_keyword_at_eof_is_text() {
+        assert_eq!(refs("fixes"), vec![]);
+        assert_eq!(refs("fixes:"), vec![]);
+        assert_eq!(refs("blocked by"), vec![]);
+        assert_eq!(refs("depends on"), vec![]);
+    }
+
+    // Scan-resumption discriminators, one per consumed-length arithmetic
+    // site (the mutation sweep's survivors): a wrong jump either loses the
+    // NEXT reference or re-enters the middle of a consumed one and invents
+    // a reference that is not there.
+    #[test]
+    fn consumed_lengths_resume_exactly_after_the_target() {
+        // Under-advance after `#123` would land inside the digits and lose
+        // the later `#4` (bare form, then owner/name form).
+        assert_eq!(
+            refs("aa #123 #4"),
+            vec![
+                (RefKind::Mentions, "src/repo".into(), 4),
+                (RefKind::Mentions, "src/repo".into(), 123),
+            ]
+        );
+        assert_eq!(
+            refs("aa o/n#123 o/n#4"),
+            vec![
+                (RefKind::Mentions, "o/n".into(), 4),
+                (RefKind::Mentions, "o/n".into(), 123),
+            ]
+        );
+        // Re-entering after `#5` at the digit would read "5/n#2" as an
+        // owner/name reference that does not exist in the text.
+        assert_eq!(
+            refs("#5/n#2"),
+            vec![(RefKind::Mentions, "src/repo".into(), 5)]
+        );
+        assert_eq!(
+            refs("o/n#5/x#2"),
+            vec![(RefKind::Mentions, "o/n".into(), 5)]
+        );
+        // An owner run NOT followed by '/' must fail the owner/name shape
+        // outright — weakening that guard accepts "o#n" as a repo.
+        assert_eq!(refs("o#n#5"), vec![]);
+    }
+
     // --- parse_pr_ref: the CLI form ---
 
     #[test]

@@ -72,6 +72,7 @@ case "$doc" in
     ;;
   *)
     echo "HYD|run=$run|id=$id" >> "$dir/calls.log"
+    if [ -f "$dir/stderr-$id" ]; then cat "$dir/stderr-$id" >&2; exit 1; fi
     resp="$dir/hyd-$id.json"
     ;;
 esac
@@ -294,6 +295,13 @@ struct Pr {
     minimized: bool,
     remaining: u32,
     repo: String,
+    /// reviewRequests arrives error-masked (null): the schema-nullable
+    /// connection GraphQL bubbles a failed sub-resolver into.
+    mask_requests: bool,
+    /// comments pageInfo claims another page (with no cursor to walk):
+    /// the witness-withholding shape.
+    comments_has_next: bool,
+    closed_at: Option<&'static str>,
 }
 
 impl Pr {
@@ -311,6 +319,9 @@ impl Pr {
             minimized: false,
             remaining: 4000,
             repo: "o/n".into(),
+            mask_requests: false,
+            comments_has_next: false,
+            closed_at: None,
         }
     }
 
@@ -349,12 +360,16 @@ impl Pr {
                     "createdAt": "2026-07-01T00:00:00Z",
                     "updatedAt": self.updated_at,
                     "mergedAt": null,
-                    "closedAt": if self.state == "CLOSED" { json!("2026-07-21T00:00:00Z") } else { Value::Null },
+                    "closedAt": if self.state == "CLOSED" {
+                        json!(self.closed_at.unwrap_or("2026-07-21T00:00:00Z"))
+                    } else { Value::Null },
                     "commits": {"nodes": [{"commit": {
                         "oid": "0123456789012345678901234567890123456789",
                         "committedDate": "2026-07-09T00:00:00Z"}}]},
-                    "reviewRequests": {"totalCount": 1, "nodes": [
-                        {"requestedReviewer": {"login": "rev"}}]},
+                    "reviewRequests": if self.mask_requests { Value::Null } else {
+                        json!({"totalCount": 1, "nodes": [
+                            {"requestedReviewer": {"login": "rev"}}]})
+                    },
                     "latestOpinionatedReviews": {"totalCount": 1, "nodes": [{
                         "id": format!("REV_{}", self.id), "state": "APPROVED",
                         "submittedAt": "2026-07-11T00:00:00Z", "body": "lgtm",
@@ -368,7 +383,7 @@ impl Pr {
                         "url": "https://github.com/i",
                         "repository": {"nameWithOwner": self.repo}}]},
                     "comments": {"totalCount": comments.len(),
-                        "pageInfo": {"hasNextPage": false, "endCursor": null},
+                        "pageInfo": {"hasNextPage": self.comments_has_next, "endCursor": null},
                         "nodes": comments},
                     "reviewThreads": {"totalCount": 1,
                         "pageInfo": {"hasNextPage": false, "endCursor": null},
@@ -1086,4 +1101,231 @@ fn stalled_gh_is_killed_quarantined_and_counted() {
     assert_eq!(s["health"]["watchdog_kills"], 1, "{s}");
     assert_eq!(s["health"]["quarantined"], 1);
     assert_eq!(s["counts"]["fetched"], 1);
+}
+
+// ---------------------------------------------------------------------------
+// 12. Truncation lifecycle: a withheld witness never stamps, never sweeps,
+// never drops demand rows — and a later complete refetch heals it all.
+
+#[test]
+fn truncation_never_stamps_sweeps_or_drops_requests_and_heals() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    a.comment_ids = vec!["C_a".into(), "C_b".into()];
+    install_prs(&fake, &[&a]);
+    fake.sync_ok();
+    let stamped: Option<String> = fake.query_one("SELECT verified_at FROM prs WHERE number=1");
+    assert!(stamped.is_some(), "run 1 is witness-complete");
+    let req: i64 = fake.query_one("SELECT count(*) FROM review_requests");
+    assert_eq!(req, 1);
+    // Backdate the stamp to a sentinel: second-granular wall clocks make
+    // same-second re-stamps invisible, and the point of the next three
+    // runs is exactly WHEN the stamp moves.
+    let v1 = "2026-01-01T00:00:00Z";
+    fake.db()
+        .execute("UPDATE prs SET verified_at = ?1", rusqlite::params![v1])
+        .unwrap();
+
+    // Run 2: the requests connection arrives error-masked (null). The PR
+    // lands truncated; the stored request row is NOT deleted (fail-open —
+    // a dropped row could only under-fill a demand); verified_at holds.
+    a.mask_requests = true;
+    install_prs(&fake, &[&a]);
+    let doc = fake.sync_ok();
+    assert_eq!(fake.repo_summary(&doc, "o/n")["health"]["truncated"], 1);
+    let req: i64 = fake.query_one("SELECT count(*) FROM review_requests");
+    assert_eq!(req, 1, "a masked connection must not delete demand rows");
+    let v2: Option<String> = fake.query_one("SELECT verified_at FROM prs WHERE number=1");
+    assert_eq!(v2.as_deref(), Some(v1), "no witness, no stamp");
+
+    // Run 3: comments claim another page that cannot be walked; C_b is
+    // absent from the visible page. Truncation must never read as
+    // deletion: C_b stays live.
+    a.mask_requests = false;
+    a.comments_has_next = true;
+    a.comment_ids = vec!["C_a".into()];
+    install_prs(&fake, &[&a]);
+    let doc = fake.sync_ok();
+    assert_eq!(fake.repo_summary(&doc, "o/n")["health"]["truncated"], 1);
+    let gone: Option<String> = fake.query_one("SELECT deleted_at FROM comments WHERE id='C_b'");
+    assert!(gone.is_none(), "an incomplete connection must not sweep");
+
+    // Run 4: the connection completes with C_b really gone — NOW it
+    // sweeps, truncated heals to 0, and the witness re-stamps.
+    a.comments_has_next = false;
+    install_prs(&fake, &[&a]);
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["truncated"], 0, "{s}");
+    assert_eq!(s["counts"]["soft_deleted"], 1);
+    let gone: Option<String> = fake.query_one("SELECT deleted_at FROM comments WHERE id='C_b'");
+    assert!(gone.is_some(), "the witnessed refetch sweeps");
+    let v4: Option<String> = fake.query_one("SELECT verified_at FROM prs WHERE number=1");
+    assert_ne!(v4.as_deref(), Some(v1), "the heal re-stamps");
+}
+
+// ---------------------------------------------------------------------------
+// 13. Re-verify: the tier catches quiet mutations discovery cannot see,
+// and the closed tier is bounded by the lookback.
+
+#[test]
+fn reverify_catches_quiet_mutations_within_its_tiers() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let open = Pr::new("PR_O", 1, "2026-07-20T10:00:00Z");
+    let mut recent = Pr::new("PR_RC", 2, "2026-07-20T11:00:00Z");
+    recent.state = "CLOSED"; // closed_at 2026-07-21: inside the lookback
+    let mut ancient = Pr::new("PR_AC", 3, "2026-07-20T12:00:00Z");
+    ancient.state = "CLOSED";
+    ancient.closed_at = Some("2020-01-01T00:00:00Z"); // far outside it
+    install_prs(&fake, &[&open, &recent, &ancient]);
+    fake.sync_ok();
+
+    // Age every verified_at past both tiers' period + max jitter (7+7,
+    // 30+30 days), then edit the open PR's comment WITHOUT bumping its
+    // updatedAt — the exact quiet-mutation shape — and make run 2's
+    // discovery come back empty so re-verify is the only path to it.
+    let aged = ghgraph::time::Rfc3339Utc::now()
+        .checked_sub_days(61)
+        .unwrap();
+    fake.db()
+        .execute(
+            "UPDATE prs SET verified_at = ?1",
+            rusqlite::params![aged.as_str()],
+        )
+        .unwrap();
+    let mut edited = Pr::new("PR_O", 1, "2026-07-20T10:00:00Z");
+    edited.comment_ids = vec!["C_PR_O".into()];
+    let hydration = edited
+        .hydration()
+        .replace("comment C_PR_O", "comment C_PR_O, edited");
+    fake.write("hyd-PR_O.json", &hydration);
+    fake.write("disc-2-0.json", &discovery(&[], Some(0), 4000));
+
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["reverified"], 2, "open + recent-closed: {s}");
+    assert_eq!(
+        s["refresh"]["quiet_mutations_found"], 1,
+        "only the edited PR changed: {s}"
+    );
+    let mut got = fake.hydrations(2);
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["PR_O", "PR_RC"],
+        "the ancient closed PR is outside the lookback tier"
+    );
+    let body: String = fake.query_one("SELECT body FROM comments WHERE id='C_PR_O'");
+    assert!(body.ends_with("edited"), "the quiet edit landed: {body}");
+    let v: String = fake
+        .query_one::<Option<String>>("SELECT verified_at FROM prs WHERE number=1")
+        .unwrap();
+    assert_ne!(v, aged.as_str(), "an explicit re-verify always re-stamps");
+}
+
+// ---------------------------------------------------------------------------
+// 14. Typed stream endings: a hard discovery failure is Failed (recorded,
+// not deferred); a primary rate limit mid-stream folds into the floor's
+// defer path (deferred, not an error).
+
+#[test]
+fn discovery_failure_is_failed_not_deferred() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    // No disc-default.json: discovery exits 1 with noise on stderr.
+    let (code, doc, _) = fake.run(&["sync"]);
+    assert_eq!(code, 0, "per-repo failures are summary content, not exits");
+    let doc = doc.unwrap();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["deferred_at_floor"], false);
+    let errors = s["health"]["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{s}");
+    assert!(
+        errors[0].as_str().unwrap().starts_with("TRANSIENT"),
+        "classified, never string-matched: {errors:?}"
+    );
+}
+
+#[test]
+fn rate_exhausted_mid_stream_defers_typed() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    let b = Pr::new("PR_2", 2, "2026-07-20T11:00:00Z");
+    install_prs(&fake, &[&a, &b]);
+    // PR_2's call relays the API's primary-limit text: typed RateExhausted,
+    // never retried, folded into the floor's defer path.
+    fake.write("stderr-PR_2", "API rate limit exceeded for user ID 1.\n");
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["deferred_at_floor"], true, "{s}");
+    assert_eq!(
+        s["health"]["errors"].as_array().unwrap().len(),
+        0,
+        "a deferral is not an error: {s}"
+    );
+    let calls = fake.hydrations(1);
+    assert_eq!(
+        calls.iter().filter(|id| *id == "PR_2").count(),
+        1,
+        "RateExhausted must not burn retries: {calls:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 15. The unsplittable-capped endgame: the stream HALTS so no later
+// window's Done can advance the watermark past the lost tail.
+
+#[test]
+fn unsplittable_capped_window_halts_the_stream() {
+    let fake = Fake::new();
+    let mut cfg = base_config();
+    cfg["lookback_days"] = json!(1); // bounds the halving depth (~16)
+    fake.config(&cfg);
+    let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    fake.write("hyd-PR_1.json", &a.hydration());
+    // Every window, at every depth, reports far more hits than it returns:
+    // capped, splittable until the 2s floor, then halted.
+    fake.write("disc-default.json", &discovery(&[&a], Some(1500), 4000));
+
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["discovery_truncated"], 1, "{s}");
+    assert_eq!(fake.hydrations(1), vec!["PR_1"], "the leaf still hydrates");
+    let checked: Option<String> =
+        fake.query_one("SELECT last_checked_at FROM sync_state WHERE repo='o/n' AND stream='pr'");
+    assert!(checked.is_none(), "a halted stream never claims freshness");
+    let wm: String = fake
+        .query_one("SELECT last_item_updated_at FROM sync_state WHERE repo='o/n' AND stream='pr'");
+    assert_eq!(
+        wm, "1970-01-01T00:00:00Z",
+        "the watermark pins below the lost tail (first-contact sentinel)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 16. The floor boundary is strict: remaining == floor proceeds,
+// remaining < floor defers.
+
+#[test]
+fn floor_boundary_is_strict() {
+    for (remaining, defers) in [(500u32, false), (499, true)] {
+        let fake = Fake::new();
+        fake.config(&base_config()); // rate_limit_floor: 500 default
+        let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+        a.remaining = remaining; // observed after the FIRST hydration
+        let b = Pr::new("PR_2", 2, "2026-07-20T11:00:00Z");
+        install_prs(&fake, &[&a, &b]);
+        let doc = fake.sync_ok();
+        let s = fake.repo_summary(&doc, "o/n");
+        assert_eq!(
+            s["health"]["deferred_at_floor"],
+            json!(defers),
+            "remaining={remaining}: {s}"
+        );
+        let expected = if defers { 1 } else { 2 };
+        assert_eq!(s["counts"]["fetched"], expected, "remaining={remaining}");
+    }
 }
