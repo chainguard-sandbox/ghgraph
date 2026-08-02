@@ -375,7 +375,11 @@ pub enum Msg {
     },
     /// The rate-limit floor stopped this stream; typed so the summary and
     /// stats never string-sniff. The watermark holds at the last completed
-    /// window boundary.
+    /// window boundary. reset_at's consumer is the milestone-3 contract
+    /// freeze (`retry_after` on TRANSIENT/deferred disclosures); the writer
+    /// discards it until that field exists — carried now because the
+    /// message shape is the workers' contract and adding it later would
+    /// touch every send site.
     Deferred {
         repo: String,
         stream: Stream,
@@ -499,6 +503,14 @@ struct RepoPlan {
     /// their involves: flavors over the lookback.
     backfill: Vec<Login>,
     fingerprint: String,
+    /// The fingerprint currently in sync_state, verbatim. Backfill windows
+    /// commit THIS one: a kill mid-backfill must leave the stored inputs
+    /// unchanged, or the next run reads "equal → incremental" and the rest
+    /// of the backfill silently never happens (closure-pass F1). Only the
+    /// main walk's windows write the new fingerprint, and by then the
+    /// backfill has completed — a kill after that point redoes a completed
+    /// (idempotent) backfill, which converges.
+    stored_fingerprint: Option<String>,
     /// Due quarantine retries: (id, prior attempts). Ordered by id.
     quarantine_due: Vec<(String, u32)>,
     /// Every quarantined id, due or not: backoff dominates every hydration
@@ -595,6 +607,7 @@ fn plan(cfg: &Config, archive: &RwArchive, now: &Rfc3339Utc, full: bool) -> Resu
             since,
             backfill,
             fingerprint: fp_json,
+            stored_fingerprint: state.as_ref().map(|(_, fp)| fp.clone()),
             quarantine_due,
             quarantined,
             reverify,
@@ -841,7 +854,7 @@ fn worker(
                 stream: Stream::Pr,
                 reset_at: None,
             });
-            let _ = tx.send(Msg::Stats {
+            let stats = tx.send(Msg::Stats {
                 repo: plan.repo,
                 tel: gh::Telemetry::default(),
                 fetched: 0,
@@ -849,7 +862,7 @@ fn worker(
                 reverified: 0,
                 reverify_shed: 0,
             });
-            if deferred.is_err() {
+            if deferred.is_err() || stats.is_err() {
                 return; // writer gone: cancellation
             }
             continue;
@@ -1071,7 +1084,16 @@ impl StreamCtx<'_> {
             // than everything seen (sort is updated-desc), so any advance
             // would pass it permanently.
             watermark: if halt { None } else { watermark },
-            fingerprint: self.plan.fingerprint.clone(),
+            fingerprint: match terms {
+                TermSource::Full => self.plan.fingerprint.clone(),
+                // See RepoPlan::stored_fingerprint. A backfill only exists
+                // when a stored row does.
+                TermSource::Backfill(_) => self
+                    .plan
+                    .stored_fingerprint
+                    .clone()
+                    .unwrap_or_else(|| self.plan.fingerprint.clone()),
+            },
             completes_stream: until.is_none() && matches!(terms, TermSource::Full) && !halt,
             discovery_truncated: u64::from(halt),
             masked: d.masked,
@@ -2768,7 +2790,12 @@ fn run_targeted(cfg: &Config, archive: &mut RwArchive, reference: &str) -> Resul
     let known_id: Option<String> = archive
         .conn()
         .query_row(
-            "SELECT id FROM prs WHERE repo = ?1 AND number = ?2",
+            // deleted_at IS NULL: a drained row's stale node id would just
+            // re-run the null→quarantine→drain cycle forever; falling
+            // through to the live PR_ID lookup lets GitHub say whether the
+            // PR is truly gone (USER_INPUT, immediately) or was reborn
+            // under a new id (closure-pass S2).
+            "SELECT id FROM prs WHERE repo = ?1 AND number = ?2 AND deleted_at IS NULL",
             rusqlite::params![repo.as_str(), i64::try_from(number).unwrap_or(i64::MAX)],
             |r| r.get(0),
         )

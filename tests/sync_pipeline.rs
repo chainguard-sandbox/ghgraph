@@ -1156,6 +1156,21 @@ fn targeted_pr_hydrates_and_refuses_by_type() {
     );
     let rows: i64 = fake.query_one("SELECT count(*) FROM quarantine WHERE id='PR_D'");
     assert_eq!(rows, 0, "the drained record retires");
+
+    // A drained row's stale node id must not restart the cycle: the next
+    // --pr consults the live lookup, which now says the PR is gone —
+    // USER_INPUT immediately, no fresh quarantine (closure-pass S2).
+    fake.write(
+        "prid.json",
+        &json!({"data": {"repository": {"pullRequest": null},
+                 "rateLimit": rate_limit(4000)}})
+        .to_string(),
+    );
+    let (code, doc, _) = fake.run(&["sync", "--pr", "o/n#8"]);
+    assert_eq!(code, 2);
+    assert_eq!(doc.unwrap()["error"]["code"], "USER_INPUT");
+    let rows: i64 = fake.query_one("SELECT count(*) FROM quarantine WHERE id='PR_D'");
+    assert_eq!(rows, 0, "no cycle restart after the drain");
 }
 
 // ---------------------------------------------------------------------------
@@ -1602,4 +1617,61 @@ fn reverify_sheds_at_the_floor_and_counts_it() {
         s["health"]["deferred_at_floor"], false,
         "shedding the deferrable tier is not a stream deferral: {s}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 21. A backfill that does not finish leaves the STORED fingerprint alone,
+// so the next run re-detects the person and re-runs the (idempotent)
+// backfill — a kill or failure between backfill windows must not strand it
+// (closure-pass F1).
+
+#[test]
+fn interrupted_backfill_keeps_the_old_fingerprint_and_reruns() {
+    let fake = Fake::new();
+    fake.config(&working_config(&[], 90));
+    let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    // Run 1 (cold, three flavors = seq 0..2): explicit per-seq responses,
+    // no default — later runs control exactly which discovery calls live.
+    for seq in 0..3 {
+        fake.write(&format!("disc-1-{seq}.json"), &discovery(&[&a], None, 4000));
+    }
+    fake.write("hyd-PR_1.json", &a.hydration());
+    fake.sync_ok();
+    let fp1: String =
+        fake.query_one("SELECT fingerprint FROM sync_state WHERE repo='o/n' AND stream='pr'");
+    assert!(!fp1.contains("bob"));
+
+    // Run 2, person added: the backfill window (seq 0) succeeds; the main
+    // walk's first discovery (seq 1) has no fixture and fails the repo.
+    fake.config(&working_config(&["bob"], 90));
+    fake.write("disc-2-0.json", &discovery(&[&a], None, 4000));
+    let (code, doc, _) = fake.run(&["sync"]);
+    assert_eq!(code, 0);
+    let doc = doc.unwrap();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["errors"].as_array().unwrap().len(), 1, "{s}");
+    let fp2: String =
+        fake.query_one("SELECT fingerprint FROM sync_state WHERE repo='o/n' AND stream='pr'");
+    assert!(
+        !fp2.contains("bob"),
+        "an unfinished backfill must not commit the new inputs: {fp2}"
+    );
+
+    // Run 3, healthy: the person is re-detected, the backfill re-runs, and
+    // only a COMPLETED main walk commits the new fingerprint.
+    fake.write("disc-default.json", &discovery(&[&a], None, 4000));
+    fake.sync_ok();
+    let backfills: Vec<String> = fake
+        .calls()
+        .iter()
+        .filter(|l| l.starts_with("DISC|run=3") && l.contains("involves:bob"))
+        .cloned()
+        .collect();
+    assert!(
+        backfills.len() >= 2,
+        "run 3 re-runs the backfill flavor plus the regular flavor: {backfills:?}"
+    );
+    let fp3: String =
+        fake.query_one("SELECT fingerprint FROM sync_state WHERE repo='o/n' AND stream='pr'");
+    assert!(fp3.contains("bob"), "the completed walk commits the inputs");
 }
