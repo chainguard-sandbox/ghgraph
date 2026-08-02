@@ -131,6 +131,45 @@
 //!     completed by any follow-up document yet, so its PR stays
 //!     truncated=1 (counted, re-verified, never swept) until the `last: K`
 //!     tail lands (ROADMAP defers sizing it to real totalCount data).
+//!     The round-0 spec audit hardened the plan's obligations before any
+//!     of it is code; they bind the implementation:
+//!       - A tail hit needs a THIRD completeness state. verified() is a
+//!         boolean conjunction and truncated derives from !verified(), so
+//!         a tail bundle would either oscillate truncated (0↔1 per
+//!         alternating full-walk/tail runs — an UPDATE per tail hit of an
+//!         unchanged PR, breaking replay idempotence) or falsely license
+//!         the sweep/stamp. Resolution: the comments completeness becomes
+//!         Complete | TailHit | Incomplete; on TailHit the writer carries
+//!         the STORED truncated and verified_at forward untouched, sweeps
+//!         nothing, stamps nothing.
+//!       - TWO masked cases, not one, both caught by the same re-verify
+//!         catcher: (1) a deletion offset by an equal count of
+//!         non-tail-visible adds in one window; (2) a body edit to a
+//!         top-level comment in the un-fetched middle — the count is
+//!         conserved and the tail ids overlap, so the stale body persists
+//!         until re-verify (comment edits never bump PR.updatedAt, which
+//!         is why the tier exists at all).
+//!       - The catcher's reach is tier-bounded: unconditional for OPEN
+//!         PRs; for CLOSED/MERGED it extends only within lookback of
+//!         closed_at/merged_at — a masked case beyond that is permanently
+//!         stale, the same accepted scope limit as closed-tier discovery.
+//!       - Count and tail come from ONE document (TAIL_COMMENTS: selects
+//!         totalCount and comments(last: K) in a single response, its own
+//!         parse type and captured fixture). A two-round-trip split is a
+//!         TOCTOU on a live connection and is prohibited, not discouraged.
+//!       - Zero id overlap between the tail and the archived set means
+//!         there is NO induction anchor: escalate to the full walk
+//!         regardless of count balance.
+//!       - The dispatch gate is structural and caller-side: only a PR
+//!         with a witnessed baseline (verified_at IS NOT NULL) may route
+//!         to the tail; first contact is always a full walk.
+//!       - tail_hits and full_walks PARTITION attempts: an escalated
+//!         check counts as full_walks only, so tail_hits/(tail_hits+
+//!         full_walks) is the true hit rate that sizes K.
+//!       - Enablement gate: a live-captured fixture proving minimized
+//!         comments are counted in the connection's totalCount (the
+//!         conservation universe) — if GitHub excluded them, the
+//!         arithmetic would bias toward false passes.
 //!
 //!   * Rate-limit floor: every GraphQL document returns rateLimit cost and
 //!     remaining; when remaining < config.rate_limit_floor, the run defers —

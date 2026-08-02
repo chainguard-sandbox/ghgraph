@@ -138,8 +138,15 @@ skeleton-walked in full: cheap mutable fields every time, bodies only for
 new or edited ids (GitHub prices GraphQL by node count, not field — the
 skeleton saves bytes, the tail saves points, and a single-page PR costs
 exactly one call). A tail fetch never constructs a witness, so it can never
-sweep or stamp `verified_at`; the check's preconditions and its one masked
-case are stated beside the check in src/sync.rs. Quiet mutations the
+sweep or stamp `verified_at`; the check's preconditions and its two masked
+cases (a deletion offset by equal non-tail-visible adds; a body edit in
+the un-fetched middle — both fall to re-verify, whose reach for
+closed/merged PRs is bounded by the lookback) are stated beside the check
+in src/sync.rs, together with the obligations the round-0 spec audit
+added: a third completeness state for tail hits, the one-document
+count+tail rule, the zero-overlap escalation, the structural
+witnessed-baseline dispatch gate, and the minimized-comments counting
+fixture as the enablement gate. Quiet mutations the
 watermark cannot see (edits, resolves) fall to the tiered re-verify: open
 PRs refetch completely on a short period regardless of lookback — OPEN is
 the relevance signal, not recency, else a quiet open PR closed upstream
