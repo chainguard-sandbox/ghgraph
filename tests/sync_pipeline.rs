@@ -45,7 +45,7 @@ if [ "$1" = "--version" ]; then
 fi
 if [ "$1" = "api" ] && [ "$2" = "user" ]; then cat "$dir/user.json"; exit 0; fi
 doc=$(cat)
-q=""; id=""; owner=""; name=""
+q=""; id=""; owner=""; name=""; after=""
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-f" ]; then
@@ -54,6 +54,7 @@ for a in "$@"; do
       id=*) id="${a#id=}";;
       owner=*) owner="${a#owner=}";;
       name=*) name="${a#name=}";;
+      after=*) after="${a#after=}";;
     esac
   fi
   prev="$a"
@@ -65,6 +66,14 @@ case "$doc" in
     echo "DISC|run=$run|seq=$s|q=$q" >> "$dir/calls.log"
     resp="$dir/disc-$run-$s.json"
     [ -f "$resp" ] || resp="$dir/disc-default.json"
+    ;;
+  *'comments(first: 100'*)
+    echo "CPAGE|run=$run|id=$id|after=$after" >> "$dir/calls.log"
+    resp="$dir/cpage-$id.json"
+    ;;
+  *'reviewThreads(first: 100'*)
+    echo "TPAGE|run=$run|id=$id|after=$after" >> "$dir/calls.log"
+    resp="$dir/tpage-$id.json"
     ;;
   *'pullRequest(number:'*)
     echo "PRID|run=$run|owner=$owner|name=$name" >> "$dir/calls.log"
@@ -301,6 +310,14 @@ struct Pr {
     /// comments pageInfo claims another page (with no cursor to walk):
     /// the witness-withholding shape.
     comments_has_next: bool,
+    /// A real follow-up cursor: the walkable multi-page shape.
+    comments_cursor: Option<&'static str>,
+    threads_has_next: bool,
+    threads_cursor: Option<&'static str>,
+    thread_resolved: bool,
+    no_thread: bool,
+    /// closingIssuesReferences arrives error-masked (null).
+    mask_closing: bool,
     closed_at: Option<&'static str>,
 }
 
@@ -321,6 +338,12 @@ impl Pr {
             repo: "o/n".into(),
             mask_requests: false,
             comments_has_next: false,
+            comments_cursor: None,
+            threads_has_next: false,
+            threads_cursor: None,
+            thread_resolved: false,
+            no_thread: false,
+            mask_closing: false,
             closed_at: None,
         }
     }
@@ -375,26 +398,29 @@ impl Pr {
                         "submittedAt": "2026-07-11T00:00:00Z", "body": "lgtm",
                         "url": "https://github.com/r", "authorAssociation": "MEMBER",
                         "author": author("rev", "User")}]},
-                    "closingIssuesReferences": {"totalCount": 1, "nodes": [{
+                    "closingIssuesReferences": if self.mask_closing { Value::Null } else { json!({"totalCount": 1, "nodes": [{
                         "id": format!("I_{}", self.id), "number": self.number + 100,
                         "title": "linked issue", "state": "OPEN", "body": "issue body",
                         "updatedAt": "2026-07-08T00:00:00Z",
                         "author": author("dora", "User"), "authorAssociation": "NONE",
                         "url": "https://github.com/i",
-                        "repository": {"nameWithOwner": self.repo}}]},
-                    "comments": {"totalCount": comments.len(),
-                        "pageInfo": {"hasNextPage": self.comments_has_next, "endCursor": null},
+                        "repository": {"nameWithOwner": self.repo}}]}) },
+                    "comments": {"totalCount": comments.len() + usize::from(self.comments_has_next),
+                        "pageInfo": {"hasNextPage": self.comments_has_next,
+                                     "endCursor": self.comments_cursor},
                         "nodes": comments},
-                    "reviewThreads": {"totalCount": 1,
-                        "pageInfo": {"hasNextPage": false, "endCursor": null},
-                        "nodes": [{
-                            "id": format!("T_{}", self.id), "isResolved": false,
+                    "reviewThreads": {
+                        "totalCount": (1 - usize::from(self.no_thread)) + usize::from(self.threads_has_next),
+                        "pageInfo": {"hasNextPage": self.threads_has_next,
+                                     "endCursor": self.threads_cursor},
+                        "nodes": if self.no_thread { json!([]) } else { json!([{
+                            "id": format!("T_{}", self.id), "isResolved": self.thread_resolved,
                             "isOutdated": false, "path": "src/x.rs", "line": 10,
                             "comments": {"totalCount": 1, "nodes": [{
                                 "id": format!("TC_{}", self.id), "body": "thread comment",
                                 "createdAt": "2026-07-10T01:00:00Z", "lastEditedAt": null,
                                 "url": "https://github.com/t", "isMinimized": false,
-                                "authorAssociation": "NONE", "author": author("erin", "User")}]}}]}
+                                "authorAssociation": "NONE", "author": author("erin", "User")}]}}]) }}
                 },
                 "rateLimit": rate_limit(self.remaining)
             }
@@ -453,6 +479,19 @@ fn replay_of_unchanged_remote_writes_nothing() {
     assert_eq!(s["counts"]["unchanged"], 0);
     assert_eq!(s["health"]["truncated"], 0, "single-page fixtures verify");
     let dump1 = fake.dump();
+    // Backdate the stamps two days (well inside the 7d+jitter re-verify
+    // period, so nothing is due): the replay must not move them — an
+    // unchanged, already-verified overlap re-hydration that re-stamped
+    // would be exactly the per-PR-per-run row churn the stamp rule forbids.
+    let recent = ghgraph::time::Rfc3339Utc::now()
+        .checked_sub_days(2)
+        .unwrap();
+    fake.db()
+        .execute(
+            "UPDATE prs SET verified_at = ?1",
+            rusqlite::params![recent.as_str()],
+        )
+        .unwrap();
 
     // Second run against the byte-identical remote: the diff gate must
     // skip every row, every observation, every FTS write.
@@ -462,6 +501,15 @@ fn replay_of_unchanged_remote_writes_nothing() {
     assert_eq!(s["counts"]["unchanged"], 2);
     assert_eq!(s["counts"]["observations"], 0);
     assert_eq!(s["counts"]["soft_deleted"], 0);
+    // The cost group is deterministic with fixture responses: one
+    // discovery page and two hydrations, each costing 1 point.
+    assert_eq!(s["cost"]["subprocess_count"], 3);
+    assert_eq!(s["cost"]["rate_cost"], 3);
+    let stamps: i64 = fake.query_one(&format!(
+        "SELECT count(*) FROM prs WHERE verified_at = '{}'",
+        recent.as_str()
+    ));
+    assert_eq!(stamps, 2, "replay must not move verified_at");
     let dump2 = fake.dump();
     assert_eq!(
         dump1, dump2,
@@ -497,11 +545,13 @@ fn metadata_only_flip_updates_rows_but_never_fts() {
         "SELECT group_concat(id || ':' || length(block)) FROM comments_fts_data ORDER BY id",
     );
 
-    // State flips CLOSED and the one comment flips is_minimized — the
-    // exact quiet-mutation shapes the skeleton walk exists to record.
-    // Title and body are byte-identical, so FTS must not move.
+    // State flips CLOSED, the one comment flips is_minimized, and the
+    // review thread resolves — the exact quiet-mutation shapes the
+    // skeleton walk exists to record. Title and body are byte-identical,
+    // so FTS must not move.
     a.state = "CLOSED";
     a.minimized = true;
+    a.thread_resolved = true;
     install_prs(&fake, &[&a]);
     let doc = fake.sync_ok();
     let s = fake.repo_summary(&doc, "o/n");
@@ -515,6 +565,8 @@ fn metadata_only_flip_updates_rows_but_never_fts() {
     assert_eq!(state, "CLOSED");
     let minimized: i64 = fake.query_one("SELECT is_minimized FROM comments WHERE id='C_PR_1'");
     assert_eq!(minimized, 1);
+    let resolved: i64 = fake.query_one("SELECT is_resolved FROM review_threads WHERE id='T_PR_1'");
+    assert_eq!(resolved, 1, "the thread resolve landed");
     let (field, old, new): (String, String, String) = fake
         .db()
         .query_row(
@@ -562,6 +614,20 @@ fn upstream_comment_deletion_sweeps_softly() {
     assert!(deleted.is_some(), "swept, not erased");
     let body: String = fake.query_one("SELECT body FROM comments WHERE id='C_b'");
     assert_eq!(body, "comment C_b", "deleted rows keep their content");
+
+    // The whole thread vanishes upstream: the (witnessed) thread sweep
+    // soft-deletes the thread AND its review comment.
+    a.no_thread = true;
+    install_prs(&fake, &[&a]);
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["counts"]["soft_deleted"], 2, "thread + its comment: {s}");
+    let t_gone: Option<String> =
+        fake.query_one("SELECT deleted_at FROM review_threads WHERE id='T_PR_1'");
+    assert!(t_gone.is_some());
+    let tc_gone: Option<String> =
+        fake.query_one("SELECT deleted_at FROM comments WHERE id='TC_PR_1'");
+    assert!(tc_gone.is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -920,7 +986,9 @@ fn viewer_mismatch_is_a_configuration_refusal() {
 #[test]
 fn quarantine_lifecycle_backoff_retry_and_drain() {
     let fake = Fake::new();
-    fake.config(&base_config());
+    let mut cfg = base_config();
+    cfg["retry_attempts"] = json!(2); // one in-call retry: sleeps become visible
+    fake.config(&cfg);
     let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
     let broken = Pr::new("PR_X", 9, "2026-07-20T11:00:00Z");
     install_prs(&fake, &[&a, &broken]);
@@ -931,6 +999,10 @@ fn quarantine_lifecycle_backoff_retry_and_drain() {
     let s = fake.repo_summary(&doc, "o/n");
     assert_eq!(s["health"]["quarantined"], 1, "{s}");
     assert_eq!(s["counts"]["fetched"], 1);
+    assert_eq!(
+        s["cost"]["sleeps"], 1,
+        "the one transient retry slept once, and the writer merged it: {s}"
+    );
     let (attempts, class): (i64, String) = fake
         .db()
         .query_row(
@@ -1057,6 +1129,33 @@ fn targeted_pr_hydrates_and_refuses_by_type() {
     assert!(doc["error"]["message"].as_str().unwrap().contains("bots"));
     let stored: i64 = fake.query_one("SELECT count(*) FROM prs WHERE number=7");
     assert_eq!(stored, 0, "a refused --pr writes nothing");
+
+    // The vanished-PR arc: each explicit demand consumes one retry attempt
+    // through backoff; the third node:null drains.
+    fake.write("hyd-PR_D.json", r#"{"data":{"node":null}}"#);
+    fake.write(
+        "prid.json",
+        &json!({"data": {"repository": {"pullRequest": {"id": "PR_D"}},
+                 "rateLimit": rate_limit(4000)}})
+        .to_string(),
+    );
+    for expected_attempts in [1i64, 2] {
+        let (code, doc, _) = fake.run(&["sync", "--pr", "o/n#8"]);
+        assert_eq!(code, 2);
+        let doc = doc.unwrap();
+        assert_eq!(doc["error"]["code"], "TRANSIENT");
+        let attempts: i64 = fake.query_one("SELECT attempts FROM quarantine WHERE id='PR_D'");
+        assert_eq!(attempts, expected_attempts, "{doc}");
+    }
+    let (code, doc, _) = fake.run(&["sync", "--pr", "o/n#8"]);
+    assert_eq!(code, 2);
+    let doc = doc.unwrap();
+    assert_eq!(
+        doc["error"]["code"], "USER_INPUT",
+        "the third null drains: {doc}"
+    );
+    let rows: i64 = fake.query_one("SELECT count(*) FROM quarantine WHERE id='PR_D'");
+    assert_eq!(rows, 0, "the drained record retires");
 }
 
 // ---------------------------------------------------------------------------
@@ -1131,11 +1230,17 @@ fn truncation_never_stamps_sweeps_or_drops_requests_and_heals() {
     // lands truncated; the stored request row is NOT deleted (fail-open —
     // a dropped row could only under-fill a demand); verified_at holds.
     a.mask_requests = true;
+    a.mask_closing = true;
     install_prs(&fake, &[&a]);
     let doc = fake.sync_ok();
     assert_eq!(fake.repo_summary(&doc, "o/n")["health"]["truncated"], 1);
     let req: i64 = fake.query_one("SELECT count(*) FROM review_requests");
     assert_eq!(req, 1, "a masked connection must not delete demand rows");
+    let api_refs: i64 = fake.query_one("SELECT count(*) FROM refs WHERE source='api'");
+    assert_eq!(
+        api_refs, 1,
+        "a masked closing connection must not delete api refs"
+    );
     let v2: Option<String> = fake.query_one("SELECT verified_at FROM prs WHERE number=1");
     assert_eq!(v2.as_deref(), Some(v1), "no witness, no stamp");
 
@@ -1143,6 +1248,7 @@ fn truncation_never_stamps_sweeps_or_drops_requests_and_heals() {
     // absent from the visible page. Truncation must never read as
     // deletion: C_b stays live.
     a.mask_requests = false;
+    a.mask_closing = false;
     a.comments_has_next = true;
     a.comment_ids = vec!["C_a".into()];
     install_prs(&fake, &[&a]);
@@ -1359,4 +1465,141 @@ fn default_project_scope_never_discovers_issues_into_pr_hydration() {
             "the milestone-2 PR walk must never emit an issue term: {call}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 18. Multi-page hydration: follow-up pages merge, the witness is earned by
+// TERMINATED pagination, and a broken follow-up withholds it.
+
+#[test]
+fn follow_up_pages_merge_and_earn_the_witness() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    a.comments_has_next = true;
+    a.comments_cursor = Some("c1");
+    a.threads_has_next = true;
+    a.threads_cursor = Some("t1");
+    install_prs(&fake, &[&a]);
+    fake.write(
+        "cpage-PR_1.json",
+        &json!({"data": {"node": {"comments": {
+            "totalCount": 2,
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": [{
+                "id": "C_p2", "body": "second-page comment",
+                "createdAt": "2026-07-10T02:00:00Z", "lastEditedAt": null,
+                "url": "https://github.com/x2", "isMinimized": false,
+                "authorAssociation": "NONE", "author": author("carol", "User")}]}},
+            "rateLimit": rate_limit(4000)}})
+        .to_string(),
+    );
+    fake.write(
+        "tpage-PR_1.json",
+        &json!({"data": {"node": {"reviewThreads": {
+            "totalCount": 2,
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": [{
+                "id": "T_p2", "isResolved": false, "isOutdated": false,
+                "path": "src/y.rs", "line": 4,
+                "comments": {"totalCount": 1, "nodes": [{
+                    "id": "TC_p2", "body": "second-page thread comment",
+                    "createdAt": "2026-07-10T03:00:00Z", "lastEditedAt": null,
+                    "url": "https://github.com/t2", "isMinimized": false,
+                    "authorAssociation": "NONE", "author": author("erin", "User")}]}}]}},
+            "rateLimit": rate_limit(4000)}})
+        .to_string(),
+    );
+
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(
+        s["health"]["truncated"], 0,
+        "terminated pagination = witness: {s}"
+    );
+    let comments: i64 =
+        fake.query_one("SELECT count(*) FROM comments WHERE kind='comment' AND deleted_at IS NULL");
+    assert_eq!(comments, 2, "both pages' comments stored");
+    let threads: i64 = fake.query_one("SELECT count(*) FROM review_threads");
+    assert_eq!(threads, 2, "both pages' threads stored");
+    let paged: Vec<String> = fake
+        .calls()
+        .iter()
+        .filter(|l| l.starts_with("CPAGE") || l.starts_with("TPAGE"))
+        .cloned()
+        .collect();
+    assert_eq!(paged.len(), 2, "one follow-up per connection: {paged:?}");
+    assert!(paged[0].contains("after=c1") || paged[1].contains("after=c1"));
+    let verified: Option<String> = fake.query_one("SELECT verified_at FROM prs WHERE number=1");
+    assert!(verified.is_some());
+
+    // A later refetch whose comments follow-up BREAKS: the witness is
+    // withheld, the PR lands truncated, and the second-page comment
+    // gathered earlier is NOT swept (no witness, no sweep).
+    fake.remove("cpage-PR_1.json");
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["truncated"], 1, "{s}");
+    let gone: Option<String> = fake.query_one("SELECT deleted_at FROM comments WHERE id='C_p2'");
+    assert!(gone.is_none(), "a broken walk must not sweep the tail");
+}
+
+// ---------------------------------------------------------------------------
+// 19. A stuck discovery cursor reads as capped (never as complete): the
+// window splits to the floor and the stream halts, exactly like the
+// count-capped case.
+
+#[test]
+fn non_advancing_discovery_cursor_reads_as_capped() {
+    let fake = Fake::new();
+    let mut cfg = base_config();
+    cfg["lookback_days"] = json!(1);
+    fake.config(&cfg);
+    let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    fake.write("hyd-PR_1.json", &a.hydration());
+    let mut d: Value = serde_json::from_str(&discovery(&[&a], None, 4000)).unwrap();
+    d["data"]["search"]["pageInfo"] = json!({"hasNextPage": true, "endCursor": "X"});
+    fake.write("disc-default.json", &d.to_string());
+
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["discovery_truncated"], 1, "{s}");
+    let checked: Option<String> =
+        fake.query_one("SELECT last_checked_at FROM sync_state WHERE repo='o/n' AND stream='pr'");
+    assert!(checked.is_none(), "a halted stream never claims freshness");
+}
+
+// ---------------------------------------------------------------------------
+// 20. Re-verify sheds first at the floor, and the shed volume is counted —
+// shedding is graceful degradation, not a deferral.
+
+#[test]
+fn reverify_sheds_at_the_floor_and_counts_it() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    install_prs(&fake, &[&a]);
+    fake.sync_ok();
+
+    let aged = ghgraph::time::Rfc3339Utc::now()
+        .checked_sub_days(61)
+        .unwrap();
+    fake.db()
+        .execute(
+            "UPDATE prs SET verified_at = ?1",
+            rusqlite::params![aged.as_str()],
+        )
+        .unwrap();
+    // Run 2: an empty discovery window whose response leaves the budget one
+    // point below the floor. The window completes (no more calls needed);
+    // re-verify would be next and sheds instead.
+    fake.write("disc-2-0.json", &discovery(&[], Some(0), 499));
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["reverify_shed"], 1, "{s}");
+    assert_eq!(s["refresh"]["reverified"], 0);
+    assert_eq!(
+        s["health"]["deferred_at_floor"], false,
+        "shedding the deferrable tier is not a stream deferral: {s}"
+    );
 }

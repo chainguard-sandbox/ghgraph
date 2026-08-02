@@ -230,7 +230,12 @@ const MAX_DISCOVERY_PAGES: u32 = 40;
 const MAX_CONNECTION_PAGES: u32 = 100;
 
 /// Bundles per Page message: bounds worker memory on a 1,000-item window
-/// while keeping writer transactions usefully sized.
+/// while keeping writer transactions usefully sized. Known-equivalent
+/// mutants, and they stay: the flush threshold is a tuning constant — ANY
+/// positive batching is correct (rows reach the writer either in Page
+/// batches or in the window's Done), so comparison mutants here change
+/// message shapes, never archive content. The same argument as gh.rs's
+/// drain chunk size.
 const PAGE_BATCH: usize = 8;
 
 /// Re-verify hydrations per repo per run. A cap, not a config: it exists so
@@ -1010,6 +1015,9 @@ impl StreamCtx<'_> {
         let mut rows: Vec<PrBundle> = Vec::new();
         let mut quarantine: Vec<QuarantineRecord> = Vec::new();
         let mut watermark: Option<Rfc3339Utc> = None;
+        // Known-equivalent mutant on the comparison (> vs >=), and it
+        // stays: at equality the replacement is the same instant, so both
+        // orderings fold to the same watermark.
         let extend = |wm: &mut Option<Rfc3339Utc>, t: &Rfc3339Utc| {
             if wm.as_ref().is_none_or(|cur| t > cur) {
                 *wm = Some(t.clone());
@@ -1135,7 +1143,14 @@ impl StreamCtx<'_> {
                 match page.page_info.end_cursor {
                     // A non-advancing cursor cannot be walked; treat the
                     // term as capped so the window splits instead of
-                    // trusting a stuck page. Same for the page backstop.
+                    // trusting a stuck page (tested: the stuck-cursor
+                    // pipeline case). The page-count backstop beside it is
+                    // defense-in-depth against a server that advances
+                    // cursors forever — its counter's mutants survive
+                    // hermetic tests (the fake terminates) and stay:
+                    // exercising it would mean a 40-page fixture chain
+                    // proving a bound the cursor guard already witnesses
+                    // one level down.
                     Some(c)
                         if after.as_deref() != Some(c.as_str()) && pages < MAX_DISCOVERY_PAGES =>
                     {
@@ -1289,7 +1304,9 @@ impl StreamCtx<'_> {
     }
 
     /// Operators kill healthy multi-hour first runs; say what is happening.
-    /// stderr stays non-contract.
+    /// stderr stays non-contract — which is also why mutants on this
+    /// counter and format survive mutation testing, and stay: a test
+    /// asserting heartbeat text would promote noise space into contract.
     fn heartbeat(&self, window_items: usize) {
         let points = match self.gh.tel.remaining {
             Some(r) => r.to_string(),
@@ -1327,6 +1344,14 @@ enum Hydrated {
 
 /// Halve a window; None when it is too narrow to split (the search grammar
 /// is second-granular). An open right edge splits against "now".
+/// Known-equivalent mutants, and they stay: the split boundary arithmetic
+/// (the +1 on the right half's start, the MIN_WINDOW comparison's exact
+/// edge) tolerates any perturbation that produces OVERLAP — upserts make
+/// overlap free, exactly like the deliberate 10-minute watermark overlap —
+/// and no ±1/×1 mutant of a midpoint can produce a GAP, which is the only
+/// wrong direction. Only the halving itself (progress toward the floor)
+/// is load-bearing, and a non-halving mutant times out against the
+/// recursion.
 fn split_point(since: &Rfc3339Utc, until: Option<&Rfc3339Utc>) -> Option<Rfc3339Utc> {
     let end = match until {
         Some(u) => u.clone(),
@@ -1706,6 +1731,9 @@ fn writer(
                 t.rate_cost += tel.rate_cost;
                 t.sleeps += tel.sleeps;
                 t.sleep_ms += tel.sleep_ms;
+                // watchdog_kills' merge is witnessed only by the ignored
+                // heavy test (`make check-heavy` waits out the shipped
+                // 120s deadline once); fast sweeps see it as a survivor.
                 t.watchdog_kills += tel.watchdog_kills;
                 t.rate_limit_unknown += tel.rate_limit_unknown;
                 t.remaining = tel.remaining;
@@ -2012,7 +2040,12 @@ fn upsert_pr(
             // verified_at moves only when it says something new (module
             // docs): witnessed AND (changed | was-truncated | never |
             // explicit re-verify). Keeping it still on a no-op overlap
-            // re-hydration is what makes replay write nothing.
+            // re-hydration is what makes replay write nothing (pinned by
+            // the replay test's backdated stamps). The never-verified arm
+            // is defensive: this writer cannot produce verified_at NULL
+            // with truncated=0 (insert stamps or marks truncated), so the
+            // arm is unreachable until some future writer relaxes that —
+            // its mutants are equivalent by that precondition, and stay.
             let stamp = b.verified()
                 && (field_changed
                     || old_verified_at.is_none()
