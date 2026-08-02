@@ -4,7 +4,7 @@
 # ghgraph is a design scaffold — function bodies are `todo!()` stubs, so
 # `build` compiles but `run` will panic until the bodies land. See DESIGN.md.
 
-.PHONY: help doctor config build release run test fuzz mutants fmt lint check check-full audit clean install setup setup-vet
+.PHONY: help doctor config build release run test check-heavy fuzz mutants fmt lint check check-full audit clean install setup setup-vet
 
 BINARY_NAME := ghgraph
 
@@ -90,6 +90,9 @@ check: ## Fast pre-commit gate: format, clippy, check, test
 	cargo check --all-targets
 	cargo test
 	@echo "✓ all checks passed"
+
+check-heavy: ## The ignored heavy tests (e.g. the 120s live watchdog stall)
+	cargo test -- --ignored --skip capture_
 
 check-full: check audit ## check, plus the dependency advisory scan
 
