@@ -191,6 +191,16 @@ impl Fake {
             .collect()
     }
 
+    fn refreshes(&self, run: u32) -> Vec<String> {
+        self.calls()
+            .iter()
+            .filter_map(|l| {
+                l.strip_prefix(&format!("REFRESH|run={run}|id="))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
     fn db(&self) -> rusqlite::Connection {
         rusqlite::Connection::open_with_flags(
             self.dir.join("archive/ghgraph.db"),
@@ -1337,8 +1347,14 @@ fn truncation_never_stamps_sweeps_or_drops_requests_and_heals() {
     assert_eq!(req, 1);
     // Backdate the stamp to a sentinel: second-granular wall clocks make
     // same-second re-stamps invisible, and the point of the next three
-    // runs is exactly WHEN the stamp moves.
-    let v1 = "2026-01-01T00:00:00Z";
+    // runs is exactly WHEN the stamp moves. Recent (two days), not epoch:
+    // an old stamp would make re-verify due, and this test isolates the
+    // witness rules from the tier (the tail-then-reverify interplay has
+    // its own test).
+    let v1_ts = ghgraph::time::Rfc3339Utc::now()
+        .checked_sub_days(2)
+        .unwrap();
+    let v1 = v1_ts.as_str();
     fake.db()
         .execute("UPDATE prs SET verified_at = ?1", rusqlite::params![v1])
         .unwrap();
@@ -1776,4 +1792,358 @@ fn interrupted_backfill_keeps_the_old_fingerprint_and_reruns() {
     let fp3: String =
         fake.query_one("SELECT fingerprint FROM sync_state WHERE repo='o/n' AND stream='pr'");
     assert!(fp3.contains("bob"), "the completed walk commits the inputs");
+}
+
+// ---------------------------------------------------------------------------
+// 15. The layered refresh: dispatch, conservation arms, skeleton bodies, and
+// the masked-case/re-verify interplay. (The tail-hit replay and its cost
+// pin live in test 1.)
+
+/// An upstream deletion unbalances the count (2 archived + 0 new != 1):
+/// the check escalates, the full walk runs from the top, and ONLY the full
+/// walk sweeps — the deletion becomes a soft delete with a witness, never
+/// an inference.
+#[test]
+fn refresh_escalates_on_deletion_and_the_full_walk_sweeps() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    a.comment_ids = vec!["C_a".into(), "C_b".into()];
+    install_prs(&fake, &[&a]);
+    fake.sync_ok();
+    assert!(
+        fake.refreshes(1).is_empty(),
+        "first contact never refreshes"
+    );
+
+    a.comment_ids = vec!["C_a".into()];
+    install_prs(&fake, &[&a]);
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["full_walks"], 1, "escalated: {s}");
+    assert_eq!(s["refresh"]["tail_hits"], 0);
+    assert_eq!(s["counts"]["soft_deleted"], 1);
+    assert_eq!(fake.refreshes(2), vec!["PR_1".to_string()]);
+    assert_eq!(
+        fake.hydrations(2),
+        vec!["PR_1".to_string()],
+        "restarted from the top"
+    );
+    let gone: Option<String> = fake.query_one("SELECT deleted_at FROM comments WHERE id='C_b'");
+    assert!(
+        gone.is_some(),
+        "the walk's witness sweeps what the tail could not"
+    );
+}
+
+/// An appended comment tail-hits: the new row lands, nothing sweeps, and
+/// the stamp does not move — a tail hit is an inference, and verified_at
+/// only ever records witnesses.
+#[test]
+fn refresh_tail_hit_upserts_without_stamp() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    a.comment_ids = vec!["C_a".into()];
+    install_prs(&fake, &[&a]);
+    fake.sync_ok();
+    let sentinel = ghgraph::time::Rfc3339Utc::now()
+        .checked_sub_days(2)
+        .unwrap();
+    fake.db()
+        .execute(
+            "UPDATE prs SET verified_at = ?1",
+            rusqlite::params![sentinel.as_str()],
+        )
+        .unwrap();
+
+    a.comment_ids = vec!["C_a".into(), "C_b".into()];
+    install_prs(&fake, &[&a]);
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["tail_hits"], 1, "{s}");
+    assert_eq!(s["refresh"]["full_walks"], 0);
+    assert_eq!(
+        s["counts"]["upserted"], 1,
+        "the new comment is a content change"
+    );
+    assert_eq!(
+        s["health"]["truncated"], 0,
+        "a tail hit carries stored truncated=0"
+    );
+    assert!(fake.hydrations(2).is_empty(), "no full walk");
+    let present: i64 = fake.query_one("SELECT count(*) FROM comments WHERE id='C_b'");
+    assert_eq!(present, 1);
+    let stamp: Option<String> = fake.query_one("SELECT verified_at FROM prs WHERE number=1");
+    assert_eq!(
+        stamp.as_deref(),
+        Some(sentinel.as_str()),
+        "inference never stamps"
+    );
+}
+
+/// The walk-back: the first tail page is all-new, the second reaches the
+/// archived set (the anchor), and the balanced whole hits — count and tail
+/// from one document on every iteration.
+#[test]
+fn refresh_walks_back_to_the_anchor() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    a.comment_ids = vec!["C_a".into(), "C_b".into()];
+    install_prs(&fake, &[&a]);
+    fake.sync_ok();
+
+    // Hand-built pages: the fully-observed suffix is [C_a, C_b, C_c] with
+    // totalCount 3; the refresh's own page carries only the new C_c.
+    let mut refresh: Value = serde_json::from_str(&a.refresh()).unwrap();
+    refresh["data"]["node"]["comments"] = json!({
+        "totalCount": 3,
+        "pageInfo": {"hasPreviousPage": true, "startCursor": "curA"},
+        "nodes": [comment_node("C_c")]
+    });
+    fake.write("refresh-PR_1.json", &refresh.to_string());
+    fake.write(
+        "tail-PR_1-curA.json",
+        &json!({"data": {"node": {"comments": {
+            "totalCount": 3,
+            "pageInfo": {"hasPreviousPage": false, "startCursor": "cur0"},
+            "nodes": [comment_node("C_a"), comment_node("C_b")]
+        }}, "rateLimit": rate_limit(4000)}})
+        .to_string(),
+    );
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["tail_hits"], 1, "{s}");
+    assert!(
+        fake.calls()
+            .iter()
+            .any(|l| l.starts_with("TAIL|run=2|id=PR_1|before=curA")),
+        "the walk-back paged before the anchor: {:?}",
+        fake.calls()
+    );
+    let present: i64 = fake.query_one("SELECT count(*) FROM comments WHERE id='C_c'");
+    assert_eq!(present, 1);
+    assert_eq!(
+        s["cost"]["subprocess_count"], 3,
+        "disc + refresh + one tail page"
+    );
+}
+
+/// No anchor within the walk-back bound: no induction base, escalate —
+/// and a totalCount that moves between pages escalates immediately (the
+/// pages are not one snapshot).
+#[test]
+fn refresh_escalates_unanchored_and_moved_counts() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    a.comment_ids = vec!["C_a".into()];
+    install_prs(&fake, &[&a]);
+    fake.sync_ok();
+
+    let tail_page = |total: i64, id: &str, cursor: &str, more: bool| {
+        json!({"data": {"node": {"comments": {
+            "totalCount": total,
+            "pageInfo": {"hasPreviousPage": more, "startCursor": cursor},
+            "nodes": [comment_node(id)]
+        }}, "rateLimit": rate_limit(4000)}})
+        .to_string()
+    };
+    // Nine comments upstream, every walked page all-new: after the two
+    // bound walk-back pages there is still no anchor.
+    let mut refresh: Value = serde_json::from_str(&a.refresh()).unwrap();
+    refresh["data"]["node"]["comments"] = json!({
+        "totalCount": 9,
+        "pageInfo": {"hasPreviousPage": true, "startCursor": "curA"},
+        "nodes": [comment_node("N_1")]
+    });
+    fake.write("refresh-PR_1.json", &refresh.to_string());
+    fake.write("tail-PR_1-curA.json", &tail_page(9, "N_2", "curB", true));
+    fake.write("tail-PR_1-curB.json", &tail_page(9, "N_3", "curC", true));
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["full_walks"], 1, "unanchored: {s}");
+    let tails: Vec<String> = fake
+        .calls()
+        .iter()
+        .filter(|l| l.starts_with("TAIL|run=2"))
+        .cloned()
+        .collect();
+    assert_eq!(tails.len(), 2, "the bound stopped the hunt: {tails:?}");
+    assert_eq!(fake.hydrations(2), vec!["PR_1".to_string()]);
+
+    // Run 3: the count moves between page one and the walk-back page.
+    let mut refresh: Value = serde_json::from_str(&a.refresh()).unwrap();
+    refresh["data"]["node"]["comments"] = json!({
+        "totalCount": 2,
+        "pageInfo": {"hasPreviousPage": true, "startCursor": "curA"},
+        "nodes": [comment_node("N_1")]
+    });
+    fake.write("refresh-PR_1.json", &refresh.to_string());
+    fake.write("tail-PR_1-curA.json", &tail_page(3, "C_a", "cur0", false));
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["full_walks"], 1, "moved count: {s}");
+    assert_eq!(fake.hydrations(3), vec!["PR_1".to_string()]);
+}
+
+/// The skeleton's edit signal: a moved lastEditedAt refetches the WHOLE
+/// thread with bodies; an is_minimized flip with the signal unmoved is a
+/// cheap-field update resolved from the archive — no body fetch at all.
+#[test]
+fn skeleton_fetches_bodies_only_on_the_edit_signal() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    install_prs(&fake, &[&a]);
+    fake.sync_ok();
+
+    // Run 2: the thread comment was edited (lastEditedAt moved).
+    let mut refresh: Value = serde_json::from_str(&a.refresh()).unwrap();
+    refresh["data"]["node"]["reviewThreads"]["nodes"][0]["comments"]["nodes"][0]["lastEditedAt"] =
+        json!("2026-07-21T00:00:00Z");
+    fake.write("refresh-PR_1.json", &refresh.to_string());
+    fake.write(
+        "tbodies-T_PR_1.json",
+        &json!({"data": {"node": {
+            "id": "T_PR_1",
+            "comments": {"totalCount": 1, "nodes": [{
+                "id": "TC_PR_1", "body": "edited thread comment",
+                "createdAt": "2026-07-10T01:00:00Z",
+                "lastEditedAt": "2026-07-21T00:00:00Z",
+                "url": "https://github.com/t", "isMinimized": false,
+                "authorAssociation": "NONE",
+                "author": author("erin", "User")}]}
+        }, "rateLimit": rate_limit(4000)}})
+        .to_string(),
+    );
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["tail_hits"], 1, "{s}");
+    assert_eq!(
+        s["refresh"]["bodies_skipped"], 0,
+        "an edited thread skips nothing"
+    );
+    assert!(
+        fake.calls()
+            .iter()
+            .any(|l| l.starts_with("TBODIES|run=2|id=T_PR_1")),
+        "{:?}",
+        fake.calls()
+    );
+    let body: String = fake.query_one("SELECT body FROM comments WHERE id='TC_PR_1'");
+    assert_eq!(body, "edited thread comment");
+
+    // Run 3: minimize flip only — the signal is unmoved, so the body
+    // comes from the archive and no thread refetch happens.
+    let mut refresh: Value = serde_json::from_str(&a.refresh()).unwrap();
+    refresh["data"]["node"]["reviewThreads"]["nodes"][0]["comments"]["nodes"][0]["lastEditedAt"] =
+        json!("2026-07-21T00:00:00Z");
+    refresh["data"]["node"]["reviewThreads"]["nodes"][0]["comments"]["nodes"][0]["isMinimized"] =
+        json!(true);
+    fake.write("refresh-PR_1.json", &refresh.to_string());
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["bodies_skipped"], 1, "{s}");
+    assert!(
+        !fake.calls().iter().any(|l| l.starts_with("TBODIES|run=3")),
+        "a cheap-field flip must not fetch bodies: {:?}",
+        fake.calls()
+    );
+    let (minimized, body): (i64, String) = fake
+        .db()
+        .query_row(
+            "SELECT is_minimized, body FROM comments WHERE id='TC_PR_1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(minimized, 1, "the flip landed");
+    assert_eq!(
+        body, "edited thread comment",
+        "the archived body survived the skip"
+    );
+}
+
+/// The masked case and its catcher, end to end. An order-violating
+/// deletion+add that balances (the disclosed tolerance) tail-hits and
+/// leaves the archive wrong with clean paperwork; the re-verify tier's
+/// full walk catches it — which requires that a tail hit NOT stand in for
+/// the tier's complete refetch (the full_walked skip set, not `hydrated`).
+#[test]
+fn masked_case_is_tolerated_then_caught_by_reverify() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    a.comment_ids = vec!["C_a".into(), "C_b".into()];
+    install_prs(&fake, &[&a]);
+    fake.sync_ok();
+
+    // Upstream: C_a deleted, C_c added mid-connection (a backdated
+    // import — the creation-order violation the tolerance covers). The
+    // observed tail [C_b] anchors, 2 + 0 == 2 balances, the middle is
+    // never fetched: a masked hit.
+    let mut refresh: Value = serde_json::from_str(&a.refresh()).unwrap();
+    refresh["data"]["node"]["comments"] = json!({
+        "totalCount": 2,
+        "pageInfo": {"hasPreviousPage": true, "startCursor": "curX"},
+        "nodes": [comment_node("C_b")]
+    });
+    fake.write("refresh-PR_1.json", &refresh.to_string());
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["tail_hits"], 1, "the mask holds: {s}");
+    let stale: Option<String> = fake.query_one("SELECT deleted_at FROM comments WHERE id='C_a'");
+    assert!(
+        stale.is_none(),
+        "the deleted row survives, stale (the tolerance)"
+    );
+    let missed: i64 = fake.query_one("SELECT count(*) FROM comments WHERE id='C_c'");
+    assert_eq!(missed, 0, "the middle add is invisible to the tail");
+
+    // Run 3: the tier is due (stamp aged past reverify_open_days). The
+    // window STILL rediscovers the PR and the mask STILL holds — and the
+    // tier must full-walk anyway: a tail hit is an inference, not the
+    // complete refetch the tier exists to perform.
+    let old = ghgraph::time::Rfc3339Utc::now()
+        .checked_sub_days(40)
+        .unwrap();
+    fake.db()
+        .execute(
+            "UPDATE prs SET verified_at = ?1",
+            rusqlite::params![old.as_str()],
+        )
+        .unwrap();
+    a.comment_ids = vec!["C_b".into(), "C_c".into()];
+    fake.write("hyd-PR_1.json", &a.hydration()); // the truth, for the walk
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["tail_hits"], 1, "the window still masks: {s}");
+    assert_eq!(s["refresh"]["reverified"], 1, "the tier walked anyway: {s}");
+    assert_eq!(
+        s["refresh"]["quiet_mutations_found"], 1,
+        "and found the mutation"
+    );
+    assert_eq!(fake.hydrations(3), vec!["PR_1".to_string()]);
+    let stale: Option<String> = fake.query_one("SELECT deleted_at FROM comments WHERE id='C_a'");
+    assert!(stale.is_some(), "the catcher swept the masked deletion");
+    let caught: i64 = fake.query_one("SELECT count(*) FROM comments WHERE id='C_c'");
+    assert_eq!(caught, 1, "the catcher landed the masked add");
+    let stamp: Option<String> = fake.query_one("SELECT verified_at FROM prs WHERE number=1");
+    assert_ne!(
+        stamp.as_deref(),
+        Some(old.as_str()),
+        "the witness re-stamped"
+    );
+}
+
+/// The comment-node shape every hand-built refresh page uses.
+fn comment_node(id: &str) -> Value {
+    json!({
+        "id": id, "body": format!("comment {id}"),
+        "createdAt": "2026-07-10T00:00:00Z", "lastEditedAt": null,
+        "url": "https://github.com/x", "isMinimized": false,
+        "authorAssociation": "NONE", "author": author("carol", "User")
+    })
 }

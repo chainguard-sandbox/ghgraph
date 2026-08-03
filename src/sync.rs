@@ -956,7 +956,7 @@ fn worker(
             full_walks: 0,
             bodies_skipped: 0,
             windows_done: 0,
-            hydrated: HashSet::new(),
+            full_walked: HashSet::new(),
         };
         let end = s.sync_repo();
         let stats = Msg::Stats {
@@ -1033,7 +1033,13 @@ struct StreamCtx<'a> {
     full_walks: u64,
     bodies_skipped: u64,
     windows_done: u64,
-    hydrated: HashSet<String>,
+    /// Ids whose hydration this run was a genuine full walk. Re-verify
+    /// skips THESE, not `hydrated`: a tail-hit rehydration is an
+    /// inference, and letting it stand in for the tier's complete refetch
+    /// would disarm the masked-case catcher on exactly the PRs active
+    /// enough to be rediscovered every run (B3; the round-0 context's
+    /// "catcher unreachable" blocker class).
+    full_walked: HashSet<String>,
 }
 
 impl StreamCtx<'_> {
@@ -1149,7 +1155,6 @@ impl StreamCtx<'_> {
             match self.hydrate(&hit.id, Origin::Discovery)? {
                 Hydrated::Bundle(bundle) => {
                     extend(&mut watermark, &bundle.pr.updated_at);
-                    self.hydrated.insert(hit.id.clone());
                     self.fetched += 1;
                     rows.push(*bundle);
                     if rows.len() >= PAGE_BATCH {
@@ -1359,6 +1364,9 @@ impl StreamCtx<'_> {
             self.cfg.rate_limit_floor,
             || self.floor.load(Ordering::Relaxed),
         );
+        if matches!(end, HydrateEnd::Bundle(_)) {
+            self.full_walked.insert(id.to_string());
+        }
         self.hydrate_end(end)
     }
 
@@ -1458,7 +1466,6 @@ impl StreamCtx<'_> {
             }
             match self.hydrate(id, Origin::Retry)? {
                 Hydrated::Bundle(bundle) => {
-                    self.hydrated.insert(id.clone());
                     self.fetched += 1;
                     resolved.push(*bundle);
                 }
@@ -1485,8 +1492,12 @@ impl StreamCtx<'_> {
         let mut requeued: Vec<QuarantineRecord> = Vec::new();
         let now = Rfc3339Utc::now();
         for (i, (id, _number)) in self.plan.reverify.iter().enumerate() {
-            if self.hydrated.contains(id) {
-                continue; // discovery already gave it a complete refetch
+            if self.full_walked.contains(id) {
+                // Discovery already gave it a complete refetch. `hydrated`
+                // would be the wrong set here: a tail-hit rehydration is
+                // an inference, and the tier's whole job is the complete
+                // refetch that catches what inference masks.
+                continue;
             }
             if self.gate().is_err() {
                 // Re-verify sheds first at the floor, and the shed volume
@@ -1802,10 +1813,12 @@ fn hydrate_failure(e: gh::GhError) -> HydrateEnd {
 const TAIL_WALKBACK_PAGES: u32 = 2;
 
 /// The archived state one refresh inducts from, read through the worker's
-/// RO connection at dispatch time. Within a run each PR is hydrated at
-/// most once (windows dedupe, retries and re-verify skip already-hydrated
-/// ids) and repos are worker-exclusive, so this read cannot race a write
-/// to the same PR; the run lock excludes other syncs.
+/// RO connection at dispatch time. The read cannot race a write to the
+/// same PR: repos are worker-exclusive, the run lock excludes other
+/// syncs, and within a repo the only hydration that can FOLLOW a tail hit
+/// of the same PR is the re-verify full walk, which reads no baseline.
+/// (Windows dedupe among themselves; retries exclude quarantined ids from
+/// windows entirely.)
 struct RefreshBaseline {
     /// Live (deleted_at IS NULL) top-level comment ids — the archived
     /// side of the conservation equation, minimized rows included.
@@ -1864,13 +1877,18 @@ enum TailVerdict {
 /// anchor rule.
 ///
 /// The two masked cases, disclosed (DESIGN.md refresh): (1) a deletion
-/// offset by an equal count of non-tail-visible adds inside one window;
-/// (2) a body edit to a top-level comment in the un-fetched middle (the
-/// count is conserved and the ids overlap). Both fall to the re-verify
-/// tier — unconditional for OPEN PRs, within lookback of
-/// closed_at/merged_at for CLOSED/MERGED, beyond which a masked case is
-/// permanently stale, the same accepted scope limit as closed-tier
-/// discovery.
+/// offset by an equal count of non-tail-visible adds inside one window —
+/// REFINED by the model enumeration below: under the stated creation-
+/// order precondition an anchored suffix covers every appended add, so
+/// this shape is unreachable and the id arithmetic is EXACT; it survives
+/// as the disclosed blast radius of an order violation (an imported or
+/// backdated comment landing mid-connection), where the enumeration
+/// confines every false pass to exactly this shape; (2) a body edit to a
+/// top-level comment in the un-fetched middle (the count is conserved
+/// and the ids overlap). Both fall to the re-verify tier — unconditional
+/// for OPEN PRs, within lookback of closed_at/merged_at for
+/// CLOSED/MERGED, beyond which a masked case is permanently stale, the
+/// same accepted scope limit as closed-tier discovery.
 fn tail_conservation(
     archived_live: &HashSet<String>,
     total_count: i64,
@@ -3981,6 +3999,200 @@ mod tests {
         assert_eq!(
             incremental_since(None, &lookback).as_str(),
             lookback.as_str()
+        );
+    }
+
+    // --- tail conservation: exhaustive model enumeration ---
+
+    // The check is a pure decision function, so its safety property is
+    // provable by cases over a model of upstream histories: every archived
+    // list up to 4 ids, every deletion subset, up to 2 adds, every tail
+    // length (the walked tail is a suffix; deletions strike anywhere).
+    // Two models, one theorem each:
+    //
+    //   STRICT (adds append — the creation-order precondition the check
+    //   states): ZERO false hits. This is stronger than the round-0
+    //   disclosure: an anchored suffix necessarily covers every appended
+    //   add, so "deletion offset by non-tail-visible adds" cannot balance
+    //   while anchored — at the id level, under the preconditions, the
+    //   inference is EXACT, and the only residual masked case is the body
+    //   edit (invisible to ids by construction; pipeline-tested catcher).
+    //
+    //   WEAKENED (adds at ANY position — the order precondition broken,
+    //   e.g. an imported comment backdated into the middle): false hits
+    //   exist but are confined EXACTLY to the documented shape — partial
+    //   observation, deletions == non-tail-visible adds. This pins the
+    //   blast radius of a precondition failure to the disclosed tolerance;
+    //   any false hit outside it is the third masked case the round-0
+    //   panel hunted, and fails this test.
+    //
+    // Completeness rides along in the strict model: no deletions and an
+    // anchored (or fully-observed) tail always Hits, so unchanged PRs,
+    // appended comments, and zero-comment PRs never over-escalate.
+    #[test]
+    fn tail_conservation_enumerated_against_the_model() {
+        let archived_ids = ["a0", "a1", "a2", "a3"];
+        let add_ids = ["n0", "n1"];
+
+        // All live lists reachable by inserting `adds` ids into
+        // `survivors`: at the end only (strict) or anywhere (weakened).
+        fn arrangements<'a>(
+            survivors: &[&'a str],
+            adds: &[&'a str],
+            append_only: bool,
+        ) -> Vec<Vec<&'a str>> {
+            let mut acc = vec![survivors.to_vec()];
+            for add in adds {
+                let mut next = Vec::new();
+                for s1 in &acc {
+                    let positions = if append_only {
+                        s1.len()..=s1.len()
+                    } else {
+                        0..=s1.len()
+                    };
+                    for pos in positions {
+                        let mut v = s1.clone();
+                        v.insert(pos, add);
+                        next.push(v);
+                    }
+                }
+                acc = next;
+            }
+            acc
+        }
+
+        for append_only in [true, false] {
+            let mut cases = 0u32;
+            let mut masked = 0u32;
+            for archived_len in 0..=archived_ids.len() {
+                let s0 = &archived_ids[..archived_len];
+                let archived_live: HashSet<String> = s0.iter().map(|s| s.to_string()).collect();
+                for deleted_mask in 0u32..(1 << archived_len) {
+                    let survivors: Vec<&str> = s0
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| deleted_mask & (1 << i) == 0)
+                        .map(|(_, id)| *id)
+                        .collect();
+                    let deletions = archived_len - survivors.len();
+                    for adds in 0..=add_ids.len() {
+                        for s1 in arrangements(&survivors, &add_ids[..adds], append_only) {
+                            for k in 0..=s1.len() {
+                                cases += 1;
+                                let tail = &s1[s1.len() - k..];
+                                let fully_observed = k == s1.len();
+                                let verdict = tail_conservation(
+                                    &archived_live,
+                                    s1.len() as i64,
+                                    tail,
+                                    fully_observed,
+                                );
+                                // Ground truth: a tail-hit apply keeps every
+                                // archived row (no sweep) and upserts the tail.
+                                let mut after: HashSet<&str> = s0.iter().copied().collect();
+                                after.extend(tail);
+                                let live: HashSet<&str> = s1.iter().copied().collect();
+                                let sound = after == live;
+                                let tail_set: HashSet<&str> = tail.iter().copied().collect();
+                                let adds_outside_tail = add_ids[..adds]
+                                    .iter()
+                                    .filter(|id| !tail_set.contains(**id))
+                                    .count();
+                                match verdict {
+                                    TailVerdict::Hit if !sound => {
+                                        masked += 1;
+                                        assert!(
+                                            !append_only,
+                                            "STRICT-MODEL false hit: archived={s0:?} \
+                                             deleted_mask={deleted_mask:b} s1={s1:?} k={k}"
+                                        );
+                                        assert!(
+                                            !fully_observed
+                                                && deletions > 0
+                                                && deletions == adds_outside_tail,
+                                            "UNDOCUMENTED false hit: archived={s0:?} \
+                                             deleted_mask={deleted_mask:b} s1={s1:?} k={k}"
+                                        );
+                                    }
+                                    TailVerdict::Escalate(reason)
+                                        if append_only
+                                            && deletions == 0
+                                            && (fully_observed
+                                                || tail
+                                                    .iter()
+                                                    .any(|t| archived_live.contains(*t))) =>
+                                    {
+                                        panic!(
+                                            "over-escalation ({reason}): archived={s0:?} \
+                                             s1={s1:?} k={k}"
+                                        );
+                                    }
+                                    TailVerdict::Hit if deletions > 0 && adds == 0 => {
+                                        panic!(
+                                            "a pure deletion balanced?! archived={s0:?} \
+                                             deleted_mask={deleted_mask:b} k={k}"
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if append_only {
+                assert_eq!(cases, 333, "the strict model space ran, none skipped");
+                assert_eq!(masked, 0, "under the preconditions the inference is exact");
+            } else {
+                assert_eq!(cases, 2080, "the weakened model space ran, none skipped");
+                assert!(
+                    masked > 0,
+                    "the documented tolerance is reachable, not vacuous"
+                );
+            }
+        }
+    }
+
+    // The check's degenerate arms, pinned individually: the discriminating
+    // inputs are named so a regression names its arm.
+    #[test]
+    fn tail_conservation_arm_pins() {
+        let arch: HashSet<String> = ["a".to_string()].into();
+        // Duplicate id across pages: the connection moved under the walk.
+        assert_eq!(
+            tail_conservation(&arch, 2, &["n", "n"], false),
+            TailVerdict::Escalate("duplicate tail id")
+        );
+        // Negative count is API nonsense, not arithmetic fodder.
+        assert_eq!(
+            tail_conservation(&arch, -1, &[], true),
+            TailVerdict::Escalate("negative totalCount")
+        );
+        // Partial observation without an anchor never hits, even balanced:
+        // 1 archived + 1 new == 2, but nothing ties the suffix to the
+        // archive (round-0: no induction base).
+        assert_eq!(
+            tail_conservation(&arch, 2, &["n"], false),
+            TailVerdict::Escalate("no induction anchor")
+        );
+        // The fully-observed degenerate case: same shape, but the walk
+        // reached the connection's start — balance alone proves
+        // archived ⊆ fetched, and there is no middle to induct over.
+        assert_eq!(
+            tail_conservation(&arch, 2, &["a", "n"], true),
+            TailVerdict::Hit
+        );
+        // Zero comments before and after: fully observed, trivially
+        // balanced — the arm that keeps comment-less PRs on one call.
+        assert_eq!(
+            tail_conservation(&HashSet::new(), 0, &[], true),
+            TailVerdict::Hit
+        );
+        // An archived id deleted upstream, fully observed: the count
+        // drops, the imbalance forces the walk that sweeps.
+        assert_eq!(
+            tail_conservation(&arch, 0, &[], true),
+            TailVerdict::Escalate("count imbalance")
         );
     }
 }
