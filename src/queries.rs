@@ -28,6 +28,7 @@
 
 use crate::config::{RepoConfig, Scope};
 use crate::identity::Login;
+use crate::sync::Stream;
 use crate::time::Rfc3339Utc;
 
 /// Discovery: ids, updatedAt, and author (for filter skips) only.
@@ -47,14 +48,26 @@ query($q: String!, $after: String) {
   rateLimit { cost remaining resetAt }
 }"#;
 
-/// The discovery search strings for one configured repo.
-/// `since` is the caller's watermark with the overlap window already applied.
+/// The discovery search strings for one configured repo and ONE stream —
+/// the caller walks per (repo, stream) and each stream has its own
+/// watermark, so a stream-typed term set is what keeps an Issue node id
+/// out of PR hydration (the B2 panel's S1: an untyped term list fed
+/// project-scope issue hits into HYDRATE_PR, where every one became an
+/// eternal parse-class quarantine row). Stream::Issue emits terms only at
+/// project scope with the issue stream on; its consumer is the milestone-4
+/// walk.
+/// `since` is the caller's watermark with the overlap window already applied;
+/// `until`, when present, closes the window (`updated:since..until`) — the
+/// cap-splitting walk (sync.rs) halves a window that GitHub's ~1,000-result
+/// search cap truncated, and the halves need a bounded range. `None` is the
+/// open form (`updated:>=since`), the ordinary single-window case.
 /// This signature is the injection boundary: every interpolated value is a
 /// validating newtype — RepoName and Login (identity.rs) admit no space or
 /// ':', Rfc3339Utc's canonical form is charset-bounded to [0-9:TZ-] with ':'
 /// only in the fixed HH:MM:SS positions — so a value that could smuggle a
 /// second qualifier ("owner/name involves:someone-else") is unrepresentable
-/// here, not filtered here. The counterexample strings live on as unit tests
+/// here, not filtered here (the ".." separator is this function's own
+/// literal, not data). The counterexample strings live on as unit tests
 /// (identity.rs, config.rs). Do not add interpolation sites that take raw
 /// strings.
 pub fn discovery_terms(
@@ -62,18 +75,24 @@ pub fn discovery_terms(
     viewer: &Login,
     people: &[Login],
     since: &Rfc3339Utc,
+    until: Option<&Rfc3339Utc>,
+    stream: Stream,
 ) -> Vec<String> {
-    let base = format!("repo:{} updated:>={since} sort:updated-desc", rc.repo);
-    let pr = format!("{base} is:pr");
-    match rc.scope {
-        Scope::Project => {
-            let mut terms = vec![pr];
-            if rc.issues() {
-                terms.push(format!("{base} is:issue"));
-            }
-            terms
+    let updated = match until {
+        Some(until) => format!("updated:{since}..{until}"),
+        None => format!("updated:>={since}"),
+    };
+    let base = format!("repo:{} {updated} sort:updated-desc", rc.repo);
+    match (stream, rc.scope) {
+        (Stream::Issue, Scope::Project) if rc.issues() => {
+            vec![format!("{base} is:issue")]
         }
-        Scope::Working => {
+        // Working scope has no issue stream (config.rs rejects the
+        // combination); a project repo with issues off has none either.
+        (Stream::Issue, _) => Vec::new(),
+        (Stream::Pr, Scope::Project) => vec![format!("{base} is:pr")],
+        (Stream::Pr, Scope::Working) => {
+            let pr = format!("{base} is:pr");
             let mut terms = vec![
                 format!("{pr} involves:{viewer}"),
                 format!("{pr} review-requested:{viewer}"),
@@ -83,6 +102,32 @@ pub fn discovery_terms(
             terms
         }
     }
+}
+
+/// The targeted-backfill terms for people ADDED to a working-scope repo's
+/// config (the fingerprint transition that does not cold-start the stream):
+/// just the new `involves:` flavors, over the caller's window. Same
+/// injection boundary and same interpolation discipline as
+/// [`discovery_terms`] — newtypes only.
+pub fn backfill_terms(
+    rc: &RepoConfig,
+    added: &[Login],
+    since: &Rfc3339Utc,
+    until: Option<&Rfc3339Utc>,
+) -> Vec<String> {
+    let updated = match until {
+        Some(until) => format!("updated:{since}..{until}"),
+        None => format!("updated:>={since}"),
+    };
+    added
+        .iter()
+        .map(|p| {
+            format!(
+                "repo:{} {updated} sort:updated-desc is:pr involves:{p}",
+                rc.repo
+            )
+        })
+        .collect()
 }
 
 /// Hydration: one PR's full working-set context by node id. Variables: $id.
@@ -100,17 +145,18 @@ pub fn discovery_terms(
 ///     push time: Commit.pushedDate — the field prs.last_pushed_at was
 ///     designed around — is deprecated upstream ("no longer supported") and
 ///     returns null on current PRs; selecting it buys nothing and breaks
-///     every hydration whenever GitHub drops the field. OPEN QUESTION
-///     (milestone 2): the approval-staleness signal needs a replacement
-///     source — candidates are the force-push timeline event (in tension
-///     with the timeline standing rejection, DESIGN.md), the sync's own
-///     observed head_sha flip time (local, not server time), or
-///     committedDate as a lower bound (push ≥ commit, so approval <
-///     committedDate proves staleness but the converse proves nothing).
-///     Interim guarantee: last_pushed_at stays NULL, and attention's
+///     every hydration whenever GitHub drops the field. DECIDED (milestone
+///     2, recorded at sync.rs OBSERVED): the approval-staleness signal's
+///     replacement is two bounds the sync already stores — committedDate as
+///     the stale-side proof (push ≥ commit, so approval < committedDate
+///     proves staleness, server time, no skew) and the observations table's
+///     own head_sha flip row (observed_at ≥ push, local time, so approval ≥
+///     observed_at proves freshness modulo clock skew) — no new column
+///     writer; the force-push timeline event stays rejected with the
+///     timeline (DESIGN.md). prs.last_pushed_at stays NULL, and attention's
 ///     polarity contract degrades NULL/unknown ordering OUT of
-///     ready_to_merge (PLANNED, milestone 3 — attention.rs) — the bucket
-///     under-fills, it never lies.
+///     ready_to_merge (PLANNED, milestone 3 — attention.rs, which owns the
+///     skew margin) — the bucket under-fills, it never lies.
 ///   * Every author selection in this hydration document carries __typename
 ///     (structural Bot detection at ingest, since sync --pr skips discovery)
 ///     plus databaseId via User/Bot fragments (NULL when neither fragment
@@ -157,7 +203,7 @@ query($id: ID!) {
       }
       latestOpinionatedReviews(first: 20) {
         totalCount
-        nodes { state submittedAt authorAssociation
+        nodes { id state submittedAt body url authorAssociation
                 author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
       }
       closingIssuesReferences(first: 10) {
@@ -190,8 +236,8 @@ query($id: ID!) {
 }"#;
 
 /// Follow-up page for any overflowed hydration connection, rooted at the
-/// parent node id. Variables: $id, $after. One document per connection kind;
-/// THREADS_PAGE shown, COMMENTS_PAGE analogous.
+/// parent node id. Variables: $id, $after. One document per connection kind:
+/// THREADS_PAGE here, COMMENTS_PAGE below.
 ///
 /// totalCount is re-selected on every page, not just the first: the count
 /// can move mid-walk (a thread lands during pagination), and a follow-up
@@ -220,11 +266,52 @@ query($id: ID!, $after: String) {
   rateLimit { cost remaining resetAt }
 }"#;
 
+/// Follow-up page for the top-level comments connection — same shape rules
+/// as THREADS_PAGE (totalCount re-selected every page; parse::Paged both
+/// pages). Until this document existed, a PR with more than 50 top-level
+/// comments could only be marked truncated (the second-round B1 panel
+/// caught the "analogous" comment standing in for the const).
+pub const COMMENTS_PAGE: &str = r#"
+query($id: ID!, $after: String) {
+  node(id: $id) {
+    ... on PullRequest {
+      comments(first: 100, after: $after) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes { id body createdAt lastEditedAt url isMinimized authorAssociation
+                author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}"#;
+
+/// The node-id lookup for `sync --pr`: hydration is by node id, but the
+/// operator names a (repo, number). Variables: $owner, $name — the number is
+/// inlined into the document text instead of passed as a variable, because
+/// `gh -f` sends string variables only and `pullRequest(number:)` takes an
+/// Int; the inlined value is a validated `u64`, so its rendering is
+/// digits-only — the same argument that lets `discovery_terms` interpolate
+/// its newtypes. Do not extend this precedent to any non-numeric type.
+/// `repository` and `pullRequest` are both schema-nullable: null means "not
+/// found or not visible", which is data for the caller (USER_INPUT naming
+/// the reference), never a parse error.
+pub fn pr_id_document(number: u64) -> String {
+    format!(
+        r#"
+query($owner: String!, $name: String!) {{
+  repository(owner: $owner, name: $name) {{ pullRequest(number: {number}) {{ id }} }}
+  rateLimit {{ cost remaining resetAt }}
+}}"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::discovery_terms;
     use crate::config::parse;
     use crate::identity::Login;
+    use crate::sync::Stream;
     use crate::time::Rfc3339Utc;
 
     fn since() -> Rfc3339Utc {
@@ -243,7 +330,7 @@ mod tests {
         )
         .unwrap();
         let rc = cfg.repos[0].resolved();
-        let terms = discovery_terms(&rc, &cfg.viewer, &cfg.people, &since());
+        let terms = discovery_terms(&rc, &cfg.viewer, &cfg.people, &since(), None, Stream::Pr);
         let base = "repo:o/n updated:>=2026-07-01T00:00:00Z sort:updated-desc is:pr";
         assert_eq!(
             terms,
@@ -268,12 +355,14 @@ mod tests {
         .unwrap();
         let rc = cfg.repos[0].resolved();
         let people: Vec<Login> = Vec::new();
-        let terms = discovery_terms(&rc, &cfg.viewer, &people, &since());
         let base = "repo:o/n updated:>=2026-07-01T00:00:00Z sort:updated-desc";
-        assert_eq!(
-            terms,
-            vec![format!("{base} is:pr"), format!("{base} is:issue")]
-        );
+        // The PR stream never carries the issue term, whatever the issue
+        // setting: stream-typed terms are what keep an Issue node id out of
+        // PR hydration (the B2 panel's S1).
+        let terms = discovery_terms(&rc, &cfg.viewer, &people, &since(), None, Stream::Pr);
+        assert_eq!(terms, vec![format!("{base} is:pr")]);
+        let terms = discovery_terms(&rc, &cfg.viewer, &people, &since(), None, Stream::Issue);
+        assert_eq!(terms, vec![format!("{base} is:issue")]);
 
         let no_issues = parse(
             r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"project","issues":false}]}"#,
@@ -281,7 +370,71 @@ mod tests {
         )
         .unwrap();
         let rc = no_issues.repos[0].resolved();
-        let terms = discovery_terms(&rc, &no_issues.viewer, &people, &since());
+        let terms = discovery_terms(&rc, &no_issues.viewer, &people, &since(), None, Stream::Pr);
         assert_eq!(terms, vec![format!("{base} is:pr")]);
+        let terms = discovery_terms(
+            &rc,
+            &no_issues.viewer,
+            &people,
+            &since(),
+            None,
+            Stream::Issue,
+        );
+        assert_eq!(terms, Vec::<String>::new(), "issues off: no issue term");
+        // Working scope: no issue stream exists at all.
+        let working = parse(r#"{"viewer":"v","repos":["o/n"]}"#, "<test>").unwrap();
+        let rc = working.repos[0].resolved();
+        let terms = discovery_terms(&rc, &working.viewer, &people, &since(), None, Stream::Issue);
+        assert_eq!(terms, Vec::<String>::new());
+    }
+
+    // The bounded window form the cap-splitting walk uses: a closed
+    // updated:since..until range, same injection-safe interpolation.
+    #[test]
+    fn bounded_window_emits_closed_range() {
+        let cfg = parse(
+            r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"project","issues":false}]}"#,
+            "<test>",
+        )
+        .unwrap();
+        let rc = cfg.repos[0].resolved();
+        let until = Rfc3339Utc::parse("2026-07-15T12:00:00Z").unwrap();
+        let terms = discovery_terms(&rc, &cfg.viewer, &[], &since(), Some(&until), Stream::Pr);
+        assert_eq!(
+            terms,
+            vec![
+                "repo:o/n updated:2026-07-01T00:00:00Z..2026-07-15T12:00:00Z \
+                 sort:updated-desc is:pr"
+                    .to_string()
+            ]
+        );
+    }
+
+    // The backfill flavor's exact rendered string, pinned like its
+    // siblings: a future edit adding a non-newtype interpolation must fail
+    // a string-level test, not just an end-to-end count.
+    #[test]
+    fn backfill_terms_render_exactly() {
+        let cfg = parse(r#"{"viewer":"v","repos":["o/n"]}"#, "<test>").unwrap();
+        let rc = cfg.repos[0].resolved();
+        let added = vec![Login::new("Bob").unwrap()];
+        let terms = super::backfill_terms(&rc, &added, &since(), None);
+        assert_eq!(
+            terms,
+            vec![
+                "repo:o/n updated:>=2026-07-01T00:00:00Z sort:updated-desc is:pr involves:bob"
+                    .to_string()
+            ]
+        );
+    }
+
+    // pr_id_document inlines only a validated u64 (digits); the two string
+    // identifiers stay variables. Pin the rendered shape.
+    #[test]
+    fn pr_id_document_inlines_digits_only() {
+        let doc = super::pr_id_document(13864);
+        assert!(doc.contains("pullRequest(number: 13864)"), "{doc}");
+        assert!(doc.contains("$owner: String!"), "{doc}");
+        assert!(doc.contains("rateLimit"), "{doc}");
     }
 }

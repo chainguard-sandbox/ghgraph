@@ -134,6 +134,8 @@ pub enum Doc {
     Discovery,
     HydratePr,
     ThreadsPage,
+    CommentsPage,
+    PrId,
 }
 
 impl fmt::Display for Doc {
@@ -142,6 +144,8 @@ impl fmt::Display for Doc {
             Doc::Discovery => "DISCOVERY",
             Doc::HydratePr => "HYDRATE_PR",
             Doc::ThreadsPage => "THREADS_PAGE",
+            Doc::CommentsPage => "COMMENTS_PAGE",
+            Doc::PrId => "PR_ID",
         })
     }
 }
@@ -453,15 +457,24 @@ pub struct TeamRef {
 pub struct EmptyObject {}
 
 /// One row of latestOpinionatedReviews: per-reviewer verdict without paging
-/// review history. Becomes a comments row (kind='review'; schema.sql).
+/// review history. Becomes a comments row (kind='review'; schema.sql) —
+/// which is why it selects `id` (comments.id is NOT NULL UNIQUE), `body`
+/// (review summaries join comments_fts like any other comment text), and
+/// `url`. `submittedAt` is schema-nullable; a `None` cannot become a
+/// comments row (created_at is NOT NULL) and the writer skips it — an
+/// opinionated review always carries one in practice, so the skip is
+/// disclosure-free (sync.rs records the decision).
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ReviewNode {
+    pub id: String,
     /// APPROVED | CHANGES_REQUESTED | … — raw (module docs).
     pub state: String,
     #[serde(deserialize_with = "nullable")]
     pub submitted_at: Option<Rfc3339Utc>,
+    pub body: String,
+    pub url: String,
     pub author_association: String,
     #[serde(deserialize_with = "nullable")]
     pub author: Option<Author>,
@@ -576,6 +589,76 @@ pub fn threads_page(data: &serde_json::Value) -> Result<Option<ThreadsPageNode>,
         .map_err(|_| ParseError {
             doc: Doc::ThreadsPage,
         })
+}
+
+// ---------------------------------------------------------------------------
+// COMMENTS_PAGE
+
+/// A follow-up top-level-comments page, rooted at the PR node id.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CommentsPageNode {
+    pub comments: Paged<CommentNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CommentsPageData {
+    #[serde(deserialize_with = "nullable")]
+    node: Option<CommentsPageNode>,
+    /// See DiscoveryData::rate_limit.
+    #[allow(dead_code)]
+    rate_limit: Option<serde_json::Value>,
+}
+
+/// Parse one COMMENTS_PAGE response's `data`. `Ok(None)` = the PR vanished
+/// mid-walk (`node: null`); the walk's outcome discipline owns it.
+pub fn comments_page(data: &serde_json::Value) -> Result<Option<CommentsPageNode>, ParseError> {
+    CommentsPageData::deserialize(data)
+        .map(|d| d.node)
+        .map_err(|_| ParseError {
+            doc: Doc::CommentsPage,
+        })
+}
+
+// ---------------------------------------------------------------------------
+// PR_ID
+
+/// The `repository { pullRequest { id } }` lookup for `sync --pr`. Both
+/// levels are schema-nullable and both nulls are data: "no such repo (or not
+/// visible)" and "no such PR" respectively — the caller renders each as
+/// USER_INPUT naming the reference, never a parse error.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RepoIdNode {
+    #[serde(deserialize_with = "nullable")]
+    pub pull_request: Option<PrIdNode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PrIdNode {
+    pub id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PrIdData {
+    #[serde(deserialize_with = "nullable")]
+    repository: Option<RepoIdNode>,
+    /// See DiscoveryData::rate_limit.
+    #[allow(dead_code)]
+    rate_limit: Option<serde_json::Value>,
+}
+
+/// Parse one PR_ID response's `data`.
+pub fn pr_id(data: &serde_json::Value) -> Result<Option<RepoIdNode>, ParseError> {
+    PrIdData::deserialize(data)
+        .map(|d| d.repository)
+        .map_err(|_| ParseError { doc: Doc::PrId })
 }
 
 #[cfg(test)]
@@ -998,6 +1081,48 @@ mod tests {
             "response does not match the HYDRATE_PR document's parse type \
              (ghgraph's selection and GitHub's live schema disagree)"
         );
+    }
+
+    #[test]
+    fn comments_page_fixture_parses() {
+        let node = comments_page(&data(include_str!("../tests/fixtures/comments_page.json")))
+            .unwrap()
+            .expect("node resolves");
+        assert!(node.comments.total_count >= 1);
+        assert!(!node.comments.nodes.is_empty());
+        let c = &node.comments.nodes[0];
+        assert!(!c.id.is_empty());
+        assert!(c.author.is_some());
+    }
+
+    #[test]
+    fn comments_page_node_null_and_shape_errors() {
+        assert_eq!(comments_page(&json!({"node": null})).unwrap(), None);
+        assert!(comments_page(&json!({})).is_err(), "missing key is drift");
+        // A node that is not a PullRequest ({} from an unmatched fragment)
+        // must fail, not read as an empty page.
+        assert!(comments_page(&json!({"node": {}})).is_err());
+    }
+
+    #[test]
+    fn pr_id_fixture_parses() {
+        let repo = pr_id(&data(include_str!("../tests/fixtures/pr_id.json")))
+            .unwrap()
+            .expect("repository resolves");
+        let pr = repo.pull_request.expect("PR resolves");
+        assert!(pr.id.starts_with("PR_"), "{}", pr.id);
+    }
+
+    #[test]
+    fn pr_id_nulls_are_data() {
+        // Repo invisible and PR absent are USER_INPUT-grade data, never
+        // parse errors; a missing key stays loud.
+        assert_eq!(pr_id(&json!({"repository": null})).unwrap(), None);
+        let repo = pr_id(&json!({"repository": {"pullRequest": null}}))
+            .unwrap()
+            .expect("repo resolves");
+        assert_eq!(repo.pull_request, None);
+        assert!(pr_id(&json!({})).is_err());
     }
 
     #[test]

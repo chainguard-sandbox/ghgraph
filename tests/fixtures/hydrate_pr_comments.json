@@ -121,8 +121,11 @@
               "login": "williammartin"
             },
             "authorAssociation": "MEMBER",
+            "body": "Works for me!",
+            "id": "PRR_kwDODKw3uc8AAAABHl3RDQ",
             "state": "APPROVED",
-            "submittedAt": "2026-07-29T05:48:03Z"
+            "submittedAt": "2026-07-29T05:48:03Z",
+            "url": "https://github.com/cli/cli/pull/13987#pullrequestreview-4804432141"
           },
           {
             "author": {
@@ -131,8 +134,11 @@
               "login": "BagToad"
             },
             "authorAssociation": "MEMBER",
+            "body": "",
+            "id": "PRR_kwDODKw3uc8AAAABHlgjRQ",
             "state": "APPROVED",
-            "submittedAt": "2026-07-29T04:47:22Z"
+            "submittedAt": "2026-07-29T04:47:22Z",
+            "url": "https://github.com/cli/cli/pull/13987#pullrequestreview-4804059973"
           }
         ],
         "totalCount": 2
@@ -166,8 +172,8 @@
     },
     "rateLimit": {
       "cost": 1,
-      "remaining": 4821,
-      "resetAt": "2026-07-30T22:01:39Z"
+      "remaining": 4991,
+      "resetAt": "2026-07-31T23:44:34Z"
     }
   }
 }

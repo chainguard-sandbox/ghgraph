@@ -17,7 +17,7 @@
 //!      accepted is dropped or invented in flight, and normalization
 //!      (timestamp canonicalization) is idempotent.
 //!   3. Rejection carries no input: a ParseError's entire output is one of
-//!      three fixed strings — a pure function of which document failed —
+//!      five fixed strings — a pure function of which document failed —
 //!      so no fragment of the (untrusted) document can ride along.
 //!
 //! Corpus: seed with tests/fixtures/*.json so mutation starts from real
@@ -67,6 +67,30 @@ fuzz_target!(|data: &[u8]| {
                 parse::threads_page(&re).as_ref(),
                 Ok(&node),
                 "threads_page round-trip must be identity"
+            );
+        }
+        Err(e) => assert_fixed_message(&e),
+    }
+
+    match parse::comments_page(&v) {
+        Ok(node) => {
+            let re = serde_json::json!({ "node": node });
+            assert_eq!(
+                parse::comments_page(&re).as_ref(),
+                Ok(&node),
+                "comments_page round-trip must be identity"
+            );
+        }
+        Err(e) => assert_fixed_message(&e),
+    }
+
+    match parse::pr_id(&v) {
+        Ok(repo) => {
+            let re = serde_json::json!({ "repository": repo });
+            assert_eq!(
+                parse::pr_id(&re).as_ref(),
+                Ok(&repo),
+                "pr_id round-trip must be identity"
             );
         }
         Err(e) => assert_fixed_message(&e),

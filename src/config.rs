@@ -32,6 +32,20 @@ fn default_workers() -> usize {
     3
 }
 
+// Retry policy is OWNED by ghgraph (gh does not retry; the operator should
+// not have to babysit) — mechanics live in gh.rs, these are the knobs. Both
+// defaults are conservative ships to be tuned from sync_runs telemetry
+// (ROADMAP, deferred list): 3 attempts rides out a blip without hammering a
+// down API; the per-repo budget stops a pathological repo from spending the
+// whole run's wall clock on backoff sleeps.
+fn default_retry_attempts() -> u32 {
+    3
+}
+
+fn default_retry_budget() -> u32 {
+    20
+}
+
 fn default_rate_limit_floor() -> u32 {
     // The GraphQL point budget (5,000/hr) is shared with the operator's
     // interactive gh use and anything else on the token. When `remaining`
@@ -212,6 +226,13 @@ pub struct Config {
     /// this; the deferral is recorded, never silent.
     #[serde(default = "default_rate_limit_floor")]
     pub rate_limit_floor: u32,
+    /// Attempts per gh call before the failure escalates (quarantine for a
+    /// hydration, Failed for discovery). Only transient classes retry.
+    #[serde(default = "default_retry_attempts")]
+    pub retry_attempts: u32,
+    /// Total retries one repo may spend per run, across all its calls.
+    #[serde(default = "default_retry_budget")]
+    pub retry_budget: u32,
 }
 
 impl Config {
@@ -275,6 +296,15 @@ pub fn parse(raw: &str, source: &str) -> Result<Config> {
 /// value exists, every identifier is validated — so what remains here are
 /// the rules that span fields.
 fn validate(cfg: &Config) -> Result<()> {
+    // A zero period has no meaning the schedule could honor (its jitter is
+    // modulo the period), and the panic it once caused violated "workers
+    // return control on every fallible path" — config is external data
+    // (B2 panel, S2). "Every run" is not a re-verify tier; it is --full.
+    if cfg.reverify_open_days == 0 || cfg.reverify_closed_days == 0 {
+        return Err(Error::config(
+            "reverify_open_days and reverify_closed_days must be at least 1              (for a full refetch every run, use sync --full)",
+        ));
+    }
     for entry in &cfg.repos {
         let rc = entry.resolved();
         if rc.scope == Scope::Working && rc.issues() {
@@ -380,6 +410,8 @@ mod tests {
         assert_eq!(c.reverify_closed_days, 30);
         assert_eq!(c.workers, 3);
         assert_eq!(c.rate_limit_floor, 500);
+        assert_eq!(c.retry_attempts, 3);
+        assert_eq!(c.retry_budget, 20);
     }
 
     // validate() must reject a malformed repo (not just a bad viewer) and the
@@ -405,6 +437,19 @@ mod tests {
             .is_ok(),
             "a clean config must parse"
         );
+    }
+
+    // A zero re-verify period would make the schedule's jitter a modulo
+    // zero; it must be a CONFIGURATION refusal, never a panic (config is
+    // external data — B2 panel, S2).
+    #[test]
+    fn zero_reverify_periods_are_refused() {
+        for field in ["reverify_open_days", "reverify_closed_days"] {
+            let raw = format!(r#"{{"viewer":"v","repos":["o/n"],"{field}":0}}"#);
+            let err = parse(&raw, "<test>").err().expect("zero must be refused");
+            assert_eq!(err.code, crate::error::Code::Configuration);
+            assert!(err.message.contains("at least 1"), "{}", err.message);
+        }
     }
 
     // exclude_authors are gated too (by AuthorPattern's Deserialize): a
