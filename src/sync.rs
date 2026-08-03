@@ -323,20 +323,48 @@ enum Origin {
     Targeted,
 }
 
+/// The top-level comments connection's completeness, three-state by the
+/// round-0 spec audit's decree. Two states cannot say "the tail sufficed":
+/// with a boolean, a tail hit either claims complete (falsely licensing
+/// the sweep and the verified_at stamp — the middle was inferred, not
+/// witnessed) or claims incomplete (flipping truncated 0↔1 per alternating
+/// tail/full runs on an UNCHANGED PR — an UPDATE per tail hit, replay
+/// idempotence broken). TailHit is the third horn: the writer carries the
+/// STORED truncated and verified_at forward untouched, sweeps nothing,
+/// stamps nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommentsCompleteness {
+    /// Pagination of the live id set terminated: the witness, as in B2.
+    Complete,
+    /// The conservation check concluded the un-fetched middle is unchanged;
+    /// the bundle's comment nodes are the tail only. An inference, never a
+    /// witness: it can neither sweep nor stamp, and the stored
+    /// truncated/verified_at pass through unmodified.
+    TailHit,
+    /// Pagination did not terminate (cap, floor, mid-walk failure): the
+    /// row lands truncated, as in B2.
+    Incomplete,
+}
+
 /// Rows for one writer transaction, already parsed and typed: the PR node
 /// with its comments/reviewThreads vectors REPLACED by the merged
 /// all-pages sets, plus body-extracted refs and the per-connection
-/// completeness verdicts. Constructed only by [`hydrate_one`], which is the
-/// only place a completeness claim can be earned.
+/// completeness verdicts. Constructed only by [`hydrate_one`] and the
+/// refresh path (`refresh_one`), the only places a completeness claim can
+/// be earned.
 pub struct PrBundle {
     repo: String,
     pr: parse::PrNode,
     refs: Vec<refs::ExtractedRef>,
     origin: Origin,
-    /// Pagination of the top-level comments connection terminated.
-    comments_complete: bool,
+    /// Top-level comments: the one three-state connection (see
+    /// [`CommentsCompleteness`]); every other connection is witnessed or
+    /// not, with no inference form.
+    comments: CommentsCompleteness,
     /// Thread pagination terminated AND every thread's nested comment
-    /// selection was complete (nodes == totalCount).
+    /// selection was complete (nodes == totalCount). The skeleton walk
+    /// earns this the same way a full walk does: ids suffice, bodies are
+    /// not part of completeness.
     threads_complete: bool,
     /// The three schema-nullable connections: present (not error-masked)
     /// and complete (nodes == totalCount).
@@ -347,9 +375,11 @@ pub struct PrBundle {
 
 impl PrBundle {
     /// Witness-complete: every connection of the PR paginated to its end.
-    /// The gate for verified_at and for sweeps.
+    /// The gate for verified_at and for sweeps. A TailHit is deliberately
+    /// NOT verified — the comments middle was inferred, and an inference
+    /// licenses carrying state forward, never advancing it.
     fn verified(&self) -> bool {
-        self.comments_complete
+        self.comments == CommentsCompleteness::Complete
             && self.threads_complete
             && self.requests_complete
             && self.reviews_complete
@@ -433,6 +463,21 @@ pub enum Msg {
         filtered: u64,
         reverified: u64,
         reverify_shed: u64,
+        /// Refresh attempts whose conservation check concluded (the
+        /// dispatch gate passed): tail_hits and full_walks PARTITION them
+        /// — an escalated check counts as full_walks only — so
+        /// tail_hits/(tail_hits+full_walks) is the true hit rate that
+        /// sizes TAIL_K (the telemetry rule's named consumer). First
+        /// contact, re-verify, retries, and --pr are not attempts: they
+        /// never reach the gate. A floor-aborted attempt (check never
+        /// concluded) counts as neither and lands in health.truncated.
+        tail_hits: u64,
+        full_walks: u64,
+        /// Thread-comment bodies resolved from the archive instead of the
+        /// wire (id known and lastEditedAt unmoved): the skeleton's saved
+        /// bytes, and the field that would expose a body-skip that stops
+        /// firing (a regression detector, its other named consumer).
+        bodies_skipped: u64,
     },
 }
 
@@ -900,6 +945,9 @@ fn worker(
                 filtered: 0,
                 reverified: 0,
                 reverify_shed: 0,
+                tail_hits: 0,
+                full_walks: 0,
+                bodies_skipped: 0,
             });
             if deferred.is_err() || stats.is_err() {
                 return; // writer gone: cancellation
@@ -916,6 +964,9 @@ fn worker(
             filtered: 0,
             reverified: 0,
             reverify_shed: 0,
+            tail_hits: 0,
+            full_walks: 0,
+            bodies_skipped: 0,
             windows_done: 0,
             hydrated: HashSet::new(),
         };
@@ -927,6 +978,9 @@ fn worker(
             filtered: s.filtered,
             reverified: s.reverified,
             reverify_shed: s.reverify_shed,
+            tail_hits: s.tail_hits,
+            full_walks: s.full_walks,
+            bodies_skipped: s.bodies_skipped,
         };
         match end {
             Err(Stop::Writer) => return,
@@ -979,6 +1033,9 @@ struct StreamCtx<'a> {
     filtered: u64,
     reverified: u64,
     reverify_shed: u64,
+    tail_hits: u64,
+    full_walks: u64,
+    bodies_skipped: u64,
     windows_done: u64,
     hydrated: HashSet<String>,
 }
@@ -1584,7 +1641,13 @@ fn hydrate_one(
         pr: node,
         refs: body_refs,
         origin,
-        comments_complete,
+        // The full walk is two-state: it witnesses or it doesn't. TailHit
+        // is constructible only by the refresh path's conservation check.
+        comments: if comments_complete {
+            CommentsCompleteness::Complete
+        } else {
+            CommentsCompleteness::Incomplete
+        },
         threads_complete,
         requests_complete,
         reviews_complete,
@@ -1628,6 +1691,9 @@ struct RepoTally {
     reverified: u64,
     quiet_mutations_found: u64,
     reverify_shed: u64,
+    tail_hits: u64,
+    full_walks: u64,
+    bodies_skipped: u64,
     truncated: u64,
     quarantined: u64,
     discovery_truncated: u64,
@@ -1780,12 +1846,18 @@ fn writer(
                 filtered,
                 reverified,
                 reverify_shed,
+                tail_hits,
+                full_walks,
+                bodies_skipped,
             } => {
                 let t = tally(&mut tallies, &repo);
                 t.fetched += fetched;
                 t.filtered += filtered;
                 t.reverified += reverified;
                 t.reverify_shed += reverify_shed;
+                t.tail_hits += tail_hits;
+                t.full_walks += full_walks;
+                t.bodies_skipped += bodies_skipped;
                 t.subprocess_count += tel.subprocess_count;
                 t.subprocess_ms += tel.subprocess_ms;
                 t.bytes_parsed += tel.bytes_parsed;
@@ -1919,7 +1991,7 @@ fn apply_bundle(
     // nor upserted.
     let mut changed = false;
 
-    let pk = upsert_pr(tx, now, b, t, &mut changed)?;
+    let (pk, landed_truncated) = upsert_pr(tx, now, b, t, &mut changed)?;
     upsert_children(tx, now, b, pk, t, &mut changed)?;
 
     if changed {
@@ -1927,7 +1999,11 @@ fn apply_bundle(
     } else {
         t.unchanged += 1;
     }
-    if !b.verified() {
+    // health.truncated counts rows the run LEFT truncated. A TailHit
+    // carries the stored value, so an ordinary hit (stored 0) is not
+    // truncation — counting the bundle's !verified() here would report
+    // every tail hit as an incomplete archive row, which it is not.
+    if landed_truncated {
         t.truncated += 1;
     }
     if b.origin == Origin::Reverify && changed {
@@ -1956,10 +2032,53 @@ fn upsert_pr(
     b: &PrBundle,
     t: &mut RepoTally,
     changed: &mut bool,
-) -> Result<i64> {
+) -> Result<(i64, bool)> {
     let pr = &b.pr;
     let head = pr.commits.nodes.first().map(|c| &c.commit);
     let author = pr.author.as_ref();
+
+    let existing: Option<(i64, Vec<Option<String>>, Option<String>)> = tx
+        .query_row(
+            "SELECT pk, id, title, body, state, is_draft, author, author_id, author_assoc, \
+                    head_ref, base_ref, head_sha, review_decision, created_at, updated_at, \
+                    merged_at, closed_at, url, truncated, deleted_at, verified_at \
+             FROM prs WHERE repo = ?1 AND number = ?2",
+            rusqlite::params![b.repo, pr.number],
+            |r| {
+                let pk: i64 = r.get(0)?;
+                let mut cols = Vec::new();
+                for i in 1..20 {
+                    // Numeric columns read back as text for a uniform diff;
+                    // SQLite's CAST of INTEGER to TEXT is exact.
+                    cols.push(r.get::<_, Option<String>>(i).or_else(|_| {
+                        r.get::<_, Option<i64>>(i).map(|v| v.map(|v| v.to_string()))
+                    })?);
+                }
+                let verified_at: Option<String> = r.get(20)?;
+                Ok((pk, cols, verified_at))
+            },
+        )
+        .map(Some)
+        .or_else(none_if_no_rows)
+        .map_err(|e| classify_sql(&e))?;
+
+    // The truncated value this bundle lands. A TailHit CARRIES the stored
+    // value (round-0 decree: the middle was inferred, so the bundle may
+    // neither heal truncation nor introduce it — a boolean here is what
+    // oscillated); with truncated inside the field diff, carrying the old
+    // value is also what keeps an unchanged tail-hit replay write-free. A
+    // TailHit with no stored row cannot claim anything (the dispatch gate
+    // requires a witnessed baseline, so this arm is defensive): it lands
+    // truncated, disclosed, healed by the next full walk.
+    let landed_truncated = match (b.comments, &existing) {
+        (CommentsCompleteness::TailHit, Some((_, old_cols, _))) => {
+            // old_cols[17] is `truncated` (the SELECT order above).
+            old_cols[17].as_deref() == Some("1")
+        }
+        (CommentsCompleteness::TailHit, None) => true,
+        _ => !b.verified(),
+    };
+
     let new: Vec<(&str, Option<String>)> = vec![
         ("id", Some(pr.id.clone())),
         ("title", Some(pr.title.clone())),
@@ -1987,34 +2106,9 @@ fn upsert_pr(
             pr.closed_at.as_ref().map(|x| x.as_str().to_string()),
         ),
         ("url", Some(pr.url.clone())),
-        ("truncated", Some(i64::from(!b.verified()).to_string())),
+        ("truncated", Some(i64::from(landed_truncated).to_string())),
         ("deleted_at", None),
     ];
-
-    let existing: Option<(i64, Vec<Option<String>>, Option<String>)> = tx
-        .query_row(
-            "SELECT pk, id, title, body, state, is_draft, author, author_id, author_assoc, \
-                    head_ref, base_ref, head_sha, review_decision, created_at, updated_at, \
-                    merged_at, closed_at, url, truncated, deleted_at, verified_at \
-             FROM prs WHERE repo = ?1 AND number = ?2",
-            rusqlite::params![b.repo, pr.number],
-            |r| {
-                let pk: i64 = r.get(0)?;
-                let mut cols = Vec::new();
-                for i in 1..20 {
-                    // Numeric columns read back as text for a uniform diff;
-                    // SQLite's CAST of INTEGER to TEXT is exact.
-                    cols.push(r.get::<_, Option<String>>(i).or_else(|_| {
-                        r.get::<_, Option<i64>>(i).map(|v| v.map(|v| v.to_string()))
-                    })?);
-                }
-                let verified_at: Option<String> = r.get(20)?;
-                Ok((pk, cols, verified_at))
-            },
-        )
-        .map(Some)
-        .or_else(none_if_no_rows)
-        .map_err(|e| classify_sql(&e))?;
 
     match existing {
         None => {
@@ -2052,11 +2146,11 @@ fn upsert_pr(
                     pr.merged_at.as_ref().map(|x| x.as_str()),
                     pr.closed_at.as_ref().map(|x| x.as_str()),
                     pr.url,
-                    !b.verified(),
+                    landed_truncated,
                     verified_at,
                 ],
             )?;
-            Ok(tx.last_insert_rowid())
+            Ok((tx.last_insert_rowid(), landed_truncated))
         }
         Some((pk, old_cols, old_verified_at)) => {
             let names = [
@@ -2147,13 +2241,13 @@ fn upsert_pr(
                         pr.merged_at.as_ref().map(|x| x.as_str()),
                         pr.closed_at.as_ref().map(|x| x.as_str()),
                         pr.url,
-                        !b.verified(),
+                        landed_truncated,
                         verified_at,
                         pk,
                     ],
                 )?;
             }
-            Ok(pk)
+            Ok((pk, landed_truncated))
         }
     }
 }
@@ -2240,7 +2334,7 @@ fn upsert_children(
     // Sweeps: soft deletes, gated on the connection's completeness witness
     // — a sweep on an incomplete connection is a type error by discipline
     // (truncation must never read as deletion).
-    if b.comments_complete {
+    if b.comments == CommentsCompleteness::Complete {
         t.soft_deleted += sweep(
             tx,
             now,
@@ -2768,6 +2862,9 @@ fn summary(tallies: &BTreeMap<String, RepoTally>) -> Value {
                     "reverified": t.reverified,
                     "quiet_mutations_found": t.quiet_mutations_found,
                     "reverify_shed": t.reverify_shed,
+                    "tail_hits": t.tail_hits,
+                    "full_walks": t.full_walks,
+                    "bodies_skipped": t.bodies_skipped,
                 },
                 "cost": {
                     "subprocess_count": t.subprocess_count,
