@@ -135,7 +135,10 @@
 //!     thread bodies from the archive when id + lastEditedAt match
 //!     (bodies_skipped) or refetches whole changed threads
 //!     (THREAD_BODIES), and carries stored truncated/verified_at forward
-//!     untouched — it can never sweep or stamp. Re-verify, retries, --pr,
+//!     untouched — the tail can never sweep COMMENTS and never stamps,
+//!     while a complete skeleton walk in the same bundle still earns the
+//!     thread sweeps (per-connection witnesses, as everywhere).
+//!     Re-verify, retries, --pr,
 //!     and first contact always FULL-WALK: the first-page document plus
 //!     follow-up pages for both big connections, the
 //!     strictly-more-complete form the refresh specializes — and
@@ -178,7 +181,9 @@
 //!              visible), observations, soft_deleted
 //!     refresh  reverified, quiet_mutations_found, reverify_shed,
 //!              tail_hits, full_walks (partitioning concluded refresh
-//!              attempts — the hit rate that sizes TAIL_K), bodies_skipped
+//!              attempts — the hit rate that sizes TAIL_K), escalations
+//!              (full_walks split by reason: which response would change
+//!              the outcome is a per-reason question), bodies_skipped
 //!     cost     subprocess_count, subprocess_seconds, bytes_parsed,
 //!              rate_cost, sleeps, sleep_seconds
 //!     health   truncated, quarantined, discovery_truncated,
@@ -455,10 +460,19 @@ pub enum Msg {
         /// tail_hits/(tail_hits+full_walks) is the true hit rate that
         /// sizes TAIL_K (the telemetry rule's named consumer). First
         /// contact, re-verify, retries, and --pr are not attempts: they
-        /// never reach the gate. A floor-aborted attempt (check never
-        /// concluded) counts as neither and lands in health.truncated.
+        /// never reach the gate. A walk-back aborted BEFORE the verdict
+        /// (floor, transport) counts as neither and lands in
+        /// health.truncated; post-verdict thread-phase failures still
+        /// count as tail_hits — the tail mechanism concluded, and the
+        /// incompleteness is disclosed through the withheld threads
+        /// witness.
         tail_hits: u64,
         full_walks: u64,
+        /// Escalations by reason (the strings RefreshEnd::Escalate
+        /// names): the diagnostic split behind full_walks — which
+        /// response would change the outcome (raise K, accept deletion
+        /// traffic, distrust the walk) is a per-reason question.
+        escalations: BTreeMap<&'static str, u64>,
         /// Thread-comment bodies resolved from the archive instead of the
         /// wire (id known and lastEditedAt unmoved): the skeleton's saved
         /// bytes, and the field that would expose a body-skip that stops
@@ -934,6 +948,7 @@ fn worker(
                 reverify_shed: 0,
                 tail_hits: 0,
                 full_walks: 0,
+                escalations: BTreeMap::new(),
                 bodies_skipped: 0,
             });
             if deferred.is_err() || stats.is_err() {
@@ -954,6 +969,7 @@ fn worker(
             reverify_shed: 0,
             tail_hits: 0,
             full_walks: 0,
+            escalations: BTreeMap::new(),
             bodies_skipped: 0,
             windows_done: 0,
             full_walked: HashSet::new(),
@@ -968,6 +984,7 @@ fn worker(
             reverify_shed: s.reverify_shed,
             tail_hits: s.tail_hits,
             full_walks: s.full_walks,
+            escalations: s.escalations.clone(),
             bodies_skipped: s.bodies_skipped,
         };
         match end {
@@ -1031,6 +1048,7 @@ struct StreamCtx<'a> {
     reverify_shed: u64,
     tail_hits: u64,
     full_walks: u64,
+    escalations: BTreeMap<&'static str, u64>,
     bodies_skipped: u64,
     windows_done: u64,
     /// Ids whose hydration this run was a genuine full walk. Re-verify
@@ -1347,12 +1365,14 @@ impl StreamCtx<'_> {
                     }
                     return self.hydrate_end(end);
                 }
-                RefreshEnd::Escalate => {
+                RefreshEnd::Escalate(reason) => {
                     // The check could not license the tail: discard the
                     // refresh's view entirely and restart from the top —
                     // never resume from suspect state. Partitioned into
-                    // full_walks only (never also tail_hits).
+                    // full_walks only (never also tail_hits), with the
+                    // reason split kept for the K-sizing diagnosis.
                     self.full_walks += 1;
+                    *self.escalations.entry(reason).or_default() += 1;
                 }
             }
         }
@@ -1835,7 +1855,14 @@ struct RefreshBaseline {
 /// an error: it is the check declining to license the skip.
 enum RefreshEnd {
     End(HydrateEnd),
-    Escalate,
+    /// The reason names the arm for the summary's per-reason escalation
+    /// counters (refresh.escalations): the flat tail_hits/full_walks
+    /// ratio sizes K, but only the reason split says WHICH response
+    /// raising K would change — "no induction anchor" means the tail is
+    /// too short, "count imbalance" means deletion traffic no K fixes,
+    /// "duplicate tail id"/"non-advancing cursor" mean the API is
+    /// unstable under the walk (B3 panel, S1).
+    Escalate(&'static str),
 }
 
 /// The conservation check's verdict. The reason string names the arm for
@@ -1956,7 +1983,7 @@ fn refresh_one(
         Err(e) => return RefreshEnd::End(hydrate_failure(e)),
     };
     let node = match parse::refresh_pr(&resp.data) {
-        Err(_) => return RefreshEnd::Escalate,
+        Err(_) => return RefreshEnd::Escalate("refresh parse drift"),
         Ok(None) => return RefreshEnd::End(HydrateEnd::Vanished),
         Ok(Some(node)) => node,
     };
@@ -1975,14 +2002,20 @@ fn refresh_one(
     let mut has_prev = node.comments.page_info.has_previous_page;
     let mut cursor = node.comments.page_info.start_cursor.clone();
     let mut pages: u32 = 0;
-    // `aborted`: the floor or a transport wobble stopped the refresh
-    // before a verdict; the bundle lands Incomplete (witness-free), the
-    // same shape as the full walk's partial arm.
+    // `aborted`: the floor or a transport wobble stopped the walk-back
+    // BEFORE a verdict; the bundle lands Incomplete (witness-free), the
+    // same shape as the full walk's partial arm. Post-verdict failures
+    // (the thread phase) never touch this: comments completeness
+    // reflects the comments connection alone, and a thread-phase floor
+    // or transport failure withholds the THREADS witness instead (B3
+    // panel, S2 — the earlier draft demoted a concluded Hit to
+    // Incomplete on a thread-phase floor, which made the accounting
+    // asymmetric with the transport arm below).
     let mut aborted = false;
     while has_prev && !tail.iter().any(|c| baseline.live_comments.contains(&c.id)) {
         if pages >= TAIL_WALKBACK_PAGES {
             // Anchor not found within the bound: no induction base.
-            return RefreshEnd::Escalate;
+            return RefreshEnd::Escalate("no anchor within walk-back bound");
         }
         if floor_hit(gh_ctx) {
             aborted = true;
@@ -1991,7 +2024,7 @@ fn refresh_one(
         let Some(before) = cursor.clone() else {
             // hasPreviousPage with no startCursor is schema nonsense;
             // treat it as an untrustworthy snapshot.
-            return RefreshEnd::Escalate;
+            return RefreshEnd::Escalate("missing walk-back cursor");
         };
         let resp = match gh::graphql(
             &queries::tail_comments_document(),
@@ -2007,10 +2040,10 @@ fn refresh_one(
         let page = match parse::tail_comments(&resp.data) {
             Ok(Some(page)) => page,
             // Vanished or drifted mid-walk: the snapshot is suspect.
-            Ok(None) | Err(_) => return RefreshEnd::Escalate,
+            Ok(None) | Err(_) => return RefreshEnd::Escalate("tail page vanished or drifted"),
         };
         if page.comments.total_count != total {
-            return RefreshEnd::Escalate;
+            return RefreshEnd::Escalate("count moved between pages");
         }
         pages += 1;
         has_prev = page.comments.page_info.has_previous_page;
@@ -2024,7 +2057,7 @@ fn refresh_one(
         match page.comments.page_info.start_cursor {
             Some(c) if Some(&c) != cursor.as_ref() => cursor = Some(c),
             _ if !has_prev => cursor = None,
-            _ => return RefreshEnd::Escalate, // non-advancing cursor
+            _ => return RefreshEnd::Escalate("non-advancing cursor"),
         }
         let mut walked = page.comments.nodes;
         walked.extend(tail);
@@ -2035,7 +2068,7 @@ fn refresh_one(
         let tail_ids: Vec<&str> = tail.iter().map(|c| c.id.as_str()).collect();
         match tail_conservation(&baseline.live_comments, total, &tail_ids, !has_prev) {
             TailVerdict::Hit => {}
-            TailVerdict::Escalate(_) => return RefreshEnd::Escalate,
+            TailVerdict::Escalate(reason) => return RefreshEnd::Escalate(reason),
         }
     }
 
@@ -2107,7 +2140,10 @@ fn refresh_one(
             continue;
         }
         if floor_hit(gh_ctx) {
-            aborted = true;
+            // Same degradation as the transport arm below: the thread
+            // keeps its cheap fields, loses its comments, and the
+            // withheld threads witness lands the row truncated. The
+            // comments verdict (already concluded) stands.
             threads.push(thread_without_comments(sk));
             continue;
         }
@@ -2271,6 +2307,7 @@ struct RepoTally {
     reverify_shed: u64,
     tail_hits: u64,
     full_walks: u64,
+    escalations: BTreeMap<&'static str, u64>,
     bodies_skipped: u64,
     truncated: u64,
     quarantined: u64,
@@ -2426,6 +2463,7 @@ fn writer(
                 reverify_shed,
                 tail_hits,
                 full_walks,
+                escalations,
                 bodies_skipped,
             } => {
                 let t = tally(&mut tallies, &repo);
@@ -2435,6 +2473,9 @@ fn writer(
                 t.reverify_shed += reverify_shed;
                 t.tail_hits += tail_hits;
                 t.full_walks += full_walks;
+                for (reason, n) in escalations {
+                    *t.escalations.entry(reason).or_default() += n;
+                }
                 t.bodies_skipped += bodies_skipped;
                 t.subprocess_count += tel.subprocess_count;
                 t.subprocess_ms += tel.subprocess_ms;
@@ -2604,6 +2645,15 @@ fn apply_bundle(
 /// prs.last_pushed_at stays NULL, which fails closed.
 const OBSERVED: &[&str] = &["state", "review_decision", "head_sha", "is_draft", "author"];
 
+/// The one SELECT whose column ORDER feeds a decision: old_cols[17] must
+/// be `truncated` for the TailHit carry (upsert_pr). The list is a const
+/// so the position test pins the string the query actually runs, not a
+/// copy (B3 panel, S3).
+const PR_SELECT: &str = "SELECT pk, id, title, body, state, is_draft, author, author_id, \
+                    author_assoc, head_ref, base_ref, head_sha, review_decision, created_at, \
+                    updated_at, merged_at, closed_at, url, truncated, deleted_at, verified_at \
+             FROM prs WHERE repo = ?1 AND number = ?2";
+
 fn upsert_pr(
     tx: &rusqlite::Transaction,
     now: &Rfc3339Utc,
@@ -2616,26 +2666,21 @@ fn upsert_pr(
     let author = pr.author.as_ref();
 
     let existing: Option<(i64, Vec<Option<String>>, Option<String>)> = tx
-        .query_row(
-            "SELECT pk, id, title, body, state, is_draft, author, author_id, author_assoc, \
-                    head_ref, base_ref, head_sha, review_decision, created_at, updated_at, \
-                    merged_at, closed_at, url, truncated, deleted_at, verified_at \
-             FROM prs WHERE repo = ?1 AND number = ?2",
-            rusqlite::params![b.repo, pr.number],
-            |r| {
-                let pk: i64 = r.get(0)?;
-                let mut cols = Vec::new();
-                for i in 1..20 {
-                    // Numeric columns read back as text for a uniform diff;
-                    // SQLite's CAST of INTEGER to TEXT is exact.
-                    cols.push(r.get::<_, Option<String>>(i).or_else(|_| {
+        .query_row(PR_SELECT, rusqlite::params![b.repo, pr.number], |r| {
+            let pk: i64 = r.get(0)?;
+            let mut cols = Vec::new();
+            for i in 1..20 {
+                // Numeric columns read back as text for a uniform diff;
+                // SQLite's CAST of INTEGER to TEXT is exact.
+                cols.push(
+                    r.get::<_, Option<String>>(i).or_else(|_| {
                         r.get::<_, Option<i64>>(i).map(|v| v.map(|v| v.to_string()))
-                    })?);
-                }
-                let verified_at: Option<String> = r.get(20)?;
-                Ok((pk, cols, verified_at))
-            },
-        )
+                    })?,
+                );
+            }
+            let verified_at: Option<String> = r.get(20)?;
+            Ok((pk, cols, verified_at))
+        })
         .map(Some)
         .or_else(none_if_no_rows)
         .map_err(|e| classify_sql(&e))?;
@@ -3454,6 +3499,7 @@ fn summary(tallies: &BTreeMap<String, RepoTally>) -> Value {
                     "reverify_shed": t.reverify_shed,
                     "tail_hits": t.tail_hits,
                     "full_walks": t.full_walks,
+                    "escalations": t.escalations,
                     "bodies_skipped": t.bodies_skipped,
                 },
                 "cost": {
@@ -4171,6 +4217,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    // upsert_pr reads old_cols[17] as `truncated` for the TailHit carry —
+    // the one place a positional column index feeds a DECISION rather
+    // than the uniform diff. Pin the position against the SELECT text
+    // itself so a column reorder fails here, not silently in the carry
+    // (B3 panel, S3).
+    #[test]
+    fn upsert_pr_truncated_column_position_is_pinned() {
+        let cols: Vec<&str> = PR_SELECT
+            .trim_start_matches("SELECT ")
+            .split(" FROM ")
+            .next()
+            .unwrap()
+            .split(',')
+            .map(str::trim)
+            .collect();
+        // cols[0] is pk (not part of old_cols); old_cols[i] = cols[i + 1].
+        assert_eq!(cols.len(), 21, "the 1..20 read loop spans every column");
+        assert_eq!(cols[18], "truncated", "old_cols[17] must be truncated");
     }
 
     // The check's degenerate arms, pinned individually: the discriminating

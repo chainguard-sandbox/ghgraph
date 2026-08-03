@@ -1825,6 +1825,7 @@ fn refresh_escalates_on_deletion_and_the_full_walk_sweeps() {
     let s = fake.repo_summary(&doc, "o/n");
     assert_eq!(s["refresh"]["full_walks"], 1, "escalated: {s}");
     assert_eq!(s["refresh"]["tail_hits"], 0);
+    assert_eq!(s["refresh"]["escalations"]["count imbalance"], 1, "{s}");
     assert_eq!(s["counts"]["soft_deleted"], 1);
     assert_eq!(fake.refreshes(2), vec!["PR_1".to_string()]);
     assert_eq!(
@@ -1970,6 +1971,10 @@ fn refresh_escalates_unanchored_and_moved_counts() {
     let doc = fake.sync_ok();
     let s = fake.repo_summary(&doc, "o/n");
     assert_eq!(s["refresh"]["full_walks"], 1, "unanchored: {s}");
+    assert_eq!(
+        s["refresh"]["escalations"]["no anchor within walk-back bound"], 1,
+        "the reason split feeds the K-sizing diagnosis: {s}"
+    );
     let tails: Vec<String> = fake
         .calls()
         .iter()
@@ -1991,6 +1996,10 @@ fn refresh_escalates_unanchored_and_moved_counts() {
     let doc = fake.sync_ok();
     let s = fake.repo_summary(&doc, "o/n");
     assert_eq!(s["refresh"]["full_walks"], 1, "moved count: {s}");
+    assert_eq!(
+        s["refresh"]["escalations"]["count moved between pages"], 1,
+        "{s}"
+    );
     assert_eq!(fake.hydrations(3), vec!["PR_1".to_string()]);
 }
 
@@ -2392,4 +2401,8 @@ fn skeleton_walk_pages_and_respects_the_floor() {
         fake.calls()
     );
     assert_eq!(s["health"]["truncated"], 1, "witness withheld: {s}");
+    // The comments verdict concluded BEFORE the thread-phase floor: the
+    // hit stands, and the incompleteness is the withheld threads
+    // witness, not a demoted verdict (panel S2).
+    assert_eq!(s["refresh"]["tail_hits"], 1, "{s}");
 }
