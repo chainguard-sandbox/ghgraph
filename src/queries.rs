@@ -286,6 +286,176 @@ query($id: ID!, $after: String) {
   rateLimit { cost remaining resetAt }
 }"#;
 
+/// Tail size for the layered-refresh comments fetch: `comments(last: K)`.
+/// Conservative constant, not config: it must only be large enough to cover
+/// the new-comment burst between two syncs of one PR (the walk-back covers
+/// modest overshoot; anything larger escalates to the full walk, which is
+/// correct, just costlier). ROADMAP defers final sizing to the telemetry
+/// this layer itself emits (refresh.tail_hits vs full_walks against real
+/// totalCount distributions); its value is an input to that decision, not
+/// a finding.
+pub const TAIL_K: u32 = 20;
+
+/// Render `__K__` in a refresh-layer document template. TAIL_K is a
+/// compile-time u32, so its rendering is digits-only — the pr_id_document
+/// argument. The marker form (not `format!`) keeps the GraphQL braces
+/// literal; the no-residual-marker test pins that every marker was
+/// replaced.
+fn render_tail_k(template: &str) -> String {
+    template.replace("__K__", &TAIL_K.to_string())
+}
+
+/// Layered refresh: the first document for a PR that already has a
+/// witnessed baseline (sync.rs owns that dispatch gate). Identical to
+/// HYDRATE_PR — same scalars, same small connections, the shared shape
+/// notes above apply — except the two big connections:
+///
+///   * comments(last: K): the tail, selected WITH totalCount in this same
+///     document. Count and tail from one response is a correctness
+///     obligation, not a preference — a two-round-trip split is a TOCTOU
+///     on a live connection (round-0 spec audit). Backward pagination
+///     reads the mirror pageInfo pair (hasPreviousPage/startCursor);
+///     walk-back pages go through TAIL_COMMENTS.
+///   * reviewThreads: the skeleton — every cheap mutable field every time
+///     (isResolved, isOutdated, isMinimized, lastEditedAt,
+///     authorAssociation can all change without bumping PR.updatedAt),
+///     bodies omitted. GitHub prices by node count, not field, so the
+///     skeleton saves bytes while the tail saves points; sync.rs fills
+///     bodies from the archive for unchanged ids and refetches whole
+///     threads (THREAD_BODIES) for new or edited ones.
+///
+/// A single-page PR — tail covers the comments, threads fit one page —
+/// costs exactly one call.
+pub fn refresh_pr_document() -> String {
+    render_tail_k(REFRESH_PR_TEMPLATE)
+}
+
+const REFRESH_PR_TEMPLATE: &str = r#"
+query($id: ID!) {
+  node(id: $id) {
+    ... on PullRequest {
+      id number title body state isDraft url
+      author { login __typename ... on User { databaseId } ... on Bot { databaseId } }
+      authorAssociation
+      repository { nameWithOwner }
+      headRefName baseRefName
+      reviewDecision
+      createdAt updatedAt mergedAt closedAt
+      commits(last: 1) { nodes { commit { oid committedDate } } }
+      reviewRequests(first: 20) {
+        totalCount
+        nodes { requestedReviewer { ... on User { login } ... on Team { name } } }
+      }
+      latestOpinionatedReviews(first: 20) {
+        totalCount
+        nodes { id state submittedAt body url authorAssociation
+                author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
+      }
+      closingIssuesReferences(first: 10) {
+        totalCount
+        nodes { id number title state body updatedAt
+                author { login __typename ... on User { databaseId } ... on Bot { databaseId } }
+                authorAssociation url repository { nameWithOwner } }
+      }
+      comments(last: __K__) {
+        totalCount
+        pageInfo { hasPreviousPage startCursor }
+        nodes { id body createdAt lastEditedAt url isMinimized authorAssociation
+                author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
+      }
+      reviewThreads(first: 50) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id isResolved isOutdated path line
+          comments(first: 30) {
+            totalCount
+            nodes { id createdAt lastEditedAt url isMinimized authorAssociation
+                    author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
+          }
+        }
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}"#;
+
+/// Walk-back page for the refresh tail: the next K comments BEFORE the
+/// oldest already fetched, still selecting totalCount in the same response
+/// (the one-document rule holds on every iteration — each page's count is
+/// compared against the first's, and a moved count escalates to the full
+/// walk). Nodes carry bodies: tail rows are upserted verbatim, they are
+/// the rows the refresh writes.
+pub fn tail_comments_document() -> String {
+    render_tail_k(TAIL_COMMENTS_TEMPLATE)
+}
+
+const TAIL_COMMENTS_TEMPLATE: &str = r#"
+query($id: ID!, $before: String) {
+  node(id: $id) {
+    ... on PullRequest {
+      comments(last: __K__, before: $before) {
+        totalCount
+        pageInfo { hasPreviousPage startCursor }
+        nodes { id body createdAt lastEditedAt url isMinimized authorAssociation
+                author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}"#;
+
+/// Follow-up skeleton page for the refresh thread walk — THREADS_PAGE with
+/// bodies omitted from the nested selection (same shape rules: totalCount
+/// re-selected every page, one parse type for first and follow-up pages).
+/// The skeleton walk's pagination terminating over ids is what earns the
+/// threads witness; bodies are not part of completeness.
+pub const SKELETON_THREADS_PAGE: &str = r#"
+query($id: ID!, $after: String) {
+  node(id: $id) {
+    ... on PullRequest {
+      reviewThreads(first: 100, after: $after) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id isResolved isOutdated path line
+          comments(first: 50) {
+            totalCount
+            nodes { id createdAt lastEditedAt url isMinimized authorAssociation
+                    author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
+          }
+        }
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}"#;
+
+/// One thread refetched WITH bodies, rooted at the thread's own node id:
+/// the body fetch for a thread whose skeleton showed a new or edited
+/// comment id. Whole-thread on purpose — a review burst lands its replies
+/// in one thread, so grouping by thread bounds calls by changed threads,
+/// not changed comments — and the response REPLACES the skeleton's view of
+/// that thread (its comment set may have moved between the two calls; the
+/// newer snapshot wins, and a count its selection cannot cover just
+/// withholds the threads witness, exactly like an overflowing thread in
+/// HYDRATE_PR). first: 50 matches THREADS_PAGE's nested budget, not
+/// HYDRATE_PR's 30: a single-thread document has node room to spare.
+pub const THREAD_BODIES: &str = r#"
+query($id: ID!) {
+  node(id: $id) {
+    ... on PullRequestReviewThread {
+      id
+      comments(first: 50) {
+        totalCount
+        nodes { id body createdAt lastEditedAt url isMinimized authorAssociation
+                author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}"#;
+
 /// The node-id lookup for `sync --pr`: hydration is by node id, but the
 /// operator names a (repo, number). Variables: $owner, $name — the number is
 /// inlined into the document text instead of passed as a variable, because
@@ -436,5 +606,36 @@ mod tests {
         assert!(doc.contains("pullRequest(number: 13864)"), "{doc}");
         assert!(doc.contains("$owner: String!"), "{doc}");
         assert!(doc.contains("rateLimit"), "{doc}");
+    }
+
+    // The refresh documents render TAIL_K wherever the template says
+    // __K__, and no marker survives — a half-rendered document would be a
+    // live GraphQL syntax error, caught here instead.
+    #[test]
+    fn tail_documents_render_k_completely() {
+        let k = format!("(last: {}", super::TAIL_K);
+        for doc in [
+            super::refresh_pr_document(),
+            super::tail_comments_document(),
+        ] {
+            assert!(doc.contains(&k), "{doc}");
+            assert!(!doc.contains("__K__"), "{doc}");
+        }
+        // The backward-pagination pair, in both tail documents: a forward
+        // pageInfo here would make every walk-back terminate instantly and
+        // read as "overlap reached" (the round-0 context's claim 6).
+        for doc in [
+            super::refresh_pr_document(),
+            super::tail_comments_document(),
+        ] {
+            assert!(doc.contains("hasPreviousPage startCursor"), "{doc}");
+        }
+        // The skeleton selections carry no bodies on thread comments; the
+        // tail selection does (its rows are written verbatim).
+        assert!(
+            !super::SKELETON_THREADS_PAGE.contains(" body "),
+            "skeleton must not fetch bodies"
+        );
+        assert!(super::tail_comments_document().contains("id body createdAt"));
     }
 }

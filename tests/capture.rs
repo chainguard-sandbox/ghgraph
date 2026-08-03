@@ -31,6 +31,23 @@
 //! * pr_id.json — PR_ID for cli/cli#13864; the capture asserts it returns
 //!   the node id the hydration fixtures pin, tying the two documents to
 //!   one PR.
+//! * refresh_pr.json — REFRESH_PR against cli/cli#13987: a populated
+//!   comments tail (small enough for last: K to cover fully) beside the
+//!   same review request the hydration fixture pins.
+//! * tail_comments.json — TAIL_COMMENTS against cli/cli#13987, no cursor.
+//! * skeleton_threads_page.json — SKELETON_THREADS_PAGE against
+//!   cli/cli#13864: a populated skeleton thread whose nested comment
+//!   carries no body.
+//! * thread_bodies.json — THREAD_BODIES against cli/cli#13864's one review
+//!   thread (PRRT_kwDODKw3uc6QWWXy), tying the thread-rooted document to
+//!   the same thread the hydration fixture carries.
+//! * comments_minimized.json — TAIL_COMMENTS against cli/cli#13918, whose
+//!   ONLY top-level comment is minimized (spam). The enablement gate for
+//!   the layered-refresh conservation check: the capture asserts that
+//!   totalCount counts the minimized node (totalCount == nodes.len(), one
+//!   node isMinimized) — if GitHub excluded minimized comments from
+//!   totalCount, this PR would read totalCount 0 and the check's counting
+//!   universe would bias toward false passes.
 //!
 //! One `#[ignore]` test per fixture group, so a single fixture can be
 //! re-captured without churning the others — the pinned targets were chosen
@@ -143,6 +160,80 @@ fn capture_comments_page() {
             &[("id", "PR_kwDODKw3uc73afq3")],
         ),
     );
+}
+
+#[test]
+#[ignore = "talks to live GitHub and rewrites tests/fixtures/ — run explicitly"]
+fn capture_refresh_pr() {
+    write_fixture(
+        "refresh_pr.json",
+        &gh_graphql(
+            &ghgraph::queries::refresh_pr_document(),
+            &[("id", "PR_kwDODKw3uc73afq3")],
+        ),
+    );
+}
+
+#[test]
+#[ignore = "talks to live GitHub and rewrites tests/fixtures/ — run explicitly"]
+fn capture_tail_comments() {
+    write_fixture(
+        "tail_comments.json",
+        &gh_graphql(
+            &ghgraph::queries::tail_comments_document(),
+            &[("id", "PR_kwDODKw3uc73afq3")],
+        ),
+    );
+}
+
+#[test]
+#[ignore = "talks to live GitHub and rewrites tests/fixtures/ — run explicitly"]
+fn capture_skeleton_threads_page() {
+    write_fixture(
+        "skeleton_threads_page.json",
+        &gh_graphql(
+            ghgraph::queries::SKELETON_THREADS_PAGE,
+            &[("id", "PR_kwDODKw3uc7xAi-o")],
+        ),
+    );
+}
+
+#[test]
+#[ignore = "talks to live GitHub and rewrites tests/fixtures/ — run explicitly"]
+fn capture_thread_bodies() {
+    write_fixture(
+        "thread_bodies.json",
+        &gh_graphql(
+            ghgraph::queries::THREAD_BODIES,
+            &[("id", "PRRT_kwDODKw3uc6QWWXy")],
+        ),
+    );
+}
+
+#[test]
+#[ignore = "talks to live GitHub and rewrites tests/fixtures/ — run explicitly"]
+fn capture_comments_minimized() {
+    let raw = gh_graphql(
+        &ghgraph::queries::tail_comments_document(),
+        &[("id", "PR_kwDODKw3uc7zWRTx")],
+    );
+    // The enablement gate (round-0 spec audit): the conservation check's
+    // counting universe must include minimized comments, live-witnessed,
+    // not assumed. This PR's ONLY top-level comment is minimized, so an
+    // excluded-from-count regime would read totalCount 0 here.
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("JSON");
+    let comments = &v["data"]["node"]["comments"];
+    let nodes = comments["nodes"].as_array().expect("nodes array");
+    assert_eq!(
+        comments["totalCount"].as_i64(),
+        Some(nodes.len() as i64),
+        "tail must cover the whole connection for the count proof to read"
+    );
+    assert!(
+        nodes.iter().any(|n| n["isMinimized"] == true),
+        "the pinned PR's minimized comment is gone — pick a new anchor"
+    );
+    write_fixture("comments_minimized.json", &raw);
 }
 
 #[test]

@@ -136,6 +136,10 @@ pub enum Doc {
     ThreadsPage,
     CommentsPage,
     PrId,
+    RefreshPr,
+    TailComments,
+    SkeletonThreadsPage,
+    ThreadBodies,
 }
 
 impl fmt::Display for Doc {
@@ -146,6 +150,10 @@ impl fmt::Display for Doc {
             Doc::ThreadsPage => "THREADS_PAGE",
             Doc::CommentsPage => "COMMENTS_PAGE",
             Doc::PrId => "PR_ID",
+            Doc::RefreshPr => "REFRESH_PR",
+            Doc::TailComments => "TAIL_COMMENTS",
+            Doc::SkeletonThreadsPage => "SKELETON_THREADS_PAGE",
+            Doc::ThreadBodies => "THREAD_BODIES",
         })
     }
 }
@@ -253,6 +261,34 @@ pub struct Paged<T> {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Counted<T> {
     pub total_count: i64,
+    pub nodes: Vec<T>,
+}
+
+/// The backward-pagination mirror of [`PageInfo`], for `last:`-selected
+/// connections (the refresh tail). A distinct type on purpose: mixing the
+/// forward pair into a backward walk typically terminates the walk
+/// instantly (hasNextPage is false at the connection's end) and would read
+/// as "overlap reached" — the mixup must be a parse error, not a quiet
+/// wrong loop.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct BackPageInfo {
+    pub has_previous_page: bool,
+    #[serde(deserialize_with = "nullable")]
+    pub start_cursor: Option<String>,
+}
+
+/// A `last:`-selected connection: totalCount + the backward pageInfo pair +
+/// nodes. The refresh tail's shape — count and tail in one value because
+/// they arrive in one response (the one-document rule; sync.rs owns the
+/// conservation judgment this feeds).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct BackPaged<T> {
+    pub total_count: i64,
+    pub page_info: BackPageInfo,
     pub nodes: Vec<T>,
 }
 
@@ -535,6 +571,40 @@ pub struct ThreadNode {
     pub comments: Counted<CommentNode>,
 }
 
+/// [`CommentNode`] minus `body`: the refresh skeleton's nested selection.
+/// Everything mutable-without-bumping-PR.updatedAt is here (lastEditedAt,
+/// isMinimized, authorAssociation), so a cheap-field flip never needs a
+/// body fetch; sync.rs resolves bodies — from the archive when id +
+/// lastEditedAt match the stored row, from THREAD_BODIES otherwise.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SkeletonCommentNode {
+    pub id: String,
+    pub created_at: Rfc3339Utc,
+    #[serde(deserialize_with = "nullable")]
+    pub last_edited_at: Option<Rfc3339Utc>,
+    pub url: String,
+    pub is_minimized: bool,
+    pub author_association: String,
+    #[serde(deserialize_with = "nullable")]
+    pub author: Option<Author>,
+}
+
+/// [`ThreadNode`] with the skeleton nested selection.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SkeletonThreadNode {
+    pub id: String,
+    pub is_resolved: bool,
+    pub is_outdated: bool,
+    pub path: String,
+    #[serde(deserialize_with = "nullable")]
+    pub line: Option<i64>,
+    pub comments: Counted<SkeletonCommentNode>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct HydratePrData {
@@ -619,6 +689,165 @@ pub fn comments_page(data: &serde_json::Value) -> Result<Option<CommentsPageNode
         .map(|d| d.node)
         .map_err(|_| ParseError {
             doc: Doc::CommentsPage,
+        })
+}
+
+// ---------------------------------------------------------------------------
+// REFRESH_PR / TAIL_COMMENTS / SKELETON_THREADS_PAGE / THREAD_BODIES
+// (the layered-refresh documents; sync.rs owns every judgment on these —
+// this module only carries shapes)
+
+/// [`PrNode`] with the refresh selections: a backward-paged comments tail
+/// and skeleton threads. A distinct type, not a parameterized PrNode: which
+/// connections carry bodies and which direction they page is document
+/// contract, and deny_unknown_fields can only enforce it on a type that
+/// states it.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RefreshPrNode {
+    pub id: String,
+    pub number: i64,
+    pub title: String,
+    pub body: String,
+    pub state: String,
+    pub is_draft: bool,
+    pub url: String,
+    #[serde(deserialize_with = "nullable")]
+    pub author: Option<Author>,
+    pub author_association: String,
+    pub repository: RepoRef,
+    pub head_ref_name: String,
+    pub base_ref_name: String,
+    #[serde(deserialize_with = "nullable")]
+    pub review_decision: Option<String>,
+    pub created_at: Rfc3339Utc,
+    pub updated_at: Rfc3339Utc,
+    #[serde(deserialize_with = "nullable")]
+    pub merged_at: Option<Rfc3339Utc>,
+    #[serde(deserialize_with = "nullable")]
+    pub closed_at: Option<Rfc3339Utc>,
+    pub commits: NodesOnly<CommitEdge>,
+    /// Nullable-connection masking: same reading as PrNode's (None is a
+    /// failed sub-resolver, treated as truncation, never as empty).
+    #[serde(deserialize_with = "nullable")]
+    pub review_requests: Option<Counted<ReviewRequestNode>>,
+    #[serde(deserialize_with = "nullable")]
+    pub latest_opinionated_reviews: Option<Counted<ReviewNode>>,
+    #[serde(deserialize_with = "nullable")]
+    pub closing_issues_references: Option<Counted<LinkedIssueNode>>,
+    pub comments: BackPaged<CommentNode>,
+    pub review_threads: Paged<SkeletonThreadNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RefreshPrData {
+    #[serde(deserialize_with = "nullable")]
+    node: Option<RefreshPrNode>,
+    /// See DiscoveryData::rate_limit.
+    #[allow(dead_code)]
+    rate_limit: Option<serde_json::Value>,
+}
+
+/// Parse one REFRESH_PR response's `data`. `Ok(None)` is `node: null`,
+/// same reading as [`hydrate_pr`]. A parse failure here is NOT quarantined
+/// by the caller: the full walk is the strictly-more-complete form, so a
+/// refresh that stops parsing escalates to it (sync.rs) — only a HYDRATE_PR
+/// drift earns the parse-class quarantine row.
+pub fn refresh_pr(data: &serde_json::Value) -> Result<Option<RefreshPrNode>, ParseError> {
+    RefreshPrData::deserialize(data)
+        .map(|d| d.node)
+        .map_err(|_| ParseError {
+            doc: Doc::RefreshPr,
+        })
+}
+
+/// A walk-back tail page, rooted at the PR node id.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TailCommentsNode {
+    pub comments: BackPaged<CommentNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct TailCommentsData {
+    #[serde(deserialize_with = "nullable")]
+    node: Option<TailCommentsNode>,
+    /// See DiscoveryData::rate_limit.
+    #[allow(dead_code)]
+    rate_limit: Option<serde_json::Value>,
+}
+
+/// Parse one TAIL_COMMENTS response's `data`. `Ok(None)` = the PR vanished
+/// mid-walk; the refresh escalation discipline owns it.
+pub fn tail_comments(data: &serde_json::Value) -> Result<Option<TailCommentsNode>, ParseError> {
+    TailCommentsData::deserialize(data)
+        .map(|d| d.node)
+        .map_err(|_| ParseError {
+            doc: Doc::TailComments,
+        })
+}
+
+/// A follow-up skeleton reviewThreads page, rooted at the PR node id.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SkeletonThreadsPageNode {
+    pub review_threads: Paged<SkeletonThreadNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct SkeletonThreadsPageData {
+    #[serde(deserialize_with = "nullable")]
+    node: Option<SkeletonThreadsPageNode>,
+    /// See DiscoveryData::rate_limit.
+    #[allow(dead_code)]
+    rate_limit: Option<serde_json::Value>,
+}
+
+/// Parse one SKELETON_THREADS_PAGE response's `data`.
+pub fn skeleton_threads_page(
+    data: &serde_json::Value,
+) -> Result<Option<SkeletonThreadsPageNode>, ParseError> {
+    SkeletonThreadsPageData::deserialize(data)
+        .map(|d| d.node)
+        .map_err(|_| ParseError {
+            doc: Doc::SkeletonThreadsPage,
+        })
+}
+
+/// One thread refetched with bodies, rooted at the THREAD's node id.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ThreadBodiesNode {
+    pub id: String,
+    pub comments: Counted<CommentNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ThreadBodiesData {
+    #[serde(deserialize_with = "nullable")]
+    node: Option<ThreadBodiesNode>,
+    /// See DiscoveryData::rate_limit.
+    #[allow(dead_code)]
+    rate_limit: Option<serde_json::Value>,
+}
+
+/// Parse one THREAD_BODIES response's `data`. `Ok(None)` = the thread
+/// vanished between the skeleton and the body fetch; the caller withholds
+/// the threads witness (deletion evidence arrives on the next full walk or
+/// re-verify, never from a refresh).
+pub fn thread_bodies(data: &serde_json::Value) -> Result<Option<ThreadBodiesNode>, ParseError> {
+    ThreadBodiesData::deserialize(data)
+        .map(|d| d.node)
+        .map_err(|_| ParseError {
+            doc: Doc::ThreadBodies,
         })
 }
 
@@ -1102,6 +1331,131 @@ mod tests {
         // A node that is not a PullRequest ({} from an unmatched fragment)
         // must fail, not read as an empty page.
         assert!(comments_page(&json!({"node": {}})).is_err());
+    }
+
+    #[test]
+    fn refresh_pr_fixture_parses() {
+        let pr = refresh_pr(&data(include_str!("../tests/fixtures/refresh_pr.json")))
+            .unwrap()
+            .expect("node resolves");
+        // The tail on cli/cli#13987 covers the whole small connection: the
+        // backward pair reads "no un-fetched middle".
+        assert!(pr.comments.total_count >= 1);
+        assert_eq!(pr.comments.nodes.len() as i64, pr.comments.total_count);
+        assert!(!pr.comments.page_info.has_previous_page);
+        assert!(pr.comments.page_info.start_cursor.is_some());
+        // Same PR the hydration fixture pins: the review request is there.
+        assert!(
+            pr.review_requests
+                .as_ref()
+                .is_some_and(|r| r.total_count >= 1)
+        );
+        assert!(!pr.comments.nodes[0].body.is_empty());
+    }
+
+    #[test]
+    fn refresh_pr_node_null_and_shape_errors() {
+        assert_eq!(refresh_pr(&json!({"node": null})).unwrap(), None);
+        assert!(refresh_pr(&json!({})).is_err(), "missing key is drift");
+        assert!(refresh_pr(&json!({"node": {}})).is_err());
+    }
+
+    #[test]
+    fn tail_comments_fixture_parses() {
+        let node = tail_comments(&data(include_str!("../tests/fixtures/tail_comments.json")))
+            .unwrap()
+            .expect("node resolves");
+        assert!(node.comments.total_count >= 1);
+        assert_eq!(node.comments.nodes.len() as i64, node.comments.total_count);
+        assert!(!node.comments.page_info.has_previous_page);
+    }
+
+    #[test]
+    fn tail_comments_node_null_and_shape_errors() {
+        assert_eq!(tail_comments(&json!({"node": null})).unwrap(), None);
+        assert!(tail_comments(&json!({})).is_err());
+        assert!(tail_comments(&json!({"node": {}})).is_err());
+        // A FORWARD pageInfo in a tail response is drift, not tolerable
+        // variation: the walk-back loop reads the backward pair, and a
+        // mixup must die at parse, not terminate the loop early (the
+        // round-0 context's claim 6).
+        assert!(
+            tail_comments(&json!({"node": {"comments": {
+                "totalCount": 1,
+                "pageInfo": {"hasNextPage": false, "endCursor": null},
+                "nodes": []
+            }}}))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn skeleton_threads_page_fixture_parses() {
+        let node = skeleton_threads_page(&data(include_str!(
+            "../tests/fixtures/skeleton_threads_page.json"
+        )))
+        .unwrap()
+        .expect("node resolves");
+        assert!(node.review_threads.total_count >= 1);
+        let t = &node.review_threads.nodes[0];
+        assert_eq!(t.id, "PRRT_kwDODKw3uc6QWWXy");
+        assert!(t.comments.total_count >= 1);
+        // The skeleton carries the edit signal and the cheap mutable
+        // fields; body's absence is enforced by the type (deny_unknown
+        // would reject a body key), so this only spot-checks the signal.
+        assert!(!t.comments.nodes[0].id.is_empty());
+        assert!(t.comments.nodes[0].author.is_some());
+    }
+
+    #[test]
+    fn skeleton_threads_page_rejects_bodies() {
+        // deny_unknown_fields in the live direction: a response that DOES
+        // carry a body (someone pointed the skeleton parser at a full
+        // THREADS_PAGE response) is drift, not silently-extra data.
+        let node =
+            skeleton_threads_page(&data(include_str!("../tests/fixtures/threads_page.json")));
+        assert!(
+            node.is_err(),
+            "a bodied response must not parse as skeleton"
+        );
+        assert_eq!(skeleton_threads_page(&json!({"node": null})).unwrap(), None);
+        assert!(skeleton_threads_page(&json!({})).is_err());
+    }
+
+    #[test]
+    fn thread_bodies_fixture_parses() {
+        let node = thread_bodies(&data(include_str!("../tests/fixtures/thread_bodies.json")))
+            .unwrap()
+            .expect("node resolves");
+        assert_eq!(node.id, "PRRT_kwDODKw3uc6QWWXy");
+        assert_eq!(node.comments.nodes.len() as i64, node.comments.total_count);
+        assert!(!node.comments.nodes[0].body.is_empty());
+    }
+
+    #[test]
+    fn thread_bodies_node_null_and_shape_errors() {
+        assert_eq!(thread_bodies(&json!({"node": null})).unwrap(), None);
+        assert!(thread_bodies(&json!({})).is_err());
+        assert!(thread_bodies(&json!({"node": {}})).is_err());
+    }
+
+    // The enablement gate, pinned offline (round-0 spec audit): minimized
+    // comments COUNT in the comments connection's totalCount, witnessed
+    // live on cli/cli#13918, whose only top-level comment is minimized as
+    // spam. The conservation check's counting universe (sync.rs) leans on
+    // this: archived live rows INCLUDE is_minimized=1 rows, and if GitHub
+    // excluded them upstream the arithmetic would bias toward false
+    // passes. If a re-capture breaks this test, the universe moved — stop
+    // and re-derive the check before touching the assertion.
+    #[test]
+    fn minimized_comments_count_in_total_count() {
+        let node = tail_comments(&data(include_str!(
+            "../tests/fixtures/comments_minimized.json"
+        )))
+        .unwrap()
+        .expect("node resolves");
+        assert_eq!(node.comments.nodes.len() as i64, node.comments.total_count);
+        assert!(node.comments.nodes.iter().any(|c| c.is_minimized));
     }
 
     #[test]

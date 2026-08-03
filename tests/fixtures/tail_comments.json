@@ -1,0 +1,76 @@
+{
+  "data": {
+    "node": {
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "User",
+              "databaseId": 1701557,
+              "login": "skarim"
+            },
+            "authorAssociation": "NONE",
+            "body": "Ran this by the Cognition team (makers of Devin / Windsurf), and they said this looks good to them ✅ \r\n\r\n> Should this actually remove `windsurf`? Are there still users out there you might be using windsurf and not updating?\r\n\r\nThey confirmed that most users have updated to \"Devin,\" so no need to keep around the legacy \"Windsurf\" option anymore.",
+            "createdAt": "2026-07-28T17:56:43Z",
+            "id": "IC_kwDODKw3uc8AAAABMHL0mw",
+            "isMinimized": false,
+            "lastEditedAt": null,
+            "url": "https://github.com/cli/cli/pull/13987#issuecomment-5107807387"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "databaseId": 1611510,
+              "login": "williammartin"
+            },
+            "authorAssociation": "MEMBER",
+            "body": "It is technically a breaking change for anyone who did in a script `gh skill install --agent windsurf`. Might be worth a quick check on code search. Probably not a huge deal though.",
+            "createdAt": "2026-07-28T18:18:29Z",
+            "id": "IC_kwDODKw3uc8AAAABMHaj5w",
+            "isMinimized": false,
+            "lastEditedAt": null,
+            "url": "https://github.com/cli/cli/pull/13987#issuecomment-5108048871"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "databaseId": 47394200,
+              "login": "BagToad"
+            },
+            "authorAssociation": "MEMBER",
+            "body": "@williammartin FWIW, `gh skill` is labelled as preview, so I'm fine with this change:\r\n\r\n\r\n```\r\ngh skill --help\r\n...\r\nWorking with agent skills in the GitHub CLI is in preview and subject to change without notice.\r\n...\r\n```\r\n",
+            "createdAt": "2026-07-29T04:57:18Z",
+            "id": "IC_kwDODKw3uc8AAAABMMiZ-g",
+            "isMinimized": false,
+            "lastEditedAt": null,
+            "url": "https://github.com/cli/cli/pull/13987#issuecomment-5113420282"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "databaseId": 37270480,
+              "login": "tommaso-moro"
+            },
+            "authorAssociation": "CONTRIBUTOR",
+            "body": "Merged! Thank you @williammartin @BagToad @skarim ",
+            "createdAt": "2026-07-29T10:05:57Z",
+            "id": "IC_kwDODKw3uc8AAAABMPNx_A",
+            "isMinimized": false,
+            "lastEditedAt": null,
+            "url": "https://github.com/cli/cli/pull/13987#issuecomment-5116228092"
+          }
+        ],
+        "pageInfo": {
+          "hasPreviousPage": false,
+          "startCursor": "Y3Vyc29yOnYyOpHPAAAAATBy9Js="
+        },
+        "totalCount": 4
+      }
+    },
+    "rateLimit": {
+      "cost": 1,
+      "remaining": 4910,
+      "resetAt": "2026-08-03T16:07:07Z"
+    }
+  }
+}
