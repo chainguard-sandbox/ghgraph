@@ -42,13 +42,15 @@
 //!     regressed; an exotic umask that clears owner bits could make the archive
 //!     unwritable, which surfaces as a CONFIGURATION open error.
 //!
-//! Migrations: PRAGMA user_version. 0 → apply schema.sql → 1, schema apply and
-//! the version bump in ONE rusqlite-managed transaction, so a crash mid-apply
-//! rolls back to 0 and the next open retries from clean — the archive is never
-//! half-migrated. Every user_version value has a defined outcome (see
-//! `migrate`); a value we do not understand is refused, never guessed. Later
-//! versions are numbered fn(&mut Connection) steps, each bumping the pragma
-//! inside its own transaction. No schema_version table; the pragma is the record.
+//! Migrations: PRAGMA user_version. 0 → apply schema.sql (always the CURRENT
+//! shape) → SCHEMA_VERSION, schema apply and the version bump in ONE
+//! rusqlite-managed transaction, so a crash mid-apply rolls back to 0 and the
+//! next open retries from clean — the archive is never half-migrated. Every
+//! user_version value has a defined outcome (see `migrate`); a value we do
+//! not understand is refused, never guessed. Older versions step forward
+//! through numbered fn(&mut Connection) migrations (v1→v2 is the first),
+//! each bumping the pragma inside its own transaction. No schema_version
+//! table; the pragma is the record.
 
 use std::fs::{DirBuilder, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -66,7 +68,18 @@ use crate::error::{Error, Result};
 const SCHEMA: &str = include_str!("schema.sql");
 
 /// Current schema version, written to PRAGMA user_version after migration.
-pub const SCHEMA_VERSION: i64 = 1;
+/// This is the ARCHIVE version (a storage fact), not the output contract's
+/// `_meta.schema_version` (report.rs) — the archive can migrate without the
+/// output contract moving, which is exactly what v2 did (an added column
+/// feeds a derivation; no emitted field changed shape).
+///
+/// v2: prs.head_committed_at — the stale-side approval-staleness bound. The
+/// v1 schema's own comments claimed staleness "derives from committedDate",
+/// but v1 never stored it: parse.rs validated the field and the upsert
+/// dropped it. Migrated v1 rows hold NULL (freshness reads Unknown, which
+/// fails closed) and heal on their next hydration, since the column joins
+/// the diff-gated upsert.
+pub const SCHEMA_VERSION: i64 = 2;
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 
@@ -169,6 +182,18 @@ pub fn open_ro(path: &Path) -> Result<RoArchive> {
     // query_only blocks writes the READ_ONLY flag alone would miss (ATTACH).
     conn.pragma_update(None, "query_only", true)
         .map_err(|e| sqlite_err(path, "cannot set query_only on", e))?;
+    // The determinism harness (golden tests, DESIGN.md Verification): with
+    // this env var set, SQLite reverses the row order of any SELECT that
+    // lacks a total ORDER BY, so a missing ORDER BY fails the golden diff
+    // instead of passing by physical-row-order luck. Live on the shipped
+    // path on purpose — the hook must exercise the very connection the read
+    // verbs use, and for contract-correct output the pragma is a no-op (it
+    // can reorder only what the contract never promised an order for), so
+    // an operator setting it can confuse only themselves, not the archive.
+    if std::env::var_os("GHGRAPH_TEST_REVERSE_SELECTS").is_some_and(|v| v == "1") {
+        conn.pragma_update(None, "reverse_unordered_selects", true)
+            .map_err(|e| sqlite_err(path, "cannot set reverse_unordered_selects on", e))?;
+    }
     let version = user_version(&conn, path)?;
     if version != SCHEMA_VERSION {
         return Err(wrong_version(path, version));
@@ -264,15 +289,29 @@ fn user_version(conn: &Connection, path: &Path) -> Result<i64> {
 /// unrecognized version is refused, not guessed.
 fn migrate(conn: &mut Connection, path: &Path) -> Result<()> {
     match user_version(conn, path)? {
-        0 => apply_v1(conn, path),
+        0 => apply_full(conn, path),
+        1 => migrate_v1_to_v2(conn, path),
         v if v == SCHEMA_VERSION => Ok(()),
-        // Once SCHEMA_VERSION exceeds 1, insert the 0 < v < SCHEMA_VERSION arm
-        // here — PLANNED (milestone: whenever that happens): dispatch the ordered
-        // migration steps from v to SCHEMA_VERSION, each in its own transaction.
         // Everything else (a newer archive, or a negative/foreign sentinel —
         // SQLite accepts any i64 user_version) is refused, never guessed.
         v => Err(wrong_version(path, v)),
     }
+}
+
+/// v1 → v2: add prs.head_committed_at (rationale at [`SCHEMA_VERSION`]).
+/// ALTER TABLE ADD COLUMN appends, and schema.sql declares the column last
+/// for exactly that reason: a migrated archive and a fresh one must agree on
+/// column order, or `query` SELECT * output forks by archive provenance.
+/// Step and stamp share one transaction, like every migration here: a crash
+/// between them re-runs the step from v1 cleanly.
+fn migrate_v1_to_v2(conn: &mut Connection, path: &Path) -> Result<()> {
+    let cannot = |e: rusqlite::Error| sqlite_err(path, "cannot migrate archive", e);
+    let tx = conn.transaction().map_err(cannot)?;
+    tx.execute_batch("ALTER TABLE prs ADD COLUMN head_committed_at TEXT")
+        .map_err(cannot)?;
+    tx.pragma_update(None, "user_version", 2).map_err(cannot)?;
+    tx.commit().map_err(cannot)?;
+    Ok(())
 }
 
 /// The CONFIGURATION error for an archive whose `user_version` is not the
@@ -292,9 +331,10 @@ fn wrong_version(path: &Path, v: i64) -> Error {
     } else if v > SCHEMA_VERSION {
         format!("newer than this ghgraph (v{SCHEMA_VERSION}); upgrade ghgraph")
     } else {
-        // Only 0 < v < SCHEMA_VERSION reaches here — currently vacuous (v==1 is
-        // handled by migrate), reserved for when SCHEMA_VERSION exceeds 1.
-        format!("not one this ghgraph (v{SCHEMA_VERSION}) has a migration path for")
+        // Only 0 < v < SCHEMA_VERSION reaches here, and only from open_ro:
+        // migrate handles every such version, but a read-only connection
+        // cannot run it. The remedy is the writer, which migrates on open.
+        format!("older than this ghgraph (v{SCHEMA_VERSION}); run `ghgraph sync` to migrate it")
     };
     Error::config(format!(
         "archive {} is at schema version {v}: {detail}",
@@ -302,13 +342,15 @@ fn wrong_version(path: &Path, v: i64) -> Error {
     ))
 }
 
-/// Apply the v1 schema and stamp user_version=1 atomically. The schema apply
-/// and the version bump run inside ONE rusqlite-managed transaction (schema.sql
-/// carries no BEGIN/COMMIT of its own; the only BEGINs there are trigger
-/// bodies), and PRAGMA user_version is transactional — so a crash between the
-/// last CREATE and the stamp rolls back to user_version=0 and the next open
-/// retries from clean.
-fn apply_v1(conn: &mut Connection, path: &Path) -> Result<()> {
+/// Apply the full current schema and stamp user_version=[`SCHEMA_VERSION`]
+/// atomically (schema.sql always describes the CURRENT shape; migrations exist
+/// for archives born under older ones). The schema apply and the version bump
+/// run inside ONE rusqlite-managed transaction (schema.sql carries no
+/// BEGIN/COMMIT of its own; the only BEGINs there are trigger bodies), and
+/// PRAGMA user_version is transactional — so a crash between the last CREATE
+/// and the stamp rolls back to user_version=0 and the next open retries from
+/// clean.
+fn apply_full(conn: &mut Connection, path: &Path) -> Result<()> {
     let cannot = |e: rusqlite::Error| sqlite_err(path, "cannot initialize archive", e);
     let tx = conn.transaction().map_err(cannot)?;
     tx.execute_batch(SCHEMA).map_err(cannot)?;
@@ -553,6 +595,88 @@ mod tests {
             .err()
             .expect("a version-0 foreign db must be refused");
         assert_eq!(err.code, crate::error::Code::Configuration);
+    }
+
+    /// Reconstruct a v1 archive from a v2 one: drop the one column v2 added
+    /// and reset the stamp. Dropping the LAST column preserves the order of
+    /// the rest, so the reconstruction is structurally faithful — that
+    /// last-position choice is load-bearing (schema.sql, head_committed_at)
+    /// and this helper depends on it like the migration does.
+    fn make_v1(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("ALTER TABLE prs DROP COLUMN head_committed_at")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+    }
+
+    #[test]
+    fn migrates_v1_to_v2_and_matches_fresh_column_order() {
+        let s = Scratch::new();
+        let path = s.join("ghgraph.db");
+        {
+            let _a = open_rw(&path).unwrap();
+        }
+        make_v1(&path);
+        // A row born under v1 must survive the migration with NULL in the new
+        // column (Unknown freshness, failing closed — attention.rs).
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO prs (id, repo, number, title, state, created_at, updated_at, url) \
+                 VALUES ('n1', 'o/r', 1, 't', 'OPEN', '2026-01-01T00:00:00Z', \
+                         '2026-01-01T00:00:00Z', 'https://github.com/o/r/pull/1')",
+            )
+            .unwrap();
+        }
+        let migrated = open_rw(&path).unwrap();
+        assert_eq!(user_version(migrated.conn(), &path).unwrap(), 2);
+        let committed: Option<String> = migrated
+            .conn()
+            .query_row(
+                "SELECT head_committed_at FROM prs WHERE number=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            committed, None,
+            "v1 rows migrate to NULL (Unknown, fails closed)"
+        );
+
+        // Column ORDER must agree with a fresh v2 archive, or `query`
+        // SELECT * output would fork by archive provenance.
+        let fresh_path = s.join("fresh.db");
+        let fresh = open_rw(&fresh_path).unwrap();
+        let cols = |conn: &Connection| -> Vec<String> {
+            let mut stmt = conn.prepare("PRAGMA table_info(prs)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            cols(migrated.conn()),
+            cols(fresh.conn()),
+            "migrated and fresh archives must agree on prs column order"
+        );
+    }
+
+    #[test]
+    fn ro_refuses_v1_with_migrate_remedy() {
+        // open_ro cannot migrate; it must name the writer as the remedy.
+        let s = Scratch::new();
+        let path = s.join("ghgraph.db");
+        {
+            let _a = open_rw(&path).unwrap();
+        }
+        make_v1(&path);
+        let err = open_ro(&path).err().expect("open_ro must refuse v1");
+        assert_eq!(err.code, crate::error::Code::Configuration);
+        assert!(
+            err.message.contains("ghgraph sync"),
+            "message must direct the operator to sync (which migrates), got: {}",
+            err.message
+        );
     }
 
     #[test]

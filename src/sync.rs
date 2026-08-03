@@ -735,7 +735,7 @@ fn incremental_since(state: Option<&(String, String)>, lookback_start: &Rfc3339U
 /// stream's discovery and ingest: viewer and people shape working-scope
 /// flavors only, so at project scope they are pinned empty — a people edit
 /// must not backfill a stream whose search never mentions them.
-fn fingerprint(cfg: &Config, rc: &RepoConfig) -> Value {
+pub(crate) fn fingerprint(cfg: &Config, rc: &RepoConfig) -> Value {
     let (viewer, mut people) = match rc.scope {
         Scope::Working => (
             cfg.viewer.as_str().to_string(),
@@ -2636,12 +2636,15 @@ fn apply_bundle(
 /// The observed PR fields whose transitions are the changelog. author_id
 /// and author_assoc are deliberately not observed (schema.sql records why);
 /// last_pushed_at has no writer yet — the OPEN QUESTION at queries.rs
-/// HYDRATE_PR is DECIDED for this milestone as: no API source exists
-/// (Commit.pushedDate is deprecated); the staleness signal's replacement is
-/// the observations table's own head_sha flip row (observed_at, local time,
-/// disclosed as such) as the fresh-side bound plus committedDate as the
-/// stale-side bound — both already stored, no new column writer. The
-/// attention consumer (milestone 3) combines them under its polarity rule;
+/// HYDRATE_PR is DECIDED as: no API source exists (Commit.pushedDate is
+/// deprecated); the staleness signal's replacement is the observations
+/// table's own head_sha flip row (observed_at, local time, disclosed as
+/// such) as the fresh-side bound plus prs.head_committed_at as the
+/// stale-side bound (schema v2 — the v1 prose claimed committedDate was
+/// stored while the upsert dropped it; db.rs SCHEMA_VERSION records the
+/// repair). head_committed_at is diffed, not observed: it rides with
+/// head_sha (same oid ⇒ same date), so observing it would double-log every
+/// push. attention.rs combines the two bounds under its polarity rule;
 /// prs.last_pushed_at stays NULL, which fails closed.
 const OBSERVED: &[&str] = &["state", "review_decision", "head_sha", "is_draft", "author"];
 
@@ -2651,7 +2654,8 @@ const OBSERVED: &[&str] = &["state", "review_decision", "head_sha", "is_draft", 
 /// copy (B3 panel, S3).
 const PR_SELECT: &str = "SELECT pk, id, title, body, state, is_draft, author, author_id, \
                     author_assoc, head_ref, base_ref, head_sha, review_decision, created_at, \
-                    updated_at, merged_at, closed_at, url, truncated, deleted_at, verified_at \
+                    updated_at, merged_at, closed_at, url, truncated, deleted_at, \
+                    head_committed_at, verified_at \
              FROM prs WHERE repo = ?1 AND number = ?2";
 
 fn upsert_pr(
@@ -2669,7 +2673,7 @@ fn upsert_pr(
         .query_row(PR_SELECT, rusqlite::params![b.repo, pr.number], |r| {
             let pk: i64 = r.get(0)?;
             let mut cols = Vec::new();
-            for i in 1..20 {
+            for i in 1..21 {
                 // Numeric columns read back as text for a uniform diff;
                 // SQLite's CAST of INTEGER to TEXT is exact.
                 cols.push(
@@ -2678,7 +2682,7 @@ fn upsert_pr(
                     })?,
                 );
             }
-            let verified_at: Option<String> = r.get(20)?;
+            let verified_at: Option<String> = r.get(21)?;
             Ok((pk, cols, verified_at))
         })
         .map(Some)
@@ -2743,6 +2747,15 @@ fn upsert_pr(
         ("url", Some(pr.url.clone())),
         ("truncated", Some(i64::from(landed_truncated).to_string())),
         ("deleted_at", None),
+        // Diffed but not OBSERVED: it cannot change without head_sha
+        // changing (same oid ⇒ same committedDate), so observing it would
+        // double-log every push. In the diff it must stay: that is what
+        // backfills NULL on a migrated-v1 row's next hydration (db.rs
+        // SCHEMA_VERSION) while keeping the unchanged-replay write-free.
+        (
+            "head_committed_at",
+            head.map(|c| c.committed_date.as_str().to_string()),
+        ),
     ];
 
     match existing {
@@ -2758,9 +2771,10 @@ fn upsert_pr(
                 "INSERT INTO prs (id, repo, number, title, body, state, is_draft, author, \
                                   author_id, author_assoc, head_ref, base_ref, head_sha, \
                                   last_pushed_at, review_decision, created_at, updated_at, \
-                                  merged_at, closed_at, url, truncated, verified_at, deleted_at) \
+                                  merged_at, closed_at, url, truncated, verified_at, deleted_at, \
+                                  head_committed_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, \
-                         ?15, ?16, ?17, ?18, ?19, ?20, ?21, NULL)",
+                         ?15, ?16, ?17, ?18, ?19, ?20, ?21, NULL, ?22)",
                 rusqlite::params![
                     pr.id,
                     b.repo,
@@ -2783,6 +2797,7 @@ fn upsert_pr(
                     pr.url,
                     landed_truncated,
                     verified_at,
+                    head.map(|c| c.committed_date.as_str()),
                 ],
             )?;
             Ok((tx.last_insert_rowid(), landed_truncated))
@@ -2808,6 +2823,7 @@ fn upsert_pr(
                 "url",
                 "truncated",
                 "deleted_at",
+                "head_committed_at",
             ];
             let old: HashMap<&str, &Option<String>> =
                 names.iter().copied().zip(old_cols.iter()).collect();
@@ -2856,8 +2872,9 @@ fn upsert_pr(
                     "UPDATE prs SET id=?1, title=?2, body=?3, state=?4, is_draft=?5, author=?6, \
                        author_id=?7, author_assoc=?8, head_ref=?9, base_ref=?10, head_sha=?11, \
                        review_decision=?12, created_at=?13, updated_at=?14, merged_at=?15, \
-                       closed_at=?16, url=?17, truncated=?18, verified_at=?19, deleted_at=NULL \
-                     WHERE pk = ?20",
+                       closed_at=?16, url=?17, truncated=?18, verified_at=?19, deleted_at=NULL, \
+                       head_committed_at=?20 \
+                     WHERE pk = ?21",
                     rusqlite::params![
                         pr.id,
                         pr.title,
@@ -2878,6 +2895,7 @@ fn upsert_pr(
                         pr.url,
                         landed_truncated,
                         verified_at,
+                        head.map(|c| c.committed_date.as_str()),
                         pk,
                     ],
                 )?;
@@ -4235,7 +4253,7 @@ mod tests {
             .map(str::trim)
             .collect();
         // cols[0] is pk (not part of old_cols); old_cols[i] = cols[i + 1].
-        assert_eq!(cols.len(), 21, "the 1..20 read loop spans every column");
+        assert_eq!(cols.len(), 22, "the 1..21 read loop spans every column");
         assert_eq!(cols[18], "truncated", "old_cols[17] must be truncated");
     }
 
