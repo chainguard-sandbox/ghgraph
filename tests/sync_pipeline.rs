@@ -45,7 +45,7 @@ if [ "$1" = "--version" ]; then
 fi
 if [ "$1" = "api" ] && [ "$2" = "user" ]; then cat "$dir/user.json"; exit 0; fi
 doc=$(cat)
-q=""; id=""; owner=""; name=""; after=""
+q=""; id=""; owner=""; name=""; after=""; before=""
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-f" ]; then
@@ -55,6 +55,7 @@ for a in "$@"; do
       owner=*) owner="${a#owner=}";;
       name=*) name="${a#name=}";;
       after=*) after="${a#after=}";;
+      before=*) before="${a#before=}";;
     esac
   fi
   prev="$a"
@@ -67,9 +68,27 @@ case "$doc" in
     resp="$dir/disc-$run-$s.json"
     [ -f "$resp" ] || resp="$dir/disc-default.json"
     ;;
+  *'PullRequestReviewThread'*)
+    echo "TBODIES|run=$run|id=$id" >> "$dir/calls.log"
+    resp="$dir/tbodies-$id.json"
+    ;;
+  *', before: $before)'*)
+    echo "TAIL|run=$run|id=$id|before=$before" >> "$dir/calls.log"
+    resp="$dir/tail-$id-$before.json"
+    [ -f "$resp" ] || resp="$dir/tail-$id.json"
+    ;;
   *'comments(first: 100'*)
     echo "CPAGE|run=$run|id=$id|after=$after" >> "$dir/calls.log"
     resp="$dir/cpage-$id.json"
+    ;;
+  *'comments(last: '*)
+    echo "REFRESH|run=$run|id=$id" >> "$dir/calls.log"
+    resp="$dir/refresh-$id.json"
+    [ -f "$resp" ] || resp="$dir/hyd-$id.json"
+    ;;
+  *'nodes { id createdAt'*)
+    echo "SKELPAGE|run=$run|id=$id|after=$after" >> "$dir/calls.log"
+    resp="$dir/skelpage-$id.json"
     ;;
   *'reviewThreads(first: 100'*)
     echo "TPAGE|run=$run|id=$id|after=$after" >> "$dir/calls.log"
@@ -429,6 +448,33 @@ impl Pr {
     }
 }
 
+impl Pr {
+    /// The REFRESH_PR response for this PR: the hydration's node with the
+    /// two big connections in their refresh forms — comments as a fully-
+    /// observed tail (backward pageInfo, hasPreviousPage false) and
+    /// skeleton threads (nested comments without bodies). A test that
+    /// needs a walk-back or an un-fetched middle writes its own
+    /// refresh-/tail- fixtures instead.
+    fn refresh(&self) -> String {
+        let mut v: Value = serde_json::from_str(&self.hydration()).unwrap();
+        let node = &mut v["data"]["node"];
+        node["comments"]["pageInfo"] = json!({
+            "hasPreviousPage": false,
+            "startCursor": if self.comment_ids.is_empty() { Value::Null } else { json!("cur0") }
+        });
+        if let Some(threads) = node["reviewThreads"]["nodes"].as_array_mut() {
+            for t in threads {
+                if let Some(cs) = t["comments"]["nodes"].as_array_mut() {
+                    for c in cs {
+                        c.as_object_mut().unwrap().remove("body");
+                    }
+                }
+            }
+        }
+        v.to_string()
+    }
+}
+
 fn discovery(hits: &[&Pr], issue_count: Option<i64>, remaining: u32) -> String {
     let nodes: Vec<Value> = hits.iter().map(|p| p.hit()).collect();
     json!({
@@ -458,6 +504,12 @@ fn install_prs(fake: &Fake, prs: &[&Pr]) {
     fake.write("disc-default.json", &discovery(prs, None, 4000));
     for pr in prs {
         fake.write(&format!("hyd-{}.json", pr.id), &pr.hydration());
+        // The refresh form beside every hydration: a rehydration of a PR
+        // this suite verified in an earlier run dispatches to the tail
+        // path, and a missing refresh fixture would read as a transport
+        // failure (quarantine), not a cost fallback. Tests that never
+        // re-verify a PR simply never serve it.
+        fake.write(&format!("refresh-{}.json", pr.id), &pr.refresh());
     }
 }
 
@@ -502,9 +554,21 @@ fn replay_of_unchanged_remote_writes_nothing() {
     assert_eq!(s["counts"]["observations"], 0);
     assert_eq!(s["counts"]["soft_deleted"], 0);
     // The cost group is deterministic with fixture responses: one
-    // discovery page and two hydrations, each costing 1 point.
+    // discovery page and two REFRESH documents (both PRs carry a
+    // witnessed baseline from run 1, and the fully-observed tail
+    // balances), each costing 1 point — the single-page-PR-costs-one-call
+    // claim, pinned.
     assert_eq!(s["cost"]["subprocess_count"], 3);
     assert_eq!(s["cost"]["rate_cost"], 3);
+    assert_eq!(
+        s["refresh"]["tail_hits"], 2,
+        "both rehydrations tail-hit: {s}"
+    );
+    assert_eq!(s["refresh"]["full_walks"], 0);
+    assert_eq!(
+        s["refresh"]["bodies_skipped"], 2,
+        "each PR's one thread comment resolved from the archive"
+    );
     let stamps: i64 = fake.query_one(&format!(
         "SELECT count(*) FROM prs WHERE verified_at = '{}'",
         recent.as_str()
@@ -1058,8 +1122,12 @@ fn quarantine_lifecycle_backoff_retry_and_drain() {
     assert_eq!(present, 1);
 
     // node:null drain: PR_1 vanishes upstream. Each aged retry re-nulls;
-    // the third attempt drains to deleted_at and retires the record.
+    // the third attempt drains to deleted_at and retires the record. Both
+    // documents must agree it vanished: PR_1 is verified, so the
+    // rediscovery routes through REFRESH first (node:null there is the
+    // same Vanished outcome), and the aged retries full-walk HYDRATE.
     fake.write("hyd-PR_1.json", r#"{"data":{"node":null}}"#);
+    fake.write("refresh-PR_1.json", r#"{"data":{"node":null}}"#);
     fake.sync_ok(); // rediscovered → attempts=1 (node_null)
     for _ in 0..2 {
         fake.db()
