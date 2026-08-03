@@ -1124,8 +1124,11 @@ fn quarantine_lifecycle_backoff_retry_and_drain() {
             [],
         )
         .unwrap();
-    fake.sync_ok();
+    let doc = fake.sync_ok();
     assert!(fake.hydrations(3).contains(&"PR_X".to_string()));
+    // Two fetches: PR_1's window rehydration and PR_X's resolved retry —
+    // the retry path's own counter increment, pinned.
+    assert_eq!(fake.repo_summary(&doc, "o/n")["counts"]["fetched"], 2);
     let left: i64 = fake.query_one("SELECT count(*) FROM quarantine");
     assert_eq!(left, 0, "resolved retry deletes the record");
     let present: i64 = fake.query_one("SELECT count(*) FROM prs WHERE id='PR_X'");
@@ -1903,11 +1906,14 @@ fn refresh_walks_back_to_the_anchor() {
         "nodes": [comment_node("C_c")]
     });
     fake.write("refresh-PR_1.json", &refresh.to_string());
+    // The terminal page's startCursor is null on purpose: the walk-back's
+    // cursor bookkeeping must read "no previous page" as termination, not
+    // as a non-advancing cursor (which escalates).
     fake.write(
         "tail-PR_1-curA.json",
         &json!({"data": {"node": {"comments": {
             "totalCount": 3,
-            "pageInfo": {"hasPreviousPage": false, "startCursor": "cur0"},
+            "pageInfo": {"hasPreviousPage": false, "startCursor": null},
             "nodes": [comment_node("C_a"), comment_node("C_b")]
         }}, "rateLimit": rate_limit(4000)}})
         .to_string(),
@@ -2146,4 +2152,244 @@ fn comment_node(id: &str) -> Value {
         "url": "https://github.com/x", "isMinimized": false,
         "authorAssociation": "NONE", "author": author("carol", "User")
     })
+}
+
+/// The dispatch gate's other two arms: a stored-truncated row and the
+/// carry license. A TailHit whose refresh lost a non-comments witness
+/// lands truncated=1 (carrying stored 0 through a lost witness would hide
+/// real truncation) — and that stored truncation then bars the tail path
+/// entirely on the next run.
+#[test]
+fn refresh_gate_requires_an_untruncated_baseline() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    install_prs(&fake, &[&a]);
+    fake.sync_ok();
+
+    // Run 2: the refresh's reviewRequests connection arrives error-masked.
+    // The tail concludes, but the carry is licensed by ALL other
+    // witnesses: this bundle lands truncated.
+    a.mask_requests = true;
+    install_prs(&fake, &[&a]);
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(
+        s["refresh"]["tail_hits"], 1,
+        "the check itself concluded: {s}"
+    );
+    assert_eq!(
+        s["health"]["truncated"], 1,
+        "a lost witness is not carried over: {s}"
+    );
+    let trunc: i64 = fake.query_one("SELECT truncated FROM prs WHERE number=1");
+    assert_eq!(trunc, 1);
+
+    // Run 3: the stored truncation bars the tail path — no trustworthy
+    // counting universe — and the full walk (fixture still masked) keeps
+    // the row truncated rather than healing it blind.
+    let doc = fake.sync_ok();
+    assert!(
+        fake.refreshes(3).is_empty(),
+        "a truncated baseline must never refresh: {:?}",
+        fake.calls()
+    );
+    assert_eq!(fake.hydrations(3), vec!["PR_1".to_string()]);
+    assert_eq!(fake.repo_summary(&doc, "o/n")["refresh"]["tail_hits"], 0);
+}
+
+/// The floor stops a refresh mid-walk-back: the check never concludes,
+/// the bundle lands Incomplete (witness-free), and the stream defers —
+/// never a skip, never an extra call. At exactly the floor the walk
+/// proceeds ("below", not "at": the boundary, pinned).
+#[test]
+fn refresh_floor_aborts_the_walk_back() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    a.comment_ids = vec!["C_a".into()];
+    install_prs(&fake, &[&a]);
+    fake.sync_ok();
+
+    let refresh_page = |remaining: u32| {
+        let mut refresh: Value = serde_json::from_str(&a.refresh()).unwrap();
+        refresh["data"]["node"]["comments"] = json!({
+            "totalCount": 2,
+            "pageInfo": {"hasPreviousPage": true, "startCursor": "curA"},
+            "nodes": [comment_node("C_b")]
+        });
+        refresh["data"]["rateLimit"] = rate_limit(remaining);
+        refresh.to_string()
+    };
+    fake.write(
+        "tail-PR_1-curA.json",
+        &json!({"data": {"node": {"comments": {
+            "totalCount": 2,
+            "pageInfo": {"hasPreviousPage": false, "startCursor": null},
+            "nodes": [comment_node("C_a")]
+        }}, "rateLimit": rate_limit(4000)}})
+        .to_string(),
+    );
+
+    // Run 2: the refresh document's own response drops remaining below
+    // the floor (400 < 500). The anchor hunt must NOT spend another call.
+    fake.write("refresh-PR_1.json", &refresh_page(400));
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["tail_hits"], 0, "no verdict, no hit: {s}");
+    assert_eq!(
+        s["health"]["truncated"], 1,
+        "the abort lands Incomplete: {s}"
+    );
+    // No Deferred here: PR_1 was the run's last work, so nothing behind
+    // it needed the budget — the floor's evidence is the withheld
+    // witness and the un-spent tail page, not a defer marker.
+    assert_eq!(
+        s["cost"]["subprocess_count"], 2,
+        "disc + refresh only — the floor stopped the tail page: {s}"
+    );
+
+    // Run 3: the abort left the row truncated, which bars the tail path
+    // (no trustworthy universe) — the full walk heals the witness. Only
+    // then can run 4 test the boundary.
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert!(
+        fake.refreshes(3).is_empty(),
+        "truncated baseline: {:?}",
+        fake.calls()
+    );
+    assert_eq!(s["health"]["truncated"], 0, "the walk healed it: {s}");
+
+    // Run 4: remaining is exactly AT the floor — "below" does not fire,
+    // the walk-back proceeds, anchors, and hits (resurrecting C_b, which
+    // run 3's heal swept as absent from its complete fixture).
+    fake.write("refresh-PR_1.json", &refresh_page(500));
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["tail_hits"], 1, "at-the-floor proceeds: {s}");
+    assert_eq!(s["cost"]["subprocess_count"], 3);
+}
+
+/// The fully-observed degenerate arm carries its weight: a PR verified
+/// with ZERO comments gains its first — no anchor can exist, but the walk
+/// reached the connection's start, so balance alone licenses the hit and
+/// the PR stays on the cheap path.
+#[test]
+fn refresh_first_comment_hits_without_an_anchor() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    a.comment_ids = vec![];
+    install_prs(&fake, &[&a]);
+    fake.sync_ok();
+
+    a.comment_ids = vec!["C_first".into()];
+    install_prs(&fake, &[&a]);
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["tail_hits"], 1, "{s}");
+    assert!(fake.hydrations(2).is_empty(), "no escalation");
+    let present: i64 = fake.query_one("SELECT count(*) FROM comments WHERE id='C_first'");
+    assert_eq!(present, 1);
+}
+
+/// A tail page that repeats its cursor is a non-progress remote: escalate
+/// immediately — exactly one wasted page, never a spin toward the bound.
+#[test]
+fn refresh_escalates_on_a_non_advancing_cursor() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    a.comment_ids = vec!["C_a".into()];
+    install_prs(&fake, &[&a]);
+    fake.sync_ok();
+
+    let mut refresh: Value = serde_json::from_str(&a.refresh()).unwrap();
+    refresh["data"]["node"]["comments"] = json!({
+        "totalCount": 5,
+        "pageInfo": {"hasPreviousPage": true, "startCursor": "curA"},
+        "nodes": [comment_node("N_1")]
+    });
+    fake.write("refresh-PR_1.json", &refresh.to_string());
+    // The walk-back page hands back the cursor it was asked to page
+    // before: no progress.
+    fake.write(
+        "tail-PR_1-curA.json",
+        &json!({"data": {"node": {"comments": {
+            "totalCount": 5,
+            "pageInfo": {"hasPreviousPage": true, "startCursor": "curA"},
+            "nodes": [comment_node("N_2")]
+        }}, "rateLimit": rate_limit(4000)}})
+        .to_string(),
+    );
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["full_walks"], 1, "{s}");
+    assert_eq!(
+        s["cost"]["subprocess_count"], 4,
+        "disc + refresh + ONE tail page + the full walk: {s}"
+    );
+}
+
+/// The skeleton walk pages like any other connection — and earns the
+/// threads witness by ids across pages. Then under a floor, the follow-up
+/// page is not spent and the witness is withheld instead.
+#[test]
+fn skeleton_walk_pages_and_respects_the_floor() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    install_prs(&fake, &[&a]);
+    fake.sync_ok();
+
+    // Run 2: two thread pages; the second carries a comment-less thread
+    // and a null endCursor (termination, not non-progress).
+    a.threads_has_next = true;
+    a.threads_cursor = Some("tcurA");
+    fake.write("refresh-PR_1.json", &a.refresh());
+    fake.write(
+        "skelpage-PR_1.json",
+        &json!({"data": {"node": {"reviewThreads": {
+            "totalCount": 2,
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": [{
+                "id": "T2_PR_1", "isResolved": false, "isOutdated": false,
+                "path": "src/y.rs", "line": 3,
+                "comments": {"totalCount": 0, "nodes": []}
+            }]
+        }}, "rateLimit": rate_limit(4000)}})
+        .to_string(),
+    );
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["tail_hits"], 1, "{s}");
+    assert_eq!(
+        s["health"]["truncated"], 0,
+        "the paged walk earned the witness: {s}"
+    );
+    assert!(
+        fake.calls()
+            .iter()
+            .any(|l| l.starts_with("SKELPAGE|run=2|id=PR_1")),
+        "{:?}",
+        fake.calls()
+    );
+    let t2: i64 = fake.query_one("SELECT count(*) FROM review_threads WHERE id='T2_PR_1'");
+    assert_eq!(t2, 1);
+
+    // Run 3: same shape, but the refresh response leaves remaining below
+    // the floor — the follow-up skeleton page must not be spent, and the
+    // withheld witness lands the row truncated.
+    let mut refresh: Value = serde_json::from_str(&a.refresh()).unwrap();
+    refresh["data"]["rateLimit"] = rate_limit(400);
+    fake.write("refresh-PR_1.json", &refresh.to_string());
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert!(
+        !fake.calls().iter().any(|l| l.starts_with("SKELPAGE|run=3")),
+        "the floor stops the skeleton walk: {:?}",
+        fake.calls()
+    );
+    assert_eq!(s["health"]["truncated"], 1, "witness withheld: {s}");
 }

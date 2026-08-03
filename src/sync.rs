@@ -2014,6 +2014,13 @@ fn refresh_one(
         }
         pages += 1;
         has_prev = page.comments.page_info.has_previous_page;
+        // Guard-mutant note (kin of the B2 cursor-guard survivors): with
+        // the middle arm's guard forced true, a non-advancing terminal
+        // page nulls the cursor and the next iteration escalates through
+        // the `let Some` — same verdict, same call count, so the mutant
+        // is observationally equivalent; the arms stay split for the
+        // costlier non-terminal case, which the non-advancing-cursor
+        // pipeline test pins by exact subprocess count.
         match page.comments.page_info.start_cursor {
             Some(c) if Some(&c) != cursor.as_ref() => cursor = Some(c),
             _ if !has_prev => cursor = None,
@@ -2040,6 +2047,13 @@ fn refresh_one(
     let mut threads_paged = !node.review_threads.page_info.has_next_page;
     let mut cursor = node.review_threads.page_info.end_cursor.clone();
     let mut pages: u32 = 0;
+    // Mutant notes, same classes B2 documented at hydrate_one's walks:
+    // the MAX_CONNECTION_PAGES half of the guard and the `pages` counter
+    // it consumes are a 100-page backstop no fixture reaches (their
+    // mutants are equivalent below that bound); the cursor-guard arms
+    // below degrade a pathological repeating-cursor remote to a withheld
+    // witness either way. The floor half is pinned by the
+    // skeleton-floor pipeline test.
     while !threads_paged {
         if floor_hit(gh_ctx) || pages >= MAX_CONNECTION_PAGES {
             break;
@@ -2645,6 +2659,12 @@ fn upsert_pr(
             // old_cols[17] is `truncated` (the SELECT order above).
             old_cols[17].as_deref() == Some("1")
         }
+        // This defensive arm is explicit rather than folded into the
+        // fallback: for every TailHit input `!b.verified()` also computes
+        // true (a TailHit is never verified), so deleting the arm is a
+        // behavior-preserving mutant — it stays because the truth of the
+        // fallback depends on verified()'s definition and this line's
+        // correctness must not.
         (CommentsCompleteness::TailHit, _) => true,
         _ => !b.verified(),
     };
