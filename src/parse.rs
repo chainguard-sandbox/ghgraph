@@ -80,13 +80,15 @@
 //!
 //!   * Search hits are `Vec<Option<DiscoveryHit>>` — item-level null is kept
 //!     because search spans visibility domains and a masked item is a real
-//!     production case; the discovery walk must resolve a `None` hit to a
-//!     defined outcome like any other id (PLANNED, milestone 2).
+//!     production case; the discovery walk resolves a `None` hit to a
+//!     defined outcome like any other id (counted and disclosed as
+//!     health.masked_hits — sync.rs).
 //!   * The three connections the schema itself marks nullable
 //!     (`reviewRequests`, `latestOpinionatedReviews`,
 //!     `closingIssuesReferences`) are `Option<_>` — `None` means that
-//!     connection's resolver failed and was masked, so the hydrator must
-//!     treat it as truncation, never as empty (PLANNED, milestone 2).
+//!     connection's resolver failed and was masked, so the hydrator
+//!     treats it as truncation, never as empty (counted_complete,
+//!     sync.rs).
 //!   * Everything else parses strict. A null where this module is strict
 //!     fails the one PR's parse, and the quarantine row (error_class
 //!     'parse') is the disclosed, retried outcome — the correct failure
@@ -316,7 +318,8 @@ pub struct DiscoveryPage {
     pub page_info: PageInfo,
     /// Item-level `Option` kept from the schema: search spans visibility
     /// domains, and a masked hit is real. A `None` still counts as seen —
-    /// the walk must resolve it to a defined outcome (PLANNED, milestone 2).
+    /// the walk resolves it to a defined outcome (health.masked_hits,
+    /// sync.rs).
     pub nodes: Vec<Option<DiscoveryHit>>,
 }
 
@@ -391,8 +394,8 @@ pub struct PrNode {
     /// `Option` on the connection itself: the schema marks these three
     /// nullable (unlike comments/reviewThreads/commits), which is GraphQL's
     /// error-masking — a failed sub-resolver bubbles null here instead of
-    /// failing the query. `None` is that mask, and the hydrator must treat
-    /// it as truncation, never as empty (PLANNED, milestone 2).
+    /// failing the query. `None` is that mask, and the hydrator treats it
+    /// as truncation, never as empty (counted_complete, sync.rs).
     #[serde(deserialize_with = "nullable")]
     pub review_requests: Option<Counted<ReviewRequestNode>>,
     #[serde(deserialize_with = "nullable")]
@@ -442,7 +445,8 @@ pub struct ReviewRequestNode {
     /// (tests/fixtures/hydrate_pr_comments.json carries one), deletion
     /// another. It does NOT mean "no reviewer": the request is real and
     /// totalCount counts it, so a consumer must never read `None` as
-    /// gone/deleted (PLANNED, milestone 2 owns that judgment).
+    /// gone/deleted (sync.rs upserts it as an unresolvable request row;
+    /// the witness rule at counted_complete owns the count judgment).
     #[serde(deserialize_with = "nullable")]
     pub requested_reviewer: Option<RequestedReviewer>,
 }
