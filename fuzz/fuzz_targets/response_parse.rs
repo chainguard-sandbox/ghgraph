@@ -17,7 +17,7 @@
 //!      accepted is dropped or invented in flight, and normalization
 //!      (timestamp canonicalization) is idempotent.
 //!   3. Rejection carries no input: a ParseError's entire output is one of
-//!      five fixed strings — a pure function of which document failed —
+//!      nine fixed strings — a pure function of which document failed —
 //!      so no fragment of the (untrusted) document can ride along.
 //!
 //! Corpus: seed with tests/fixtures/*.json so mutation starts from real
@@ -79,6 +79,54 @@ fuzz_target!(|data: &[u8]| {
                 parse::comments_page(&re).as_ref(),
                 Ok(&node),
                 "comments_page round-trip must be identity"
+            );
+        }
+        Err(e) => assert_fixed_message(&e),
+    }
+
+    match parse::refresh_pr(&v) {
+        Ok(node) => {
+            let re = serde_json::json!({ "node": node });
+            assert_eq!(
+                parse::refresh_pr(&re).as_ref(),
+                Ok(&node),
+                "refresh_pr round-trip must be identity"
+            );
+        }
+        Err(e) => assert_fixed_message(&e),
+    }
+
+    match parse::tail_comments(&v) {
+        Ok(node) => {
+            let re = serde_json::json!({ "node": node });
+            assert_eq!(
+                parse::tail_comments(&re).as_ref(),
+                Ok(&node),
+                "tail_comments round-trip must be identity"
+            );
+        }
+        Err(e) => assert_fixed_message(&e),
+    }
+
+    match parse::skeleton_threads_page(&v) {
+        Ok(node) => {
+            let re = serde_json::json!({ "node": node });
+            assert_eq!(
+                parse::skeleton_threads_page(&re).as_ref(),
+                Ok(&node),
+                "skeleton_threads_page round-trip must be identity"
+            );
+        }
+        Err(e) => assert_fixed_message(&e),
+    }
+
+    match parse::thread_bodies(&v) {
+        Ok(node) => {
+            let re = serde_json::json!({ "node": node });
+            assert_eq!(
+                parse::thread_bodies(&re).as_ref(),
+                Ok(&node),
+                "thread_bodies round-trip must be identity"
             );
         }
         Err(e) => assert_fixed_message(&e),

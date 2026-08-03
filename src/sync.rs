@@ -118,58 +118,47 @@
 //!     and may sweep, a truncated hydration never stamps, and a
 //!     witness-complete sync --pr does.
 //!
-//!   * Rehydration of a touched PR is a FULL WALK in this milestone: the
-//!     first-page document plus follow-up pages for both big connections.
-//!     The layered cost optimization — the tail-first comments fetch under
-//!     count conservation, the skeleton walk with bodies only for new or
-//!     edited ids, and their summary fields (tail_hits, full_walks,
-//!     bodies_skipped) — is PLANNED (milestone 2 remainder): its
-//!     correctness preconditions are recorded in DESIGN.md's refresh
-//!     section, and the full walk is the strictly-more-complete form it
-//!     will specialize. One consequence, disclosed: a review thread whose
-//!     comment count exceeds the nested first:30 selection cannot be
-//!     completed by any follow-up document yet, so its PR stays
-//!     truncated=1 (counted, re-verified, never swept) until the `last: K`
-//!     tail lands (ROADMAP defers sizing it to real totalCount data).
-//!     The round-0 spec audit hardened the plan's obligations before any
-//!     of it is code; they bind the implementation:
-//!       - A tail hit needs a THIRD completeness state. verified() is a
-//!         boolean conjunction and truncated derives from !verified(), so
-//!         a tail bundle would either oscillate truncated (0↔1 per
-//!         alternating full-walk/tail runs — an UPDATE per tail hit of an
-//!         unchanged PR, breaking replay idempotence) or falsely license
-//!         the sweep/stamp. Resolution: the comments completeness becomes
-//!         Complete | TailHit | Incomplete; on TailHit the writer carries
-//!         the STORED truncated and verified_at forward untouched, sweeps
-//!         nothing, stamps nothing.
-//!       - TWO masked cases, not one, both caught by the same re-verify
-//!         catcher: (1) a deletion offset by an equal count of
-//!         non-tail-visible adds in one window; (2) a body edit to a
-//!         top-level comment in the un-fetched middle — the count is
-//!         conserved and the tail ids overlap, so the stale body persists
-//!         until re-verify (comment edits never bump PR.updatedAt, which
-//!         is why the tier exists at all).
-//!       - The catcher's reach is tier-bounded: unconditional for OPEN
-//!         PRs; for CLOSED/MERGED it extends only within lookback of
-//!         closed_at/merged_at — a masked case beyond that is permanently
-//!         stale, the same accepted scope limit as closed-tier discovery.
-//!       - Count and tail come from ONE document (TAIL_COMMENTS: selects
-//!         totalCount and comments(last: K) in a single response, its own
-//!         parse type and captured fixture). A two-round-trip split is a
-//!         TOCTOU on a live connection and is prohibited, not discouraged.
-//!       - Zero id overlap between the tail and the archived set means
-//!         there is NO induction anchor: escalate to the full walk
-//!         regardless of count balance.
-//!       - The dispatch gate is structural and caller-side: only a PR
-//!         with a witnessed baseline (verified_at IS NOT NULL) may route
-//!         to the tail; first contact is always a full walk.
-//!       - tail_hits and full_walks PARTITION attempts: an escalated
-//!         check counts as full_walks only, so tail_hits/(tail_hits+
-//!         full_walks) is the true hit rate that sizes K.
-//!       - Enablement gate: a live-captured fixture proving minimized
-//!         comments are counted in the connection's totalCount (the
-//!         conservation universe) — if GitHub excluded them, the
-//!         arithmetic would bias toward false passes.
+//!   * Rehydration of a touched PR is LAYERED (the round-0-audited design;
+//!     DESIGN.md's refresh section carries the argument): a
+//!     discovery-origin rehydration of a PR with a witnessed baseline
+//!     (verified_at set, truncated 0, not deleted — the structural,
+//!     caller-side dispatch gate in StreamCtx::hydrate) fetches
+//!     REFRESH_PR — the tail (comments last: K WITH totalCount, one
+//!     document per page, a two-round-trip count/tail split being a
+//!     TOCTOU) plus skeleton threads (cheap mutable fields, no bodies) —
+//!     and runs the count-conservation check (tail_conservation, where
+//!     the two masked cases and the fully-observed refinement are
+//!     documented). Every arm that cannot license the skip escalates to
+//!     the full walk, restarting from the top; every mid-walk abort
+//!     (floor, transport) lands the bundle Incomplete instead. A tail hit
+//!     is the third completeness state: it upserts the tail, resolves
+//!     thread bodies from the archive when id + lastEditedAt match
+//!     (bodies_skipped) or refetches whole changed threads
+//!     (THREAD_BODIES), and carries stored truncated/verified_at forward
+//!     untouched — the tail can never sweep COMMENTS and never stamps,
+//!     while a complete skeleton walk in the same bundle still earns the
+//!     thread sweeps (per-connection witnesses, as everywhere).
+//!     Re-verify, retries, --pr,
+//!     and first contact always FULL-WALK: the first-page document plus
+//!     follow-up pages for both big connections, the
+//!     strictly-more-complete form the refresh specializes — and
+//!     re-verify's full walk is what catches the masked cases, within its
+//!     tier-bounded reach (unconditional for OPEN; within lookback of
+//!     closed_at/merged_at for CLOSED/MERGED — beyond that a masked case
+//!     is permanently stale, the same accepted scope limit as closed-tier
+//!     discovery). The enablement gate the audit demanded holds as a
+//!     fixture: minimized comments COUNT in totalCount
+//!     (tests/fixtures/comments_minimized.json; parse.rs pins it
+//!     offline). One asymmetry, disclosed: a review thread whose comment
+//!     count exceeds the full walk's nested first:30 stays truncated=1 on
+//!     full-walk paths (counted, re-verified, never swept) until the
+//!     nested `last: K` tail lands (ROADMAP defers sizing it to real
+//!     totalCount data) — but the refresh path's per-thread refetch
+//!     covers 50, so a thread that grows past 30 on an already-verified
+//!     PR can still be completed by a refresh. A later full walk of that
+//!     PR cannot re-witness the >30 thread (its stamp stalls and, when
+//!     fields changed, it marks truncated) — conservative, disclosed,
+//!     and retired by the nested tail when it lands.
 //!
 //!   * Rate-limit floor: every GraphQL document returns rateLimit cost and
 //!     remaining; when remaining < config.rate_limit_floor, the run defers —
@@ -190,9 +179,11 @@
 //!     counts   fetched, upserted, unchanged (diff-gate skips), filtered
 //!              (bots / exclude_authors skips — configured absence is
 //!              visible), observations, soft_deleted
-//!     refresh  reverified, quiet_mutations_found, reverify_shed
-//!              (tail_hits / full_walks / bodies_skipped land with the
-//!              tail-first mechanism they measure — PLANNED, see above)
+//!     refresh  reverified, quiet_mutations_found, reverify_shed,
+//!              tail_hits, full_walks (partitioning concluded refresh
+//!              attempts — the hit rate that sizes TAIL_K), escalations
+//!              (full_walks split by reason: which response would change
+//!              the outcome is a per-reason question), bodies_skipped
 //!     cost     subprocess_count, subprocess_seconds, bytes_parsed,
 //!              rate_cost, sleeps, sleep_seconds
 //!     health   truncated, quarantined, discovery_truncated,
@@ -323,20 +314,48 @@ enum Origin {
     Targeted,
 }
 
+/// The top-level comments connection's completeness, three-state by the
+/// round-0 spec audit's decree. Two states cannot say "the tail sufficed":
+/// with a boolean, a tail hit either claims complete (falsely licensing
+/// the sweep and the verified_at stamp — the middle was inferred, not
+/// witnessed) or claims incomplete (flipping truncated 0↔1 per alternating
+/// tail/full runs on an UNCHANGED PR — an UPDATE per tail hit, replay
+/// idempotence broken). TailHit is the third horn: the writer carries the
+/// STORED truncated and verified_at forward untouched, sweeps nothing,
+/// stamps nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommentsCompleteness {
+    /// Pagination of the live id set terminated: the witness, as in B2.
+    Complete,
+    /// The conservation check concluded the un-fetched middle is unchanged;
+    /// the bundle's comment nodes are the tail only. An inference, never a
+    /// witness: it can neither sweep nor stamp, and the stored
+    /// truncated/verified_at pass through unmodified.
+    TailHit,
+    /// Pagination did not terminate (cap, floor, mid-walk failure): the
+    /// row lands truncated, as in B2.
+    Incomplete,
+}
+
 /// Rows for one writer transaction, already parsed and typed: the PR node
 /// with its comments/reviewThreads vectors REPLACED by the merged
 /// all-pages sets, plus body-extracted refs and the per-connection
-/// completeness verdicts. Constructed only by [`hydrate_one`], which is the
-/// only place a completeness claim can be earned.
+/// completeness verdicts. Constructed only by [`hydrate_one`] and the
+/// refresh path (`refresh_one`), the only places a completeness claim can
+/// be earned.
 pub struct PrBundle {
     repo: String,
     pr: parse::PrNode,
     refs: Vec<refs::ExtractedRef>,
     origin: Origin,
-    /// Pagination of the top-level comments connection terminated.
-    comments_complete: bool,
+    /// Top-level comments: the one three-state connection (see
+    /// [`CommentsCompleteness`]); every other connection is witnessed or
+    /// not, with no inference form.
+    comments: CommentsCompleteness,
     /// Thread pagination terminated AND every thread's nested comment
-    /// selection was complete (nodes == totalCount).
+    /// selection was complete (nodes == totalCount). The skeleton walk
+    /// earns this the same way a full walk does: ids suffice, bodies are
+    /// not part of completeness.
     threads_complete: bool,
     /// The three schema-nullable connections: present (not error-masked)
     /// and complete (nodes == totalCount).
@@ -347,9 +366,11 @@ pub struct PrBundle {
 
 impl PrBundle {
     /// Witness-complete: every connection of the PR paginated to its end.
-    /// The gate for verified_at and for sweeps.
+    /// The gate for verified_at and for sweeps. A TailHit is deliberately
+    /// NOT verified — the comments middle was inferred, and an inference
+    /// licenses carrying state forward, never advancing it.
     fn verified(&self) -> bool {
-        self.comments_complete
+        self.comments == CommentsCompleteness::Complete
             && self.threads_complete
             && self.requests_complete
             && self.reviews_complete
@@ -433,6 +454,30 @@ pub enum Msg {
         filtered: u64,
         reverified: u64,
         reverify_shed: u64,
+        /// Refresh attempts whose conservation check concluded (the
+        /// dispatch gate passed): tail_hits and full_walks PARTITION them
+        /// — an escalated check counts as full_walks only — so
+        /// tail_hits/(tail_hits+full_walks) is the true hit rate that
+        /// sizes TAIL_K (the telemetry rule's named consumer). First
+        /// contact, re-verify, retries, and --pr are not attempts: they
+        /// never reach the gate. A walk-back aborted BEFORE the verdict
+        /// (floor, transport) counts as neither and lands in
+        /// health.truncated; post-verdict thread-phase failures still
+        /// count as tail_hits — the tail mechanism concluded, and the
+        /// incompleteness is disclosed through the withheld threads
+        /// witness.
+        tail_hits: u64,
+        full_walks: u64,
+        /// Escalations by reason (the strings RefreshEnd::Escalate
+        /// names): the diagnostic split behind full_walks — which
+        /// response would change the outcome (raise K, accept deletion
+        /// traffic, distrust the walk) is a per-reason question.
+        escalations: BTreeMap<&'static str, u64>,
+        /// Thread-comment bodies resolved from the archive instead of the
+        /// wire (id known and lastEditedAt unmoved): the skeleton's saved
+        /// bytes, and the field that would expose a body-skip that stops
+        /// firing (a regression detector, its other named consumer).
+        bodies_skipped: u64,
     },
 }
 
@@ -881,6 +926,7 @@ fn worker(
     tx: SyncSender<Msg>,
     floor: &AtomicBool,
 ) {
+    let ro = cfg.db_path().ok().and_then(|path| db::open_ro(&path).ok());
     loop {
         let Some(plan) = jobs.lock().expect("job list mutex poisoned").next() else {
             return;
@@ -900,6 +946,10 @@ fn worker(
                 filtered: 0,
                 reverified: 0,
                 reverify_shed: 0,
+                tail_hits: 0,
+                full_walks: 0,
+                escalations: BTreeMap::new(),
+                bodies_skipped: 0,
             });
             if deferred.is_err() || stats.is_err() {
                 return; // writer gone: cancellation
@@ -911,13 +961,18 @@ fn worker(
             plan: &plan,
             tx: &tx,
             floor,
+            ro: ro.as_ref(),
             gh: GhCtx::new(cfg.retry_attempts, cfg.retry_budget),
             fetched: 0,
             filtered: 0,
             reverified: 0,
             reverify_shed: 0,
+            tail_hits: 0,
+            full_walks: 0,
+            escalations: BTreeMap::new(),
+            bodies_skipped: 0,
             windows_done: 0,
-            hydrated: HashSet::new(),
+            full_walked: HashSet::new(),
         };
         let end = s.sync_repo();
         let stats = Msg::Stats {
@@ -927,6 +982,10 @@ fn worker(
             filtered: s.filtered,
             reverified: s.reverified,
             reverify_shed: s.reverify_shed,
+            tail_hits: s.tail_hits,
+            full_walks: s.full_walks,
+            escalations: s.escalations.clone(),
+            bodies_skipped: s.bodies_skipped,
         };
         match end {
             Err(Stop::Writer) => return,
@@ -974,13 +1033,31 @@ struct StreamCtx<'a> {
     plan: &'a RepoPlan,
     tx: &'a SyncSender<Msg>,
     floor: &'a AtomicBool,
+    /// The worker's own read-only view of the archive, for the refresh
+    /// dispatch gate and baseline. WAL exists exactly so readers coexist
+    /// with the writer thread ("read commands stay usable mid-sync",
+    /// db.rs); the writer's RW connection stays the only writer. None —
+    /// the archive could not be opened read-only — degrades every
+    /// hydration to the full walk: correct, costlier, and the writer
+    /// surfaces any real archive fault loudly.
+    ro: Option<&'a db::RoArchive>,
     gh: GhCtx,
     fetched: u64,
     filtered: u64,
     reverified: u64,
     reverify_shed: u64,
+    tail_hits: u64,
+    full_walks: u64,
+    escalations: BTreeMap<&'static str, u64>,
+    bodies_skipped: u64,
     windows_done: u64,
-    hydrated: HashSet<String>,
+    /// Ids whose hydration this run was a genuine full walk. Re-verify
+    /// skips THESE, not `hydrated`: a tail-hit rehydration is an
+    /// inference, and letting it stand in for the tier's complete refetch
+    /// would disarm the masked-case catcher on exactly the PRs active
+    /// enough to be rediscovered every run (B3; the round-0 context's
+    /// "catcher unreachable" blocker class).
+    full_walked: HashSet<String>,
 }
 
 impl StreamCtx<'_> {
@@ -1096,7 +1173,6 @@ impl StreamCtx<'_> {
             match self.hydrate(&hit.id, Origin::Discovery)? {
                 Hydrated::Bundle(bundle) => {
                     extend(&mut watermark, &bundle.pr.updated_at);
-                    self.hydrated.insert(hit.id.clone());
                     self.fetched += 1;
                     rows.push(*bundle);
                     if rows.len() >= PAGE_BATCH {
@@ -1251,15 +1327,74 @@ impl StreamCtx<'_> {
             .any(|p| p.matches(author.login.as_str(), &author.typename))
     }
 
+    /// Hydrate one PR, routing through the layered refresh when the
+    /// dispatch gate passes. The gate is structural and caller-side
+    /// (round-0 obligation): only a discovery-origin rehydration of a PR
+    /// with a witnessed, untruncated, undeleted baseline may take the tail
+    /// path — first contact full-walks (no baseline row), re-verify
+    /// full-walks (it is the named catcher for the check's masked cases,
+    /// so routing it through the check would disarm it), retries
+    /// full-walk (a quarantined PR's last hydration failed; its baseline
+    /// is stale in an unbounded way), and --pr full-walks (it stamps
+    /// verified_at, which only a witness may do).
+    ///
+    /// Cost bound of check-then-escalate, acknowledged: a refresh that
+    /// escalates has spent one REFRESH_PR document and at most
+    /// TAIL_WALKBACK_PAGES cheap tail pages more than the plain full walk
+    /// it then runs. The hit rate that justifies that overhead is exactly
+    /// what refresh.tail_hits / full_walks measures.
     fn hydrate(&mut self, id: &str, origin: Origin) -> std::result::Result<Hydrated, Stop> {
-        match hydrate_one(
+        if origin == Origin::Discovery
+            && let Some(baseline) = self.refresh_baseline(id)
+        {
+            match refresh_one(
+                &mut self.gh,
+                &self.plan.repo,
+                id,
+                origin,
+                self.cfg.rate_limit_floor,
+                || self.floor.load(Ordering::Relaxed),
+                &baseline,
+                &mut self.bodies_skipped,
+            ) {
+                RefreshEnd::End(end) => {
+                    if let HydrateEnd::Bundle(b) = &end
+                        && b.comments == CommentsCompleteness::TailHit
+                    {
+                        self.tail_hits += 1;
+                    }
+                    return self.hydrate_end(end);
+                }
+                RefreshEnd::Escalate(reason) => {
+                    // The check could not license the tail: discard the
+                    // refresh's view entirely and restart from the top —
+                    // never resume from suspect state. Partitioned into
+                    // full_walks only (never also tail_hits), with the
+                    // reason split kept for the K-sizing diagnosis.
+                    self.full_walks += 1;
+                    *self.escalations.entry(reason).or_default() += 1;
+                }
+            }
+        }
+        let end = hydrate_one(
             &mut self.gh,
             &self.plan.repo,
             id,
             origin,
             self.cfg.rate_limit_floor,
             || self.floor.load(Ordering::Relaxed),
-        ) {
+        );
+        if matches!(end, HydrateEnd::Bundle(_)) {
+            self.full_walked.insert(id.to_string());
+        }
+        self.hydrate_end(end)
+    }
+
+    /// Map a walk's terminal outcome onto the stream's typed results —
+    /// shared by the full walk and the refresh so both classify at the
+    /// same call site.
+    fn hydrate_end(&self, end: HydrateEnd) -> std::result::Result<Hydrated, Stop> {
+        match end {
             HydrateEnd::Bundle(b) => Ok(Hydrated::Bundle(b)),
             HydrateEnd::Vanished => Ok(Hydrated::Quarantine("node_null")),
             HydrateEnd::ParseDrift => Ok(Hydrated::Quarantine("parse")),
@@ -1272,6 +1407,67 @@ impl StreamCtx<'_> {
             HydrateEnd::RateExhausted => Err(Stop::Floor),
             HydrateEnd::Fatal(error) => Err(Stop::Repo(error)),
         }
+    }
+
+    /// Read the archived state the refresh inducts from, gating as it
+    /// goes. `None` means "no tail path" — no RO connection, no row, no
+    /// witnessed baseline (verified_at NULL), stored truncation, a
+    /// soft-deleted row, or an unreadable archive — and the caller
+    /// full-walks, the strictly-more-complete form. Conflating a read
+    /// error with absence is deliberate: the degradation is correctness-
+    /// neutral (cost only), and a genuinely broken archive fails loudly
+    /// in the writer, which holds the RW connection.
+    fn refresh_baseline(&self, id: &str) -> Option<RefreshBaseline> {
+        let conn = self.ro?.conn();
+        let (pk, verified_at, truncated, deleted_at): (i64, Option<String>, i64, Option<String>) =
+            conn.query_row(
+                "SELECT pk, verified_at, truncated, deleted_at FROM prs \
+                 WHERE repo = ?1 AND id = ?2",
+                rusqlite::params![self.plan.repo, id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .ok()?;
+        if verified_at.is_none() || truncated != 0 || deleted_at.is_some() {
+            return None;
+        }
+        // The archived side of the counting universe: LIVE rows only
+        // (deleted_at IS NULL) — a soft-deleted row is not in GitHub's
+        // totalCount, and a tail id that resurrects one counts as new on
+        // both sides of the equation. Minimized rows are counted: the
+        // universe the enablement fixture pins (parse.rs,
+        // minimized_comments_count_in_total_count).
+        let mut live_comments = HashSet::new();
+        let mut thread_comments = HashMap::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, updated_at, body FROM comments \
+                 WHERE parent_kind = 'pr' AND parent = ?1 \
+                   AND kind IN ('comment', 'review_comment') \
+                   AND deleted_at IS NULL",
+            )
+            .ok()?;
+        let rows = stmt
+            .query_map([pk], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .ok()?;
+        for row in rows {
+            let (cid, kind, updated_at, body) = row.ok()?;
+            if kind == "comment" {
+                live_comments.insert(cid);
+            } else {
+                thread_comments.insert(cid, (updated_at, body));
+            }
+        }
+        Some(RefreshBaseline {
+            live_comments,
+            thread_comments,
+        })
     }
 
     fn retry_quarantined(&mut self) -> std::result::Result<(), Stop> {
@@ -1290,7 +1486,6 @@ impl StreamCtx<'_> {
             }
             match self.hydrate(id, Origin::Retry)? {
                 Hydrated::Bundle(bundle) => {
-                    self.hydrated.insert(id.clone());
                     self.fetched += 1;
                     resolved.push(*bundle);
                 }
@@ -1317,8 +1512,12 @@ impl StreamCtx<'_> {
         let mut requeued: Vec<QuarantineRecord> = Vec::new();
         let now = Rfc3339Utc::now();
         for (i, (id, _number)) in self.plan.reverify.iter().enumerate() {
-            if self.hydrated.contains(id) {
-                continue; // discovery already gave it a complete refetch
+            if self.full_walked.contains(id) {
+                // Discovery already gave it a complete refetch. `hydrated`
+                // would be the wrong set here: a tail-hit rehydration is
+                // an inference, and the tier's whole job is the complete
+                // refetch that catches what inference masks.
+                continue;
             }
             if self.gate().is_err() {
                 // Re-verify sheds first at the floor, and the shed volume
@@ -1584,7 +1783,13 @@ fn hydrate_one(
         pr: node,
         refs: body_refs,
         origin,
-        comments_complete,
+        // The full walk is two-state: it witnesses or it doesn't. TailHit
+        // is constructible only by the refresh path's conservation check.
+        comments: if comments_complete {
+            CommentsCompleteness::Complete
+        } else {
+            CommentsCompleteness::Incomplete
+        },
         threads_complete,
         requests_complete,
         reviews_complete,
@@ -1614,6 +1819,478 @@ fn hydrate_failure(e: gh::GhError) -> HydrateEnd {
 }
 
 // ---------------------------------------------------------------------------
+// The layered refresh: tail-first comments under count conservation,
+// skeleton-walked threads with archive-resolved bodies. DESIGN.md's refresh
+// section carries the argument; the two masked cases and their catcher are
+// documented at tail_conservation below.
+
+/// Walk-back bound for the tail: pages of TAIL_K fetched beyond the first
+/// while hunting the induction anchor (id overlap with the archived set).
+/// (1 + TAIL_WALKBACK_PAGES) × TAIL_K = 60 newest comments; a PR that
+/// gained more than that between two syncs deserves the full walk the
+/// escalation buys, and the bound is what keeps check-then-escalate within
+/// a constant of the plain walk (see the dispatch's cost note).
+const TAIL_WALKBACK_PAGES: u32 = 2;
+
+/// The archived state one refresh inducts from, read through the worker's
+/// RO connection at dispatch time. The read cannot race a write to the
+/// same PR: repos are worker-exclusive, the run lock excludes other
+/// syncs, and within a repo the only hydration that can FOLLOW a tail hit
+/// of the same PR is the re-verify full walk, which reads no baseline.
+/// (Windows dedupe among themselves; retries exclude quarantined ids from
+/// windows entirely.)
+struct RefreshBaseline {
+    /// Live (deleted_at IS NULL) top-level comment ids — the archived
+    /// side of the conservation equation, minimized rows included.
+    live_comments: HashSet<String>,
+    /// Live review-thread comment id → stored (updated_at, body): the
+    /// body-skip signal and the text that replaces the un-fetched body
+    /// when the signal says "unmoved".
+    thread_comments: HashMap<String, (Option<String>, String)>,
+}
+
+/// A refresh attempt's outcome: a terminal end (bundle, vanish, transport
+/// failure — the same shapes the full walk produces, classified at the
+/// same call site), or an escalation to the full walk. Escalation is not
+/// an error: it is the check declining to license the skip.
+enum RefreshEnd {
+    End(HydrateEnd),
+    /// The reason names the arm for the summary's per-reason escalation
+    /// counters (refresh.escalations): the flat tail_hits/full_walks
+    /// ratio sizes K, but only the reason split says WHICH response
+    /// raising K would change — "no induction anchor" means the tail is
+    /// too short, "count imbalance" means deletion traffic no K fixes,
+    /// "duplicate tail id"/"non-advancing cursor" mean the API is
+    /// unstable under the walk (B3 panel, S1).
+    Escalate(&'static str),
+}
+
+/// The conservation check's verdict. The reason string names the arm for
+/// tests and future disclosure; it never reaches output today.
+#[derive(Debug, PartialEq, Eq)]
+enum TailVerdict {
+    Hit,
+    Escalate(&'static str),
+}
+
+/// The count-conservation decision, pure so it can be enumerated against a
+/// model. Inputs: the archived live top-level id set, the totalCount all
+/// tail pages agreed on (a moved count escalates before this is called),
+/// the walked tail's ids (ascending, all pages), and whether the walk
+/// reached the connection's start (`fully_observed` — the oldest page had
+/// hasPreviousPage == false).
+///
+/// The inference: stable creation order makes the un-fetched region a
+/// PREFIX of the connection. If some tail id is archived (the anchor) and
+/// |archived_live| + |tail ∖ archived_live| == totalCount, the prefix is
+/// exactly the archived remainder — nothing was added or deleted there.
+/// Preconditions, each used here or upstream: minimized rows count in
+/// totalCount (enablement fixture); the archived side counts live rows
+/// only; count and tail come from one document per page; top-level
+/// comments only (a review-thread reply mutates an OLD thread — the count
+/// balances while the archive is wrong — and pending-review submission
+/// inserts middle-positioned thread comments, so stable creation order
+/// does not even hold there).
+///
+/// Zero overlap with an un-fetched middle has NO induction anchor and
+/// escalates regardless of balance (round-0 obligation). One refinement,
+/// decided here: when the walk reached the connection's start there IS no
+/// un-fetched middle — the check degenerates to direct observation, where
+/// balance alone proves archived ⊆ fetched (|fetched ∩ archived| =
+/// totalCount − |new| = |archived|) — so a fully-observed balanced tail
+/// hits without an anchor. This is the arm that keeps zero-comment and
+/// first-comment PRs on the cheap path; it inducts over nothing. If the
+/// panel refutes the degenerate-case argument, tighten this arm, not the
+/// anchor rule.
+///
+/// The two masked cases, disclosed (DESIGN.md refresh): (1) a deletion
+/// offset by an equal count of non-tail-visible adds inside one window —
+/// REFINED by the model enumeration below: under the stated creation-
+/// order precondition an anchored suffix covers every appended add, so
+/// this shape is unreachable and the id arithmetic is EXACT; it survives
+/// as the disclosed blast radius of an order violation (an imported or
+/// backdated comment landing mid-connection), where the enumeration
+/// confines every false pass to exactly this shape; (2) a body edit to a
+/// top-level comment in the un-fetched middle (the count is conserved
+/// and the ids overlap). Both fall to the re-verify tier — unconditional
+/// for OPEN PRs, within lookback of closed_at/merged_at for
+/// CLOSED/MERGED, beyond which a masked case is permanently stale, the
+/// same accepted scope limit as closed-tier discovery.
+fn tail_conservation(
+    archived_live: &HashSet<String>,
+    total_count: i64,
+    tail_ids: &[&str],
+    fully_observed: bool,
+) -> TailVerdict {
+    if total_count < 0 {
+        return TailVerdict::Escalate("negative totalCount");
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut new: i64 = 0;
+    let mut anchored = false;
+    for id in tail_ids {
+        if !seen.insert(id) {
+            // A duplicate across pages means the connection reordered
+            // under the walk: the pages are not one snapshot.
+            return TailVerdict::Escalate("duplicate tail id");
+        }
+        if archived_live.contains(*id) {
+            anchored = true;
+        } else {
+            new += 1;
+        }
+    }
+    let Ok(archived) = i64::try_from(archived_live.len()) else {
+        return TailVerdict::Escalate("unrepresentable archive size");
+    };
+    let balanced = archived.checked_add(new) == Some(total_count);
+    match (fully_observed, anchored, balanced) {
+        (true, _, true) => TailVerdict::Hit,
+        (false, true, true) => TailVerdict::Hit,
+        (false, false, _) => TailVerdict::Escalate("no induction anchor"),
+        (_, _, false) => TailVerdict::Escalate("count imbalance"),
+    }
+}
+
+/// One layered refresh: REFRESH_PR, the tail walk-back, the conservation
+/// verdict, the skeleton thread walk, and body resolution. Every arm where
+/// the check cannot run or cannot be trusted degrades AWAY from the skip:
+/// a moved count, a missing anchor, an imbalance, a duplicate id, or a
+/// REFRESH parse drift escalates to the full walk (RefreshEnd::Escalate —
+/// note drift here is NOT the parse-class quarantine: only the full walk's
+/// own document proves schema drift against the PR); a floor trip or
+/// transport wobble mid-walk keeps what was fetched and lands the bundle
+/// Incomplete, exactly like the full walk's partial arm — never a skip.
+///
+/// A returned bundle's comment nodes are the TAIL ONLY (plus thread
+/// comments); the writer's diff gate makes re-upserting the already-
+/// archived overlap free, and the un-fetched middle is never visited —
+/// which is why a TailHit can neither sweep nor stamp (PrBundle docs).
+#[allow(clippy::too_many_arguments)]
+fn refresh_one(
+    gh_ctx: &mut GhCtx,
+    repo: &str,
+    id: &str,
+    origin: Origin,
+    floor: u32,
+    floor_tripped: impl Fn() -> bool,
+    baseline: &RefreshBaseline,
+    bodies_skipped: &mut u64,
+) -> RefreshEnd {
+    let floor_hit = |ctx: &GhCtx| ctx.tel.remaining.is_some_and(|r| r < floor) || floor_tripped();
+    let resp = match gh::graphql(&queries::refresh_pr_document(), &[("id", id)], gh_ctx) {
+        Ok(resp) => resp,
+        Err(e) => return RefreshEnd::End(hydrate_failure(e)),
+    };
+    let node = match parse::refresh_pr(&resp.data) {
+        Err(_) => return RefreshEnd::Escalate("refresh parse drift"),
+        Ok(None) => return RefreshEnd::End(HydrateEnd::Vanished),
+        Ok(Some(node)) => node,
+    };
+    if node.repository.name_with_owner.to_ascii_lowercase() != repo {
+        return RefreshEnd::End(HydrateEnd::Renamed);
+    }
+
+    // The tail walk-back: pages accumulate (ascending; older pages
+    // prepend) until an anchor exists, the connection's start is reached,
+    // or a bound stops the hunt. Count and tail arrive in ONE document on
+    // every iteration; a count that moved between pages is a live
+    // mutation mid-walk and escalates — restart from the top, never
+    // resume across the seam.
+    let total = node.comments.total_count;
+    let mut tail = node.comments.nodes;
+    let mut has_prev = node.comments.page_info.has_previous_page;
+    let mut cursor = node.comments.page_info.start_cursor.clone();
+    let mut pages: u32 = 0;
+    // `aborted`: the floor or a transport wobble stopped the walk-back
+    // BEFORE a verdict; the bundle lands Incomplete (witness-free), the
+    // same shape as the full walk's partial arm. Post-verdict failures
+    // (the thread phase) never touch this: comments completeness
+    // reflects the comments connection alone, and a thread-phase floor
+    // or transport failure withholds the THREADS witness instead (B3
+    // panel, S2 — the earlier draft demoted a concluded Hit to
+    // Incomplete on a thread-phase floor, which made the accounting
+    // asymmetric with the transport arm below).
+    let mut aborted = false;
+    while has_prev && !tail.iter().any(|c| baseline.live_comments.contains(&c.id)) {
+        if pages >= TAIL_WALKBACK_PAGES {
+            // Anchor not found within the bound: no induction base.
+            return RefreshEnd::Escalate("no anchor within walk-back bound");
+        }
+        if floor_hit(gh_ctx) {
+            aborted = true;
+            break;
+        }
+        let Some(before) = cursor.clone() else {
+            // hasPreviousPage with no startCursor is schema nonsense;
+            // treat it as an untrustworthy snapshot.
+            return RefreshEnd::Escalate("missing walk-back cursor");
+        };
+        let resp = match gh::graphql(
+            &queries::tail_comments_document(),
+            &[("id", id), ("before", &before)],
+            gh_ctx,
+        ) {
+            Ok(resp) => resp,
+            Err(_) => {
+                aborted = true;
+                break;
+            }
+        };
+        let page = match parse::tail_comments(&resp.data) {
+            Ok(Some(page)) => page,
+            // Vanished or drifted mid-walk: the snapshot is suspect.
+            Ok(None) | Err(_) => return RefreshEnd::Escalate("tail page vanished or drifted"),
+        };
+        if page.comments.total_count != total {
+            return RefreshEnd::Escalate("count moved between pages");
+        }
+        pages += 1;
+        has_prev = page.comments.page_info.has_previous_page;
+        // Guard-mutant note (kin of the B2 cursor-guard survivors): with
+        // the middle arm's guard forced true, a non-advancing terminal
+        // page nulls the cursor and the next iteration escalates through
+        // the `let Some` — same verdict, same call count, so the mutant
+        // is observationally equivalent; the arms stay split for the
+        // costlier non-terminal case, which the non-advancing-cursor
+        // pipeline test pins by exact subprocess count.
+        match page.comments.page_info.start_cursor {
+            Some(c) if Some(&c) != cursor.as_ref() => cursor = Some(c),
+            _ if !has_prev => cursor = None,
+            _ => return RefreshEnd::Escalate("non-advancing cursor"),
+        }
+        let mut walked = page.comments.nodes;
+        walked.extend(tail);
+        tail = walked;
+    }
+
+    if !aborted {
+        let tail_ids: Vec<&str> = tail.iter().map(|c| c.id.as_str()).collect();
+        match tail_conservation(&baseline.live_comments, total, &tail_ids, !has_prev) {
+            TailVerdict::Hit => {}
+            TailVerdict::Escalate(reason) => return RefreshEnd::Escalate(reason),
+        }
+    }
+
+    // The skeleton thread walk: same loop discipline as the full walk's
+    // (backstop, floor, non-advancing-cursor guard); a stopped walk
+    // withholds the threads witness, never shrinks silently.
+    let threads_total = node.review_threads.total_count;
+    let mut skeletons = node.review_threads.nodes;
+    let mut threads_paged = !node.review_threads.page_info.has_next_page;
+    let mut cursor = node.review_threads.page_info.end_cursor.clone();
+    let mut pages: u32 = 0;
+    // Mutant notes, same classes B2 documented at hydrate_one's walks:
+    // the MAX_CONNECTION_PAGES half of the guard and the `pages` counter
+    // it consumes are a 100-page backstop no fixture reaches (their
+    // mutants are equivalent below that bound); the cursor-guard arms
+    // below degrade a pathological repeating-cursor remote to a withheld
+    // witness either way. The floor half is pinned by the
+    // skeleton-floor pipeline test.
+    while !threads_paged {
+        if floor_hit(gh_ctx) || pages >= MAX_CONNECTION_PAGES {
+            break;
+        }
+        let Some(after) = cursor.clone() else { break };
+        let resp = match gh::graphql(
+            queries::SKELETON_THREADS_PAGE,
+            &[("id", id), ("after", &after)],
+            gh_ctx,
+        ) {
+            Ok(resp) => resp,
+            Err(_) => break,
+        };
+        let page = match parse::skeleton_threads_page(&resp.data) {
+            Ok(Some(page)) => page,
+            Ok(None) | Err(_) => break,
+        };
+        pages += 1;
+        skeletons.extend(page.review_threads.nodes);
+        threads_paged = !page.review_threads.page_info.has_next_page;
+        match page.review_threads.page_info.end_cursor {
+            Some(c) if Some(&c) != cursor.as_ref() => cursor = Some(c),
+            _ if threads_paged => {}
+            _ => break,
+        }
+    }
+
+    // Body resolution, per thread: a thread whose every nested comment is
+    // known (id archived live) with an unmoved edit signal (lastEditedAt
+    // == stored updated_at) — and whose selection covered its count —
+    // resolves from the archive, no call; anything else refetches the
+    // WHOLE thread with bodies (the newer snapshot replaces the
+    // skeleton's view). A refetch that fails or comes back short just
+    // withholds the threads witness via the ordinary count rule.
+    let mut threads: Vec<parse::ThreadNode> = Vec::with_capacity(skeletons.len());
+    for sk in skeletons {
+        let covered =
+            i64::try_from(sk.comments.nodes.len()).is_ok_and(|n| n >= sk.comments.total_count);
+        let resolvable = covered
+            && sk.comments.nodes.iter().all(|c| {
+                baseline
+                    .thread_comments
+                    .get(&c.id)
+                    .is_some_and(|(stored_edit, _)| {
+                        stored_edit.as_deref() == c.last_edited_at.as_ref().map(|t| t.as_str())
+                    })
+            });
+        if resolvable {
+            *bodies_skipped += sk.comments.nodes.len() as u64;
+            threads.push(thread_from_skeleton(sk, baseline));
+            continue;
+        }
+        if floor_hit(gh_ctx) {
+            // Same degradation as the transport arm below: the thread
+            // keeps its cheap fields, loses its comments, and the
+            // withheld threads witness lands the row truncated. The
+            // comments verdict (already concluded) stands.
+            threads.push(thread_without_comments(sk));
+            continue;
+        }
+        let refetched = gh::graphql(queries::THREAD_BODIES, &[("id", &sk.id)], gh_ctx)
+            .ok()
+            .and_then(|resp| parse::thread_bodies(&resp.data).ok().flatten())
+            .filter(|tb| tb.id == sk.id);
+        match refetched {
+            Some(tb) => threads.push(parse::ThreadNode {
+                id: sk.id,
+                is_resolved: sk.is_resolved,
+                is_outdated: sk.is_outdated,
+                path: sk.path,
+                line: sk.line,
+                comments: tb.comments,
+            }),
+            // Vanished/drifted/failed: keep the thread's cheap fields,
+            // drop its comments — total_count > 0 with zero nodes is what
+            // withholds the witness below. (A thread that vanished with
+            // total 0 reads complete-and-empty, which is also true.)
+            None => threads.push(thread_without_comments(sk)),
+        }
+    }
+
+    let threads_complete = threads_paged
+        && threads.iter().all(|t| {
+            i64::try_from(t.comments.nodes.len()).is_ok_and(|n| n >= t.comments.total_count)
+        });
+    let requests_complete = counted_complete(&node.review_requests);
+    let reviews_complete = counted_complete(&node.latest_opinionated_reviews);
+    let closing_complete = counted_complete(&node.closing_issues_references);
+    let body_refs = refs::extract(&node.body, repo).unwrap_or_default();
+
+    // page_info on the assembled connections is fabricated-inert: it is
+    // pagination transport, consumed above, never read by the writer.
+    let done = parse::PageInfo {
+        has_next_page: false,
+        end_cursor: None,
+    };
+    let pr = parse::PrNode {
+        id: node.id,
+        number: node.number,
+        title: node.title,
+        body: node.body,
+        state: node.state,
+        is_draft: node.is_draft,
+        url: node.url,
+        author: node.author,
+        author_association: node.author_association,
+        repository: node.repository,
+        head_ref_name: node.head_ref_name,
+        base_ref_name: node.base_ref_name,
+        review_decision: node.review_decision,
+        created_at: node.created_at,
+        updated_at: node.updated_at,
+        merged_at: node.merged_at,
+        closed_at: node.closed_at,
+        commits: node.commits,
+        review_requests: node.review_requests,
+        latest_opinionated_reviews: node.latest_opinionated_reviews,
+        closing_issues_references: node.closing_issues_references,
+        comments: parse::Paged {
+            total_count: total,
+            page_info: done.clone(),
+            nodes: tail,
+        },
+        review_threads: parse::Paged {
+            total_count: threads_total,
+            page_info: done,
+            nodes: threads,
+        },
+    };
+    RefreshEnd::End(HydrateEnd::Bundle(Box::new(PrBundle {
+        repo: repo.to_string(),
+        pr,
+        refs: body_refs,
+        origin,
+        comments: if aborted {
+            CommentsCompleteness::Incomplete
+        } else {
+            CommentsCompleteness::TailHit
+        },
+        threads_complete,
+        requests_complete,
+        reviews_complete,
+        closing_complete,
+    })))
+}
+
+/// A skeleton thread whose every comment resolved from the archive.
+fn thread_from_skeleton(
+    sk: parse::SkeletonThreadNode,
+    baseline: &RefreshBaseline,
+) -> parse::ThreadNode {
+    let nodes = sk
+        .comments
+        .nodes
+        .into_iter()
+        .map(|c| {
+            let body = baseline
+                .thread_comments
+                .get(&c.id)
+                .map(|(_, body)| body.clone())
+                .unwrap_or_default(); // unreachable: resolvable checked membership
+            parse::CommentNode {
+                id: c.id,
+                body,
+                created_at: c.created_at,
+                last_edited_at: c.last_edited_at,
+                url: c.url,
+                is_minimized: c.is_minimized,
+                author_association: c.author_association,
+                author: c.author,
+            }
+        })
+        .collect();
+    parse::ThreadNode {
+        id: sk.id,
+        is_resolved: sk.is_resolved,
+        is_outdated: sk.is_outdated,
+        path: sk.path,
+        line: sk.line,
+        comments: parse::Counted {
+            total_count: sk.comments.total_count,
+            nodes,
+        },
+    }
+}
+
+/// A thread kept for its cheap fields with its comments dropped (body
+/// fetch failed or the floor stopped it): total_count survives, so the
+/// ordinary nodes-vs-count rule withholds the threads witness.
+fn thread_without_comments(sk: parse::SkeletonThreadNode) -> parse::ThreadNode {
+    parse::ThreadNode {
+        id: sk.id,
+        is_resolved: sk.is_resolved,
+        is_outdated: sk.is_outdated,
+        path: sk.path,
+        line: sk.line,
+        comments: parse::Counted {
+            total_count: sk.comments.total_count,
+            nodes: Vec::new(),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Writer: the only thread that touches the write connection.
 
 /// Per-repo write-side counters. The worker-side ones arrive in Msg::Stats.
@@ -1628,6 +2305,10 @@ struct RepoTally {
     reverified: u64,
     quiet_mutations_found: u64,
     reverify_shed: u64,
+    tail_hits: u64,
+    full_walks: u64,
+    escalations: BTreeMap<&'static str, u64>,
+    bodies_skipped: u64,
     truncated: u64,
     quarantined: u64,
     discovery_truncated: u64,
@@ -1780,12 +2461,22 @@ fn writer(
                 filtered,
                 reverified,
                 reverify_shed,
+                tail_hits,
+                full_walks,
+                escalations,
+                bodies_skipped,
             } => {
                 let t = tally(&mut tallies, &repo);
                 t.fetched += fetched;
                 t.filtered += filtered;
                 t.reverified += reverified;
                 t.reverify_shed += reverify_shed;
+                t.tail_hits += tail_hits;
+                t.full_walks += full_walks;
+                for (reason, n) in escalations {
+                    *t.escalations.entry(reason).or_default() += n;
+                }
+                t.bodies_skipped += bodies_skipped;
                 t.subprocess_count += tel.subprocess_count;
                 t.subprocess_ms += tel.subprocess_ms;
                 t.bytes_parsed += tel.bytes_parsed;
@@ -1919,7 +2610,7 @@ fn apply_bundle(
     // nor upserted.
     let mut changed = false;
 
-    let pk = upsert_pr(tx, now, b, t, &mut changed)?;
+    let (pk, landed_truncated) = upsert_pr(tx, now, b, t, &mut changed)?;
     upsert_children(tx, now, b, pk, t, &mut changed)?;
 
     if changed {
@@ -1927,7 +2618,11 @@ fn apply_bundle(
     } else {
         t.unchanged += 1;
     }
-    if !b.verified() {
+    // health.truncated counts rows the run LEFT truncated. A TailHit
+    // carries the stored value, so an ordinary hit (stored 0) is not
+    // truncation — counting the bundle's !verified() here would report
+    // every tail hit as an incomplete archive row, which it is not.
+    if landed_truncated {
         t.truncated += 1;
     }
     if b.origin == Origin::Reverify && changed {
@@ -1950,16 +2645,75 @@ fn apply_bundle(
 /// prs.last_pushed_at stays NULL, which fails closed.
 const OBSERVED: &[&str] = &["state", "review_decision", "head_sha", "is_draft", "author"];
 
+/// The one SELECT whose column ORDER feeds a decision: old_cols[17] must
+/// be `truncated` for the TailHit carry (upsert_pr). The list is a const
+/// so the position test pins the string the query actually runs, not a
+/// copy (B3 panel, S3).
+const PR_SELECT: &str = "SELECT pk, id, title, body, state, is_draft, author, author_id, \
+                    author_assoc, head_ref, base_ref, head_sha, review_decision, created_at, \
+                    updated_at, merged_at, closed_at, url, truncated, deleted_at, verified_at \
+             FROM prs WHERE repo = ?1 AND number = ?2";
+
 fn upsert_pr(
     tx: &rusqlite::Transaction,
     now: &Rfc3339Utc,
     b: &PrBundle,
     t: &mut RepoTally,
     changed: &mut bool,
-) -> Result<i64> {
+) -> Result<(i64, bool)> {
     let pr = &b.pr;
     let head = pr.commits.nodes.first().map(|c| &c.commit);
     let author = pr.author.as_ref();
+
+    let existing: Option<(i64, Vec<Option<String>>, Option<String>)> = tx
+        .query_row(PR_SELECT, rusqlite::params![b.repo, pr.number], |r| {
+            let pk: i64 = r.get(0)?;
+            let mut cols = Vec::new();
+            for i in 1..20 {
+                // Numeric columns read back as text for a uniform diff;
+                // SQLite's CAST of INTEGER to TEXT is exact.
+                cols.push(
+                    r.get::<_, Option<String>>(i).or_else(|_| {
+                        r.get::<_, Option<i64>>(i).map(|v| v.map(|v| v.to_string()))
+                    })?,
+                );
+            }
+            let verified_at: Option<String> = r.get(20)?;
+            Ok((pk, cols, verified_at))
+        })
+        .map(Some)
+        .or_else(none_if_no_rows)
+        .map_err(|e| classify_sql(&e))?;
+
+    // The truncated value this bundle lands. A TailHit CARRIES the stored
+    // value (round-0 decree: the middle was inferred, so the bundle may
+    // neither heal truncation nor introduce it — a boolean here is what
+    // oscillated); with truncated inside the field diff, carrying the old
+    // value is also what keeps an unchanged tail-hit replay write-free.
+    // The carry is licensed ONLY when every other connection witnessed:
+    // a TailHit whose thread walk lost its witness may be missing rows,
+    // and carrying stored 0 through that would hide real truncation. A
+    // TailHit with no stored row cannot claim anything either (the
+    // dispatch gate requires a witnessed baseline, so that arm is
+    // defensive): both land truncated, disclosed, healed by the next
+    // full walk.
+    let others_complete =
+        b.threads_complete && b.requests_complete && b.reviews_complete && b.closing_complete;
+    let landed_truncated = match (b.comments, &existing) {
+        (CommentsCompleteness::TailHit, Some((_, old_cols, _))) if others_complete => {
+            // old_cols[17] is `truncated` (the SELECT order above).
+            old_cols[17].as_deref() == Some("1")
+        }
+        // This defensive arm is explicit rather than folded into the
+        // fallback: for every TailHit input `!b.verified()` also computes
+        // true (a TailHit is never verified), so deleting the arm is a
+        // behavior-preserving mutant — it stays because the truth of the
+        // fallback depends on verified()'s definition and this line's
+        // correctness must not.
+        (CommentsCompleteness::TailHit, _) => true,
+        _ => !b.verified(),
+    };
+
     let new: Vec<(&str, Option<String>)> = vec![
         ("id", Some(pr.id.clone())),
         ("title", Some(pr.title.clone())),
@@ -1987,34 +2741,9 @@ fn upsert_pr(
             pr.closed_at.as_ref().map(|x| x.as_str().to_string()),
         ),
         ("url", Some(pr.url.clone())),
-        ("truncated", Some(i64::from(!b.verified()).to_string())),
+        ("truncated", Some(i64::from(landed_truncated).to_string())),
         ("deleted_at", None),
     ];
-
-    let existing: Option<(i64, Vec<Option<String>>, Option<String>)> = tx
-        .query_row(
-            "SELECT pk, id, title, body, state, is_draft, author, author_id, author_assoc, \
-                    head_ref, base_ref, head_sha, review_decision, created_at, updated_at, \
-                    merged_at, closed_at, url, truncated, deleted_at, verified_at \
-             FROM prs WHERE repo = ?1 AND number = ?2",
-            rusqlite::params![b.repo, pr.number],
-            |r| {
-                let pk: i64 = r.get(0)?;
-                let mut cols = Vec::new();
-                for i in 1..20 {
-                    // Numeric columns read back as text for a uniform diff;
-                    // SQLite's CAST of INTEGER to TEXT is exact.
-                    cols.push(r.get::<_, Option<String>>(i).or_else(|_| {
-                        r.get::<_, Option<i64>>(i).map(|v| v.map(|v| v.to_string()))
-                    })?);
-                }
-                let verified_at: Option<String> = r.get(20)?;
-                Ok((pk, cols, verified_at))
-            },
-        )
-        .map(Some)
-        .or_else(none_if_no_rows)
-        .map_err(|e| classify_sql(&e))?;
 
     match existing {
         None => {
@@ -2052,11 +2781,11 @@ fn upsert_pr(
                     pr.merged_at.as_ref().map(|x| x.as_str()),
                     pr.closed_at.as_ref().map(|x| x.as_str()),
                     pr.url,
-                    !b.verified(),
+                    landed_truncated,
                     verified_at,
                 ],
             )?;
-            Ok(tx.last_insert_rowid())
+            Ok((tx.last_insert_rowid(), landed_truncated))
         }
         Some((pk, old_cols, old_verified_at)) => {
             let names = [
@@ -2147,13 +2876,13 @@ fn upsert_pr(
                         pr.merged_at.as_ref().map(|x| x.as_str()),
                         pr.closed_at.as_ref().map(|x| x.as_str()),
                         pr.url,
-                        !b.verified(),
+                        landed_truncated,
                         verified_at,
                         pk,
                     ],
                 )?;
             }
-            Ok(pk)
+            Ok((pk, landed_truncated))
         }
     }
 }
@@ -2240,7 +2969,7 @@ fn upsert_children(
     // Sweeps: soft deletes, gated on the connection's completeness witness
     // — a sweep on an incomplete connection is a type error by discipline
     // (truncation must never read as deletion).
-    if b.comments_complete {
+    if b.comments == CommentsCompleteness::Complete {
         t.soft_deleted += sweep(
             tx,
             now,
@@ -2768,6 +3497,10 @@ fn summary(tallies: &BTreeMap<String, RepoTally>) -> Value {
                     "reverified": t.reverified,
                     "quiet_mutations_found": t.quiet_mutations_found,
                     "reverify_shed": t.reverify_shed,
+                    "tail_hits": t.tail_hits,
+                    "full_walks": t.full_walks,
+                    "escalations": t.escalations,
+                    "bodies_skipped": t.bodies_skipped,
                 },
                 "cost": {
                     "subprocess_count": t.subprocess_count,
@@ -3332,6 +4065,220 @@ mod tests {
         assert_eq!(
             incremental_since(None, &lookback).as_str(),
             lookback.as_str()
+        );
+    }
+
+    // --- tail conservation: exhaustive model enumeration ---
+
+    // The check is a pure decision function, so its safety property is
+    // provable by cases over a model of upstream histories: every archived
+    // list up to 4 ids, every deletion subset, up to 2 adds, every tail
+    // length (the walked tail is a suffix; deletions strike anywhere).
+    // Two models, one theorem each:
+    //
+    //   STRICT (adds append — the creation-order precondition the check
+    //   states): ZERO false hits. This is stronger than the round-0
+    //   disclosure: an anchored suffix necessarily covers every appended
+    //   add, so "deletion offset by non-tail-visible adds" cannot balance
+    //   while anchored — at the id level, under the preconditions, the
+    //   inference is EXACT, and the only residual masked case is the body
+    //   edit (invisible to ids by construction; pipeline-tested catcher).
+    //
+    //   WEAKENED (adds at ANY position — the order precondition broken,
+    //   e.g. an imported comment backdated into the middle): false hits
+    //   exist but are confined EXACTLY to the documented shape — partial
+    //   observation, deletions == non-tail-visible adds. This pins the
+    //   blast radius of a precondition failure to the disclosed tolerance;
+    //   any false hit outside it is the third masked case the round-0
+    //   panel hunted, and fails this test.
+    //
+    // Completeness rides along in the strict model: no deletions and an
+    // anchored (or fully-observed) tail always Hits, so unchanged PRs,
+    // appended comments, and zero-comment PRs never over-escalate.
+    #[test]
+    fn tail_conservation_enumerated_against_the_model() {
+        let archived_ids = ["a0", "a1", "a2", "a3"];
+        let add_ids = ["n0", "n1"];
+
+        // All live lists reachable by inserting `adds` ids into
+        // `survivors`: at the end only (strict) or anywhere (weakened).
+        fn arrangements<'a>(
+            survivors: &[&'a str],
+            adds: &[&'a str],
+            append_only: bool,
+        ) -> Vec<Vec<&'a str>> {
+            let mut acc = vec![survivors.to_vec()];
+            for add in adds {
+                let mut next = Vec::new();
+                for s1 in &acc {
+                    let positions = if append_only {
+                        s1.len()..=s1.len()
+                    } else {
+                        0..=s1.len()
+                    };
+                    for pos in positions {
+                        let mut v = s1.clone();
+                        v.insert(pos, add);
+                        next.push(v);
+                    }
+                }
+                acc = next;
+            }
+            acc
+        }
+
+        for append_only in [true, false] {
+            let mut cases = 0u32;
+            let mut masked = 0u32;
+            for archived_len in 0..=archived_ids.len() {
+                let s0 = &archived_ids[..archived_len];
+                let archived_live: HashSet<String> = s0.iter().map(|s| s.to_string()).collect();
+                for deleted_mask in 0u32..(1 << archived_len) {
+                    let survivors: Vec<&str> = s0
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| deleted_mask & (1 << i) == 0)
+                        .map(|(_, id)| *id)
+                        .collect();
+                    let deletions = archived_len - survivors.len();
+                    for adds in 0..=add_ids.len() {
+                        for s1 in arrangements(&survivors, &add_ids[..adds], append_only) {
+                            for k in 0..=s1.len() {
+                                cases += 1;
+                                let tail = &s1[s1.len() - k..];
+                                let fully_observed = k == s1.len();
+                                let verdict = tail_conservation(
+                                    &archived_live,
+                                    s1.len() as i64,
+                                    tail,
+                                    fully_observed,
+                                );
+                                // Ground truth: a tail-hit apply keeps every
+                                // archived row (no sweep) and upserts the tail.
+                                let mut after: HashSet<&str> = s0.iter().copied().collect();
+                                after.extend(tail);
+                                let live: HashSet<&str> = s1.iter().copied().collect();
+                                let sound = after == live;
+                                let tail_set: HashSet<&str> = tail.iter().copied().collect();
+                                let adds_outside_tail = add_ids[..adds]
+                                    .iter()
+                                    .filter(|id| !tail_set.contains(**id))
+                                    .count();
+                                match verdict {
+                                    TailVerdict::Hit if !sound => {
+                                        masked += 1;
+                                        assert!(
+                                            !append_only,
+                                            "STRICT-MODEL false hit: archived={s0:?} \
+                                             deleted_mask={deleted_mask:b} s1={s1:?} k={k}"
+                                        );
+                                        assert!(
+                                            !fully_observed
+                                                && deletions > 0
+                                                && deletions == adds_outside_tail,
+                                            "UNDOCUMENTED false hit: archived={s0:?} \
+                                             deleted_mask={deleted_mask:b} s1={s1:?} k={k}"
+                                        );
+                                    }
+                                    TailVerdict::Escalate(reason)
+                                        if append_only
+                                            && deletions == 0
+                                            && (fully_observed
+                                                || tail
+                                                    .iter()
+                                                    .any(|t| archived_live.contains(*t))) =>
+                                    {
+                                        panic!(
+                                            "over-escalation ({reason}): archived={s0:?} \
+                                             s1={s1:?} k={k}"
+                                        );
+                                    }
+                                    TailVerdict::Hit if deletions > 0 && adds == 0 => {
+                                        panic!(
+                                            "a pure deletion balanced?! archived={s0:?} \
+                                             deleted_mask={deleted_mask:b} k={k}"
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if append_only {
+                assert_eq!(cases, 333, "the strict model space ran, none skipped");
+                assert_eq!(masked, 0, "under the preconditions the inference is exact");
+            } else {
+                assert_eq!(cases, 2080, "the weakened model space ran, none skipped");
+                assert!(
+                    masked > 0,
+                    "the documented tolerance is reachable, not vacuous"
+                );
+            }
+        }
+    }
+
+    // upsert_pr reads old_cols[17] as `truncated` for the TailHit carry —
+    // the one place a positional column index feeds a DECISION rather
+    // than the uniform diff. Pin the position against the SELECT text
+    // itself so a column reorder fails here, not silently in the carry
+    // (B3 panel, S3).
+    #[test]
+    fn upsert_pr_truncated_column_position_is_pinned() {
+        let cols: Vec<&str> = PR_SELECT
+            .trim_start_matches("SELECT ")
+            .split(" FROM ")
+            .next()
+            .unwrap()
+            .split(',')
+            .map(str::trim)
+            .collect();
+        // cols[0] is pk (not part of old_cols); old_cols[i] = cols[i + 1].
+        assert_eq!(cols.len(), 21, "the 1..20 read loop spans every column");
+        assert_eq!(cols[18], "truncated", "old_cols[17] must be truncated");
+    }
+
+    // The check's degenerate arms, pinned individually: the discriminating
+    // inputs are named so a regression names its arm.
+    #[test]
+    fn tail_conservation_arm_pins() {
+        let arch: HashSet<String> = ["a".to_string()].into();
+        // Duplicate id across pages: the connection moved under the walk.
+        assert_eq!(
+            tail_conservation(&arch, 2, &["n", "n"], false),
+            TailVerdict::Escalate("duplicate tail id")
+        );
+        // Negative count is API nonsense, not arithmetic fodder.
+        assert_eq!(
+            tail_conservation(&arch, -1, &[], true),
+            TailVerdict::Escalate("negative totalCount")
+        );
+        // Partial observation without an anchor never hits, even balanced:
+        // 1 archived + 1 new == 2, but nothing ties the suffix to the
+        // archive (round-0: no induction base).
+        assert_eq!(
+            tail_conservation(&arch, 2, &["n"], false),
+            TailVerdict::Escalate("no induction anchor")
+        );
+        // The fully-observed degenerate case: same shape, but the walk
+        // reached the connection's start — balance alone proves
+        // archived ⊆ fetched, and there is no middle to induct over.
+        assert_eq!(
+            tail_conservation(&arch, 2, &["a", "n"], true),
+            TailVerdict::Hit
+        );
+        // Zero comments before and after: fully observed, trivially
+        // balanced — the arm that keeps comment-less PRs on one call.
+        assert_eq!(
+            tail_conservation(&HashSet::new(), 0, &[], true),
+            TailVerdict::Hit
+        );
+        // An archived id deleted upstream, fully observed: the count
+        // drops, the imbalance forces the walk that sweeps.
+        assert_eq!(
+            tail_conservation(&arch, 0, &[], true),
+            TailVerdict::Escalate("count imbalance")
         );
     }
 }

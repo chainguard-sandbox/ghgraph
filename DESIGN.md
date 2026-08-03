@@ -139,11 +139,14 @@ new or edited ids (GitHub prices GraphQL by node count, not field — the
 skeleton saves bytes, the tail saves points, and a single-page PR costs
 exactly one call). A tail fetch never constructs a witness, so it can never
 sweep or stamp `verified_at`; the check's preconditions and its two masked
-cases (a deletion offset by equal non-tail-visible adds; a body edit in
-the un-fetched middle — both fall to re-verify, whose reach for
-closed/merged PRs is bounded by the lookback) are stated beside the check
-in src/sync.rs, together with the obligations the round-0 spec audit
-added: a third completeness state for tail hits, the one-document
+cases (a body edit in the un-fetched middle; a deletion offset by equal
+non-tail-visible adds — the latter reachable only when creation order
+fails, e.g. a backdated import: the exhaustive model enumeration at the
+check proves the id arithmetic exact under the order precondition and
+confines an order violation's false passes to exactly that shape — both
+fall to re-verify, whose reach for closed/merged PRs is bounded by the
+lookback) are stated beside the check in src/sync.rs, together with the
+obligations the round-0 spec audit added: a third completeness state for tail hits, the one-document
 count+tail rule, the zero-overlap escalation, the structural
 witnessed-baseline dispatch gate, and the minimized-comments counting
 fixture as the enablement gate. Quiet mutations the

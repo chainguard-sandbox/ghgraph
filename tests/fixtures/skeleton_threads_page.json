@@ -1,0 +1,45 @@
+{
+  "data": {
+    "node": {
+      "reviewThreads": {
+        "nodes": [
+          {
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "__typename": "Bot",
+                    "databaseId": 175728472,
+                    "login": "copilot-pull-request-reviewer"
+                  },
+                  "authorAssociation": "CONTRIBUTOR",
+                  "createdAt": "2026-07-13T10:07:45Z",
+                  "id": "PRRC_kwDODKw3uc7UxfCI",
+                  "isMinimized": false,
+                  "lastEditedAt": null,
+                  "url": "https://github.com/cli/cli/pull/13864#discussion_r3569741960"
+                }
+              ],
+              "totalCount": 1
+            },
+            "id": "PRRT_kwDODKw3uc6QWWXy",
+            "isOutdated": true,
+            "isResolved": true,
+            "line": null,
+            "path": "pkg/cmd/skills/update/update.go"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wNy0xM1QxMDowNzo0NVrOkFll8g==",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      }
+    },
+    "rateLimit": {
+      "cost": 1,
+      "remaining": 4912,
+      "resetAt": "2026-08-03T16:07:07Z"
+    }
+  }
+}
