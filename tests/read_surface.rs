@@ -887,6 +887,164 @@ fn query_reads_stdin_when_dashed() {
 }
 
 #[test]
+fn query_reads_stdin_when_piped_without_argument() {
+    // Absent argument + piped stdin is the second stdin form ("-" is the
+    // first); the terminal check must only fire when there is genuinely no
+    // SQL anywhere (the && ↔ || mutant this discriminates).
+    let s = Scratch::new();
+    seed(&s);
+    standard_config(&s);
+    let out = {
+        use std::io::Write;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ghgraph"))
+            .arg("--config")
+            .arg(s.config_path())
+            .arg("query")
+            .current_dir(&s.dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"SELECT COUNT(*) FROM prs")
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    assert_eq!(out.status.code(), Some(0));
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["rows"], json!([[6]]));
+}
+
+#[test]
+fn harness_reverse_selects_pragma_is_live() {
+    // The determinism harness itself: every run in this suite sets
+    // GHGRAPH_TEST_REVERSE_SELECTS=1, and the pragma must actually be ON in
+    // the connection the verbs use — otherwise every golden here is passing
+    // by physical row order, not by ORDER BY, and the suite proves nothing.
+    let s = Scratch::new();
+    seed(&s);
+    standard_config(&s);
+    let doc = s.run_ok(&["query", "PRAGMA reverse_unordered_selects"]);
+    assert_eq!(doc["rows"], json!([[1]]), "the hook must reach the reader");
+}
+
+#[test]
+fn meta_project_repo_missing_issue_stream_is_pending() {
+    // A project-scope repo whose stored PR-stream fingerprint MATCHES the
+    // loaded config but whose issue stream has not synced yet: the next
+    // sync adds a stream, so the config is pending — the expected-stream
+    // set is part of the fingerprint comparison, not a separate truth.
+    let s = Scratch::new();
+    {
+        let arch = db::open_rw(&s.db_path()).unwrap();
+        arch.conn()
+            .execute(
+                "INSERT INTO sync_state (repo, stream, last_item_updated_at, last_checked_at, \
+                                         runs_since_advance, fingerprint) \
+                 VALUES ('octo/beta', 'pr', '2026-01-04T00:00:00Z', '2026-01-04T00:10:00Z', 0, \
+                         '{\"bots\":false,\"exclude_authors\":[],\"lookback_days\":90,\
+                           \"people\":[],\"scope\":\"project\",\"viewer\":\"\"}')",
+                [],
+            )
+            .unwrap();
+    }
+    s.write_config(&json!({
+        "viewer": "me",
+        "repos": [{"repo": "octo/beta", "scope": "project"}],
+    }));
+    let doc = s.run_ok(&["prs"]);
+    let entry = &doc["_meta"]["archive"][0];
+    assert_eq!(entry["config_pending"], json!(true), "{entry}");
+    // And the same repo with BOTH streams present reads settled.
+    {
+        let arch = db::open_rw(&s.db_path()).unwrap();
+        arch.conn()
+            .execute(
+                "INSERT INTO sync_state (repo, stream, last_item_updated_at, last_checked_at, \
+                                         runs_since_advance, fingerprint) \
+                 VALUES ('octo/beta', 'issue', '2026-01-04T00:00:00Z', '2026-01-04T00:10:00Z', \
+                         0, '{\"bots\":false,\"exclude_authors\":[],\"lookback_days\":90,\
+                              \"people\":[],\"scope\":\"project\",\"viewer\":\"\"}')",
+                [],
+            )
+            .unwrap();
+    }
+    let doc = s.run_ok(&["prs"]);
+    let entry = &doc["_meta"]["archive"][0];
+    assert_eq!(entry["config_pending"], json!(false), "{entry}");
+}
+
+#[test]
+fn meta_disclosed_fingerprint_prefers_pr_stream() {
+    // Streams disagree only in transitional states; the 'pr' stream's
+    // stored fingerprint stands for the repo (and config_pending is already
+    // true). The lookback_days value is the discriminator.
+    let s = Scratch::new();
+    {
+        let arch = db::open_rw(&s.db_path()).unwrap();
+        for (stream, days) in [("issue", 30), ("pr", 90)] {
+            arch.conn()
+                .execute(
+                    "INSERT INTO sync_state (repo, stream, last_item_updated_at, \
+                                             last_checked_at, runs_since_advance, fingerprint) \
+                     VALUES ('octo/beta', ?1, '2026-01-04T00:00:00Z', '2026-01-04T00:10:00Z', \
+                             0, ?2)",
+                    rusqlite::params![
+                        stream,
+                        format!(
+                            "{{\"bots\":false,\"exclude_authors\":[],\"lookback_days\":{days},\
+                              \"people\":[],\"scope\":\"project\",\"viewer\":\"\"}}"
+                        )
+                    ],
+                )
+                .unwrap();
+        }
+    }
+    s.write_config(&json!({
+        "viewer": "me",
+        "repos": [{"repo": "octo/beta", "scope": "project"}],
+    }));
+    let doc = s.run_ok(&["prs"]);
+    let entry = &doc["_meta"]["archive"][0];
+    assert_eq!(entry["fingerprint"]["lookback_days"], json!(90), "{entry}");
+}
+
+#[test]
+fn pr_bare_number_resolves_via_cwd_remote() {
+    // The success path of the git-remote fallback: a clone whose origin
+    // names github.com resolves a bare number without --repo. The remote
+    // value is attacker-chosen content — this test is the benign half; the
+    // hostile half lives in the remote_url fuzz target and unit table.
+    let s = Scratch::new();
+    seed(&s);
+    standard_config(&s);
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(&s.dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("git present in dev/CI environments")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["remote", "add", "origin", "git@github.com:OCTO/Alpha.git"]);
+    let doc = s.run_ok(&["pr", "1"]);
+    assert_eq!(
+        doc["pr"]["repo"],
+        json!("octo/alpha"),
+        "case-folded via the remote"
+    );
+    assert_eq!(doc["pr"]["number"], json!(1));
+}
+
+#[test]
 fn search_syntax_error_is_user_input() {
     let s = Scratch::new();
     seed(&s);

@@ -320,6 +320,12 @@ fn migrate_v1_to_v2(conn: &mut Connection, path: &Path) -> Result<()> {
 /// drift. `migrate` handles v == 0 by applying the schema, so the v == 0 message
 /// here is reached only from `open_ro`.
 fn wrong_version(path: &Path, v: i64) -> Error {
+    // Mutation note: the < and > below have equivalent mutants (<= / >=):
+    // their boundary values are unreachable — v == 0 is consumed by the arm
+    // above, and v == SCHEMA_VERSION never reaches this function (open_ro
+    // calls it only on a version mismatch; migrate's arms consume the rest).
+    // Documented per the triage rule rather than chased with a test that
+    // could only assert the unreachable.
     let detail = if v == 0 {
         "empty or not a ghgraph archive — run `ghgraph sync` first".to_string()
     } else if v < 0 {

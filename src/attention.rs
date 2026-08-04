@@ -574,6 +574,28 @@ mod tests {
             ),
             Some(WaitingOn::Me)
         );
+        // Participation must be SUBSTANTIVE: a viewer comment that was
+        // minimized (or deleted) does not seat them in the thread — the
+        // filter applies to viewer_spoke exactly as it does to last-speaker
+        // (the && ↔ || mutant this discriminates).
+        assert_eq!(
+            waiting_on(
+                "me",
+                Some("author"),
+                false,
+                &[c(Some("me"), true, false), c(Some("them"), false, false)]
+            ),
+            None
+        );
+        assert_eq!(
+            waiting_on(
+                "me",
+                Some("author"),
+                false,
+                &[c(Some("me"), false, true), c(Some("them"), false, false)]
+            ),
+            None
+        );
     }
 
     #[test]

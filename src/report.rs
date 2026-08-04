@@ -952,7 +952,7 @@ fn meta(cfg: &Config, conn: &Connection) -> Result<Value> {
                         // negative age; clamp and let stale stay false.
                         .map(|t| (now.epoch() - t.epoch()).max(0))
                 });
-                let stale = age.is_none_or(|a| a > STALE_AFTER_SECS);
+                let stale = stale_at(age);
                 any_stale |= stale;
                 json!({
                     "stream": s.stream,
@@ -1012,11 +1012,22 @@ fn elide(body: &str, max: Option<usize>) -> (String, bool) {
     if body.len() <= max {
         return (body.to_string(), false);
     }
-    let mut end = max;
-    while !body.is_char_boundary(end) {
-        end -= 1;
-    }
+    // Bounded search, not a mutable countdown: boundary 0 always exists, so
+    // find() is total by construction and the mutant class that breaks loop
+    // progress (Makefile, the mutants target's OOM note) has nothing to
+    // break.
+    let end = (0..=max)
+        .rev()
+        .find(|&i| body.is_char_boundary(i))
+        .expect("0 is always a char boundary");
     (body[..end].to_string(), true)
+}
+
+/// A stream is stale strictly beyond [`STALE_AFTER_SECS`], or when never
+/// checked (None). Pure, so the boundary second is pinnable — `meta`'s ages
+/// come from now(), which no test can hold still.
+fn stale_at(age_seconds: Option<i64>) -> bool {
+    age_seconds.is_none_or(|a| a > STALE_AFTER_SECS)
 }
 
 struct CommentDocs {
@@ -1137,14 +1148,36 @@ fn cwd_github_repo() -> Option<RepoName> {
 /// `https://github.com/owner/name`, each with an optional `.git`. Anything
 /// else is None, never a guess — the value is validated by RepoName like
 /// every identifier.
-fn github_repo_from_remote_url(url: &str) -> Option<RepoName> {
+///
+/// `pub` as a verification seam only (like gh::scrub_tokens): the input is
+/// attacker-chosen (a cloned repo's .git/config), so the fuzz harness
+/// hammers host pinning and totality from outside the crate. Not CLI
+/// surface.
+pub fn github_repo_from_remote_url(url: &str) -> Option<RepoName> {
     let path = url
         .strip_prefix("git@github.com:")
         .or_else(|| url.strip_prefix("ssh://git@github.com/"))
         .or_else(|| url.strip_prefix("https://github.com/"))?;
-    let path = path.strip_suffix(".git").unwrap_or(path);
     let path = path.strip_suffix('/').unwrap_or(path);
-    RepoName::new(path).ok()
+    // The .git strip is case-INsensitive, and a name that still ends in
+    // ".git" after it is rejected outright: github.com forbids repo names
+    // ending in .git, so such a path names nothing real — and admitting it
+    // would break round-trip identity (the fuzz counterexample that forced
+    // this: "Owner/x…giT" folds to a .git-suffixed name that re-parses
+    // differently). That naming rule is enforced HERE, at the URL boundary,
+    // not in RepoName: the identity gate is the injection charset, not
+    // github.com's full naming policy (identity.rs).
+    let path = match path.len().checked_sub(4) {
+        Some(cut) if path.is_char_boundary(cut) && path[cut..].eq_ignore_ascii_case(".git") => {
+            &path[..cut]
+        }
+        _ => path,
+    };
+    let repo = RepoName::new(path).ok()?;
+    if repo.as_str().ends_with(".git") {
+        return None;
+    }
+    Some(repo)
 }
 
 /// One SQL value → JSON, losslessly (module docs carry the rationale for
@@ -1257,6 +1290,7 @@ mod tests {
         for url in [
             "git@github.com:Owner/Repo.git",
             "git@github.com:Owner/Repo",
+            "git@github.com:Owner/Repo.GIT", // the suffix strips per case-fold
             "ssh://git@github.com/Owner/Repo.git",
             "https://github.com/Owner/Repo",
             "https://github.com/Owner/Repo.git",
@@ -1271,6 +1305,11 @@ mod tests {
             "https://github.com/owner",               // no repo
             "https://github.com/owner/repo/extra",    // trailing path
             "git@github.com:owner/repo;rm -rf /",     // injection shape
+            // github.com forbids repo names ending in .git; admitting one
+            // breaks round-trip identity (the fuzz counterexample — see the
+            // parser). The .giT form is the exact crash input's shape.
+            "git@github.com:owner/repo.git.git",
+            "git@github.com:owner/repo.giT.git",
             "",
         ] {
             assert!(
@@ -1329,6 +1368,16 @@ mod tests {
             sql_value_to_json(ValueRef::Blob(&[0xde, 0xad])),
             json!({"$blob": "dead"})
         );
+    }
+
+    #[test]
+    fn stale_boundary_is_exact() {
+        // Strictly beyond 24h — checked at 86400s even is NOT stale (the
+        // discriminating second for the > vs >= mutant); never checked is.
+        assert!(!stale_at(Some(0)));
+        assert!(!stale_at(Some(STALE_AFTER_SECS)));
+        assert!(stale_at(Some(STALE_AFTER_SECS + 1)));
+        assert!(stale_at(None));
     }
 
     #[test]
