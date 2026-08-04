@@ -55,7 +55,7 @@
 //!           author_assoc, state, draft, base_ref, head_ref, head_sha,
 //!           created_at, updated_at, merged_at, closed_at, deleted_at,
 //!           review_decision, effective_review_state, truncated, verified_at,
-//!           reviews:  [ { reviewer, state, submitted_at, stale } ],
+//!           reviews:  [ { reviewer, state, submitted_at, freshness } ],
 //!           review_requests: [ { reviewer, kind } ],
 //!           threads:  [ { id, path, line, resolved, outdated, waiting_on,
 //!                         comments: [ ... ] } ],
@@ -67,8 +67,10 @@
 //! ```
 //!
 //!   `waiting_on` ∈ "me" | "them" | null and `effective_review_state` /
-//!   `reviews[].stale` (true/false/null — null is honest unknown) are
-//!   attention.rs derivations; this module only queries and serializes.
+//!   `reviews[].freshness` ("fresh" | "stale" | "unknown" — an explicit
+//!   enum, never a nullable boolean; the unknown case must not be
+//!   truth-testable by accident) are attention.rs derivations; this module
+//!   only queries and serializes.
 //!   `author_id` stays internal everywhere: identity plumbing, not a display
 //!   field (ROADMAP, freeze batch). `head_committed_at` also stays internal:
 //!   the derived staleness fields carry its meaning.
@@ -104,7 +106,7 @@ use rusqlite::Connection;
 use rusqlite::types::ValueRef;
 use serde_json::{Map, Value, json};
 
-use crate::attention::{self, PushBounds, ReviewFreshness, ReviewSignal, ThreadComment};
+use crate::attention::{self, PushBounds, ReviewSignal, ThreadComment};
 use crate::config::Config;
 use crate::db::{self, RoArchive};
 use crate::error::{Error, Result};
@@ -146,14 +148,17 @@ pub fn prs(
         .map(|a| crate::identity::Login::new(a).map_err(|e| Error::user(format!("--author: {e}"))))
         .transpose()?;
     let archive = open(cfg)?;
-    let conn = archive.conn();
+    let conn = read_snapshot(&archive)?;
+    let conn = &*conn;
 
     // Filters and defaults in ONE where-clause, shared by the count and the
-    // page, so the disclosed total can never disagree with the rows. The
-    // default hides soft-deleted rows (an upstream-deleted PR is not open
-    // work); --all shows everything, deleted_at disclosed. --author matches
-    // by login_eq semantics: logins are ASCII, so COLLATE NOCASE (ASCII-only
-    // in stock SQLite) is the same equivalence (identity.rs).
+    // page, AND one snapshot around both (read_snapshot) — the predicate
+    // makes the total and the rows agree in space, the transaction makes
+    // them agree in time; either alone over-promises. The default hides
+    // soft-deleted rows (an upstream-deleted PR is not open work); --all
+    // shows everything, deleted_at disclosed. --author matches by login_eq
+    // semantics: logins are ASCII, so COLLATE NOCASE (ASCII-only in stock
+    // SQLite) is the same equivalence (identity.rs).
     const WHERE: &str = "(?1 IS NULL OR repo = ?1) \
          AND (?2 IS NULL OR author = ?2 COLLATE NOCASE) \
          AND (?3 OR (state = 'OPEN' AND deleted_at IS NULL))";
@@ -232,7 +237,8 @@ pub fn pr(
 ) -> Result<Value> {
     let (repo, number) = resolve_pr_ref(reference, repo)?;
     let archive = open(cfg)?;
-    let conn = archive.conn();
+    let conn = read_snapshot(&archive)?;
+    let conn = &*conn;
 
     let row = conn
         .query_row(
@@ -354,16 +360,18 @@ pub fn pr(
             reviews
                 .iter()
                 .map(|(author, state, at)| {
-                    let stale = match attention::review_freshness(at, &bounds) {
-                        ReviewFreshness::Fresh => Value::Bool(false),
-                        ReviewFreshness::Stale => Value::Bool(true),
-                        ReviewFreshness::Unknown => Value::Null,
-                    };
+                    // A string enum, not a nullable boolean (C1 panel, S3):
+                    // `_meta.streams[].stale` is a plain boolean, and a
+                    // same-named tri-state field one verb over invites a
+                    // consumer to treat null as falsy — parsing "unknown"
+                    // as "fresh", the polarity inversion at their layer
+                    // instead of ours. The explicit third value cannot be
+                    // truth-tested by accident.
                     json!({
                         "reviewer": author,
                         "state": state,
                         "submitted_at": at,
-                        "stale": stale,
+                        "freshness": attention::review_freshness(at, &bounds).as_str(),
                     })
                 })
                 .collect(),
@@ -521,7 +529,8 @@ pub fn pr(
 
 pub fn search(cfg: &Config, query: &str, limit: usize) -> Result<Value> {
     let archive = open(cfg)?;
-    let conn = archive.conn();
+    let conn = read_snapshot(&archive)?;
+    let conn = &*conn;
 
     // (kind, repo, number) → group. BTreeMap gives the dedupe; the final
     // order is recency (module docs) applied after collection.
@@ -703,7 +712,8 @@ pub fn query(cfg: &Config, sql: Option<&str>, limit: usize) -> Result<Value> {
     }
 
     let archive = open(cfg)?;
-    let conn = archive.conn();
+    let conn = read_snapshot(&archive)?;
+    let conn = &*conn;
     let mut stmt = match conn.prepare(&sql) {
         Ok(stmt) => stmt,
         Err(rusqlite::Error::MultipleStatement) => {
@@ -756,11 +766,17 @@ pub fn query(cfg: &Config, sql: Option<&str>, limit: usize) -> Result<Value> {
 
 pub fn stats(cfg: &Config) -> Result<Value> {
     let archive = open(cfg)?;
-    let conn = archive.conn();
+    let conn = read_snapshot(&archive)?;
+    let conn = &*conn;
 
     // Audits (orphans, observation chain, FTS integrity, watermark
     // assertion) are PLANNED (milestone 5, hardening) — this is the count
     // surface they will land beside.
+    //
+    // The format! below interpolates TABLE NAMES — admissible only because
+    // the names come from this literal array and nowhere else. Never add a
+    // computed or user-supplied entry here; user-named tables go through
+    // `query`, whose gates exist for exactly that.
     let mut counts = Map::new();
     for table in [
         "comments",
@@ -851,6 +867,25 @@ pub fn stats(cfg: &Config) -> Result<Value> {
 
 fn open(cfg: &Config) -> Result<RoArchive> {
     db::open_ro(&cfg.db_path()?)
+}
+
+/// One WAL snapshot for one whole document (C1 panel, S1). Outside a
+/// transaction every statement acquires its own WAL read mark, so a
+/// concurrent sync could commit between a verb's statements and the
+/// document would disagree with itself — returned > total is the smallest
+/// counterexample, a count-vs-page drift under an MCP background sync the
+/// realistic one. Every verb therefore runs ALL its reads (counts, pages,
+/// children, `_meta`) inside one deferred transaction: readers don't block
+/// the writer under WAL, and the writer doesn't move this snapshot.
+/// `unchecked_transaction` because RoArchive hands out `&Connection` —
+/// rusqlite's `&mut` requirement guards writer misuse this connection
+/// cannot express (read-only + query_only, db.rs). Dropped un-committed on
+/// every path: a read transaction has nothing to commit.
+fn read_snapshot(archive: &RoArchive) -> Result<rusqlite::Transaction<'_>> {
+    archive
+        .conn()
+        .unchecked_transaction()
+        .map_err(classify_ours)
 }
 
 /// The `_meta` header (module docs). One entry per repo in the UNION of the
@@ -1237,17 +1272,34 @@ fn classify_ours(e: rusqlite::Error) -> Error {
 }
 
 /// Failures while running USER-supplied text (`query` SQL, `search` MATCH):
-/// the user can fix their statement, so USER_INPUT — except busy, which is
-/// the environment's to fix. The sqlite message names the syntax problem
-/// without this code ever interpolating archive content.
+/// the user can fix their statement, so USER_INPUT — except busy (the
+/// environment's to fix) and a corrupt archive (the operator's; C1 panel,
+/// S2). The corrupt arm matters because execution-time errors are a MIXED
+/// stream: an FTS5 syntax error in the user's MATCH surfaces at step time —
+/// i.e. inside the row-collect loop, exactly where a corruption error would
+/// — so the site cannot classify by position, only by code. (The panel's
+/// synthesis proposed flipping the collect site to classify_ours wholesale;
+/// that would relabel the user's own FTS typo "file a ghgraph bug" and
+/// break the pinned search_syntax_error_is_user_input — the per-code arm
+/// here is the fix that survives both tests.) The sqlite message names the
+/// syntax problem without this code ever interpolating archive content.
 fn classify_user_query(e: rusqlite::Error) -> Error {
-    if let rusqlite::Error::SqliteFailure(err, _) = &e
-        && matches!(
+    if let rusqlite::Error::SqliteFailure(err, _) = &e {
+        if matches!(
             err.code,
             rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-        )
-    {
-        return Error::transient(format!("archive is busy: {e}"));
+        ) {
+            return Error::transient(format!("archive is busy: {e}"));
+        }
+        if matches!(
+            err.code,
+            rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+        ) {
+            return Error::config(format!(
+                "archive is corrupt: {e} — the archive is a disposable cache; \
+                 remove it and resync"
+            ));
+        }
     }
     Error::user(format!("query failed: {e}"))
 }
@@ -1367,6 +1419,78 @@ mod tests {
         assert_eq!(
             sql_value_to_json(ValueRef::Blob(&[0xde, 0xad])),
             json!({"$blob": "dead"})
+        );
+    }
+
+    /// The mechanism behind read_snapshot (C1 panel, S1): inside one
+    /// deferred transaction on the read connection, a concurrent writer's
+    /// committed rows stay invisible — so a verb's count and page cannot
+    /// disagree in time. Two real connections on one WAL archive; the
+    /// interleaving is explicit where an integration test could only race.
+    #[test]
+    fn read_snapshot_pins_one_wal_view_across_statements() {
+        let dir = std::env::temp_dir().join(format!("ghgraph-snap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("a/ghgraph.db");
+        let rw = db::open_rw(&path).unwrap();
+        rw.conn()
+            .execute_batch(
+                "INSERT INTO prs (id, repo, number, title, state, created_at, updated_at, url) \
+                 VALUES ('n1', 'o/r', 1, 't', 'OPEN', '2026-01-01T00:00:00Z', \
+                         '2026-01-01T00:00:00Z', 'u1')",
+            )
+            .unwrap();
+
+        let ro = db::open_ro(&path).unwrap();
+        let tx = read_snapshot(&ro).unwrap();
+        let count = |c: &Connection| -> i64 {
+            c.query_row("SELECT COUNT(*) FROM prs", [], |r| r.get(0))
+                .unwrap()
+        };
+        // First read materializes the snapshot; the writer then commits.
+        assert_eq!(count(&tx), 1);
+        rw.conn()
+            .execute_batch(
+                "INSERT INTO prs (id, repo, number, title, state, created_at, updated_at, url) \
+                 VALUES ('n2', 'o/r', 2, 't', 'OPEN', '2026-01-01T00:00:00Z', \
+                         '2026-01-01T00:00:00Z', 'u2')",
+            )
+            .unwrap();
+        assert_eq!(count(&tx), 1, "the snapshot must not move mid-document");
+        drop(tx);
+        // A NEW snapshot (the next verb invocation) sees the commit.
+        let tx = read_snapshot(&ro).unwrap();
+        assert_eq!(count(&tx), 2);
+        drop(tx);
+        drop(ro);
+        drop(rw);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mixed execution-time stream behind classify_user_query (C1
+    /// panel, S2): one arm per actor, pinned like sync.rs's classifier.
+    #[test]
+    fn classify_user_query_names_the_actor_per_arm() {
+        use crate::error::Code;
+        let sqlite = |code: std::os::raw::c_int| {
+            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
+        };
+        assert_eq!(
+            classify_user_query(sqlite(rusqlite::ffi::SQLITE_BUSY)).code,
+            Code::Transient
+        );
+        let corrupt = classify_user_query(sqlite(rusqlite::ffi::SQLITE_CORRUPT));
+        assert_eq!(corrupt.code, Code::Configuration);
+        assert!(corrupt.message.contains("resync"), "{}", corrupt.message);
+        assert_eq!(
+            classify_user_query(sqlite(rusqlite::ffi::SQLITE_NOTADB)).code,
+            Code::Configuration
+        );
+        // The default arm is the user's own statement — an FTS5 syntax
+        // error surfaces as a plain SqliteFailure at step time.
+        assert_eq!(
+            classify_user_query(sqlite(rusqlite::ffi::SQLITE_ERROR)).code,
+            Code::UserInput
         );
     }
 

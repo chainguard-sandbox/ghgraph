@@ -169,14 +169,14 @@
     ],
     "reviews": [
       {
+        "freshness": "stale",
         "reviewer": "carol",
-        "stale": true,
         "state": "APPROVED",
         "submitted_at": "2026-01-01T06:00:00Z"
       },
       {
+        "freshness": "fresh",
         "reviewer": "bob",
-        "stale": false,
         "state": "APPROVED",
         "submitted_at": "2026-01-02T01:00:00Z"
       }

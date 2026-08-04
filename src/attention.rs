@@ -80,7 +80,8 @@ pub struct PushBounds<'a> {
 /// Did a review see the current head? Three-valued on purpose: the honest
 /// answer between the bounds is "unknown", and collapsing it either way is
 /// how a staleness derivation lies. Serialized by the `pr` verb as
-/// stale: true / false / null.
+/// freshness: "fresh" | "stale" | "unknown" (a string enum, never a
+/// nullable boolean — report.rs records why).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewFreshness {
     /// Provably postdates the last push (fresh-side bound + skew margin).
@@ -89,6 +90,17 @@ pub enum ReviewFreshness {
     Stale,
     /// Neither bound applies — degraded out of ready_to_merge by polarity.
     Unknown,
+}
+
+impl ReviewFreshness {
+    /// The wire spelling (`pr` verb).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewFreshness::Fresh => "fresh",
+            ReviewFreshness::Stale => "stale",
+            ReviewFreshness::Unknown => "unknown",
+        }
+    }
 }
 
 /// One review's freshness against the push bounds.
@@ -264,6 +276,11 @@ pub fn waiting_on(
     if is_resolved {
         return None;
     }
+    // Two Nones with different meanings meet at this `?`: find() returning
+    // None (no substantive comment at all → the thread demands nothing,
+    // return) vs a substantive comment whose AUTHOR is None (a ghost spoke
+    // last → last_speaker = None proceeds, and a ghost can never login_eq
+    // the viewer, so it counts as the other party below).
     let last_speaker = comments
         .iter()
         .rev()
@@ -484,6 +501,76 @@ mod tests {
             effective_review_state(&[], &full),
             EffectiveReviewState::Unreviewed
         );
+    }
+
+    /// ∀ over ordered two-reviewer panels: 3 states × 3 freshness classes
+    /// per reviewer = 81 pairs, checked against an independent count-based
+    /// oracle restating the doc rules. The implementation short-circuits on
+    /// the first standing CR (order-dependent structure); the oracle is
+    /// order-independent — that structural difference is what makes this a
+    /// check and not a restatement, and multi-reviewer ordering bugs are
+    /// exactly what the four hand-picked pairs above cannot see.
+    #[test]
+    fn review_pairs_exhaustive_two_reviewers() {
+        let full = bounds(Some(COMMIT), Some(FLIP));
+        // MID: after COMMIT (not provably stale), before FLIP+margin (not
+        // provably fresh) — the Unknown class.
+        const MID: &str = "2026-02-01T00:30:00Z";
+        let states = ["APPROVED", "CHANGES_REQUESTED", "COMMENTED"];
+        let classes = [
+            (T0, ReviewFreshness::Stale),
+            (MID, ReviewFreshness::Unknown),
+            (AFTER, ReviewFreshness::Fresh),
+        ];
+        fn oracle(reviews: &[(&str, ReviewFreshness)]) -> EffectiveReviewState {
+            let standing_cr = reviews
+                .iter()
+                .any(|(s, f)| *s == "CHANGES_REQUESTED" && *f != ReviewFreshness::Stale);
+            let approvals = reviews.iter().filter(|(s, _)| *s == "APPROVED").count();
+            let fresh = reviews
+                .iter()
+                .filter(|(s, f)| *s == "APPROVED" && *f == ReviewFreshness::Fresh)
+                .count();
+            if standing_cr {
+                EffectiveReviewState::ChangesRequested
+            } else if approvals > 0 && fresh == approvals {
+                EffectiveReviewState::Approved
+            } else if approvals > 0 {
+                EffectiveReviewState::StaleApproval
+            } else {
+                EffectiveReviewState::Unreviewed
+            }
+        }
+        for s1 in states {
+            for (t1, f1) in classes {
+                for s2 in states {
+                    for (t2, f2) in classes {
+                        let reviews = [
+                            ReviewSignal {
+                                reviewer: "a",
+                                state: s1,
+                                submitted_at: t1,
+                            },
+                            ReviewSignal {
+                                reviewer: "b",
+                                state: s2,
+                                submitted_at: t2,
+                            },
+                        ];
+                        // The freshness classes themselves are pinned by
+                        // the review_freshness cases; assert them anyway so
+                        // a timestamp typo here fails loudly, not quietly.
+                        assert_eq!(review_freshness(t1, &full), f1);
+                        assert_eq!(review_freshness(t2, &full), f2);
+                        assert_eq!(
+                            effective_review_state(&reviews, &full),
+                            oracle(&[(s1, f1), (s2, f2)]),
+                            "({s1},{f1:?}) + ({s2},{f2:?})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // ---- waiting_on ------------------------------------------------------
