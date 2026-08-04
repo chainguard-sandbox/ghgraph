@@ -1,0 +1,5 @@
+[toolchain]
+# MSRV is 1.95 (rusqlite/libsqlite3-sys use std cfg_select!, stable since 1.95).
+# Pinned to the installed 1.97.1 so `make install`, `make check`, and CI all
+# use a toolchain that satisfies the MSRV — the machine default (1.94) does not.
+channel = "1.97.1"
