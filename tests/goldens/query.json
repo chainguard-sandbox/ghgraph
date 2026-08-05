@@ -1,0 +1,95 @@
+{
+  "_meta": {
+    "archive": [
+      {
+        "config_pending": false,
+        "fingerprint": {
+          "bots": true,
+          "exclude_authors": [],
+          "lookback_days": 90,
+          "people": [],
+          "scope": "working",
+          "viewer": "me"
+        },
+        "hint": "stale — run: ghgraph sync",
+        "repo": "octo/alpha",
+        "streams": [
+          {
+            "age_seconds": "<AGE>",
+            "last_checked_at": "2026-01-05T00:10:00Z",
+            "stale": true,
+            "stream": "pr"
+          }
+        ]
+      },
+      {
+        "config_pending": true,
+        "fingerprint": {
+          "bots": true,
+          "exclude_authors": [],
+          "lookback_days": 90,
+          "people": [],
+          "scope": "working",
+          "viewer": "me"
+        },
+        "hint": "stale — run: ghgraph sync",
+        "repo": "octo/beta",
+        "streams": [
+          {
+            "age_seconds": "<AGE>",
+            "last_checked_at": "2026-01-04T00:10:00Z",
+            "stale": true,
+            "stream": "pr"
+          }
+        ]
+      },
+      {
+        "config_pending": true,
+        "fingerprint": {
+          "bots": true,
+          "exclude_authors": [],
+          "lookback_days": 90,
+          "people": [],
+          "scope": "working",
+          "viewer": "me"
+        },
+        "hint": "stale — run: ghgraph sync",
+        "repo": "octo/gone",
+        "streams": [
+          {
+            "age_seconds": "<AGE>",
+            "last_checked_at": "2026-01-03T00:10:00Z",
+            "stale": true,
+            "stream": "pr"
+          }
+        ]
+      }
+    ],
+    "generated_at": "<TIME>",
+    "schema_version": 1
+  },
+  "columns": [
+    "repo",
+    "number",
+    "title"
+  ],
+  "row_count": 3,
+  "rows": [
+    [
+      "octo/alpha",
+      1,
+      "Harden the retry loop"
+    ],
+    [
+      "octo/alpha",
+      2,
+      "Retry the sync watchdog"
+    ],
+    [
+      "octo/alpha",
+      3,
+      "Sketch the issue stream"
+    ]
+  ],
+  "truncated_at_limit": true
+}

@@ -1,0 +1,139 @@
+{
+  "_meta": {
+    "archive": [
+      {
+        "config_pending": false,
+        "fingerprint": {
+          "bots": true,
+          "exclude_authors": [],
+          "lookback_days": 90,
+          "people": [],
+          "scope": "working",
+          "viewer": "me"
+        },
+        "hint": "stale — run: ghgraph sync",
+        "repo": "octo/alpha",
+        "streams": [
+          {
+            "age_seconds": "<AGE>",
+            "last_checked_at": "2026-01-05T00:10:00Z",
+            "stale": true,
+            "stream": "pr"
+          }
+        ]
+      },
+      {
+        "config_pending": true,
+        "fingerprint": {
+          "bots": true,
+          "exclude_authors": [],
+          "lookback_days": 90,
+          "people": [],
+          "scope": "working",
+          "viewer": "me"
+        },
+        "hint": "stale — run: ghgraph sync",
+        "repo": "octo/beta",
+        "streams": [
+          {
+            "age_seconds": "<AGE>",
+            "last_checked_at": "2026-01-04T00:10:00Z",
+            "stale": true,
+            "stream": "pr"
+          }
+        ]
+      },
+      {
+        "config_pending": true,
+        "fingerprint": {
+          "bots": true,
+          "exclude_authors": [],
+          "lookback_days": 90,
+          "people": [],
+          "scope": "working",
+          "viewer": "me"
+        },
+        "hint": "stale — run: ghgraph sync",
+        "repo": "octo/gone",
+        "streams": [
+          {
+            "age_seconds": "<AGE>",
+            "last_checked_at": "2026-01-03T00:10:00Z",
+            "stale": true,
+            "stream": "pr"
+          }
+        ]
+      }
+    ],
+    "generated_at": "<TIME>",
+    "schema_version": 1
+  },
+  "stats": {
+    "archive_schema_version": 2,
+    "counts": {
+      "comments": 11,
+      "issues": 2,
+      "observations": 2,
+      "prs": 6,
+      "quarantine": 1,
+      "refs": 4,
+      "review_requests": 2,
+      "review_threads": 3
+    },
+    "db_bytes": 188416,
+    "quarantine": [
+      {
+        "count": 1,
+        "next_retry_at": "2026-01-05T00:00:00Z",
+        "repo": "octo/beta"
+      }
+    ],
+    "sync_state": [
+      {
+        "fingerprint": {
+          "bots": true,
+          "exclude_authors": [],
+          "lookback_days": 90,
+          "people": [],
+          "scope": "working",
+          "viewer": "me"
+        },
+        "last_checked_at": "2026-01-05T00:10:00Z",
+        "last_item_updated_at": "2026-01-05T00:00:00Z",
+        "repo": "octo/alpha",
+        "runs_since_advance": 0,
+        "stream": "pr"
+      },
+      {
+        "fingerprint": {
+          "bots": true,
+          "exclude_authors": [],
+          "lookback_days": 90,
+          "people": [],
+          "scope": "working",
+          "viewer": "me"
+        },
+        "last_checked_at": "2026-01-04T00:10:00Z",
+        "last_item_updated_at": "2026-01-04T00:00:00Z",
+        "repo": "octo/beta",
+        "runs_since_advance": 2,
+        "stream": "pr"
+      },
+      {
+        "fingerprint": {
+          "bots": true,
+          "exclude_authors": [],
+          "lookback_days": 90,
+          "people": [],
+          "scope": "working",
+          "viewer": "me"
+        },
+        "last_checked_at": "2026-01-03T00:10:00Z",
+        "last_item_updated_at": "2026-01-03T00:00:00Z",
+        "repo": "octo/gone",
+        "runs_since_advance": 5,
+        "stream": "pr"
+      }
+    ]
+  }
+}

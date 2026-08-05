@@ -78,5 +78,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "remote_url"
+path = "fuzz_targets/remote_url.rs"
+test = false
+doc = false
+bench = false
+
 # Own workspace so the root `cargo build` never descends into the fuzz crate.
 [workspace]

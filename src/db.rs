@@ -42,13 +42,15 @@
 //!     regressed; an exotic umask that clears owner bits could make the archive
 //!     unwritable, which surfaces as a CONFIGURATION open error.
 //!
-//! Migrations: PRAGMA user_version. 0 → apply schema.sql → 1, schema apply and
-//! the version bump in ONE rusqlite-managed transaction, so a crash mid-apply
-//! rolls back to 0 and the next open retries from clean — the archive is never
-//! half-migrated. Every user_version value has a defined outcome (see
-//! `migrate`); a value we do not understand is refused, never guessed. Later
-//! versions are numbered fn(&mut Connection) steps, each bumping the pragma
-//! inside its own transaction. No schema_version table; the pragma is the record.
+//! Versioning: PRAGMA user_version. 0 → apply schema.sql (always the CURRENT
+//! shape) → SCHEMA_VERSION, schema apply and the version bump in ONE
+//! rusqlite-managed transaction, so a crash mid-apply rolls back to 0 and the
+//! next open retries from clean — the archive is never half-initialized.
+//! Every user_version value has a defined outcome (see `migrate`); a value
+//! we do not understand is refused, never guessed, and pre-release stamps
+//! are refused rather than migrated — the policy and its reversal point
+//! (the first released binary) are recorded at SCHEMA_VERSION. No
+//! schema_version table; the pragma is the record.
 
 use std::fs::{DirBuilder, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -66,7 +68,32 @@ use crate::error::{Error, Result};
 const SCHEMA: &str = include_str!("schema.sql");
 
 /// Current schema version, written to PRAGMA user_version after migration.
-pub const SCHEMA_VERSION: i64 = 1;
+/// This is the ARCHIVE version (a storage fact), not the output contract's
+/// `_meta.schema_version` (report.rs) — the archive can move without the
+/// output contract moving, which is exactly what v2 did (an added column
+/// feeds a derivation; no emitted field changed shape).
+///
+/// v2: prs.head_committed_at — the stale-side approval-staleness bound. The
+/// v1 schema's own comments claimed staleness "derives from committedDate",
+/// but v1 never stored it: parse.rs validated the field and the upsert
+/// dropped it.
+///
+/// MIGRATION POLICY, decided here so the machinery is not re-proposed every
+/// schema change: migrations begin at the first RELEASED binary — an
+/// archive someone cannot cheaply rebuild. Until then the archive is a
+/// disposable cache (that is already the corruption remedy's prose), so a
+/// pre-release schema change bumps this version and REFUSES older stamps
+/// with the remove-and-resync remedy, rather than carrying ALTER TABLE
+/// steps, their column-order constraints (an appended column must then stay
+/// last forever or `query` SELECT * forks by archive provenance), and the
+/// fixture archaeology their tests need. The bump itself is NOT optional:
+/// amending the schema in place under an unchanged version would let an
+/// old archive pass the version gate and then fail mid-verb with "no such
+/// column" classified INTERNAL — a lie about the actor. A v1→v2 ALTER
+/// TABLE migration existed briefly and was verified correct; it was deleted
+/// by this policy, not by a defect (the git history holds it if the first
+/// release ever needs the pattern back).
+pub const SCHEMA_VERSION: i64 = 2;
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 
@@ -169,6 +196,18 @@ pub fn open_ro(path: &Path) -> Result<RoArchive> {
     // query_only blocks writes the READ_ONLY flag alone would miss (ATTACH).
     conn.pragma_update(None, "query_only", true)
         .map_err(|e| sqlite_err(path, "cannot set query_only on", e))?;
+    // The determinism harness (golden tests, DESIGN.md Verification): with
+    // this env var set, SQLite reverses the row order of any SELECT that
+    // lacks a total ORDER BY, so a missing ORDER BY fails the golden diff
+    // instead of passing by physical-row-order luck. Live on the shipped
+    // path on purpose — the hook must exercise the very connection the read
+    // verbs use, and for contract-correct output the pragma is a no-op (it
+    // can reorder only what the contract never promised an order for), so
+    // an operator setting it can confuse only themselves, not the archive.
+    if std::env::var_os("GHGRAPH_TEST_REVERSE_SELECTS").is_some_and(|v| v == "1") {
+        conn.pragma_update(None, "reverse_unordered_selects", true)
+            .map_err(|e| sqlite_err(path, "cannot set reverse_unordered_selects on", e))?;
+    }
     let version = user_version(&conn, path)?;
     if version != SCHEMA_VERSION {
         return Err(wrong_version(path, version));
@@ -264,13 +303,13 @@ fn user_version(conn: &Connection, path: &Path) -> Result<i64> {
 /// unrecognized version is refused, not guessed.
 fn migrate(conn: &mut Connection, path: &Path) -> Result<()> {
     match user_version(conn, path)? {
-        0 => apply_v1(conn, path),
+        0 => apply_full(conn, path),
         v if v == SCHEMA_VERSION => Ok(()),
-        // Once SCHEMA_VERSION exceeds 1, insert the 0 < v < SCHEMA_VERSION arm
-        // here — PLANNED (milestone: whenever that happens): dispatch the ordered
-        // migration steps from v to SCHEMA_VERSION, each in its own transaction.
-        // Everything else (a newer archive, or a negative/foreign sentinel —
-        // SQLite accepts any i64 user_version) is refused, never guessed.
+        // Everything else — an older pre-release stamp (refused with the
+        // remove-and-resync remedy; migrations begin at the first release,
+        // see SCHEMA_VERSION), a newer archive, or a negative/foreign
+        // sentinel (SQLite accepts any i64 user_version) — is refused,
+        // never guessed.
         v => Err(wrong_version(path, v)),
     }
 }
@@ -281,6 +320,12 @@ fn migrate(conn: &mut Connection, path: &Path) -> Result<()> {
 /// drift. `migrate` handles v == 0 by applying the schema, so the v == 0 message
 /// here is reached only from `open_ro`.
 fn wrong_version(path: &Path, v: i64) -> Error {
+    // Mutation note: the < and > below have equivalent mutants (<= / >=):
+    // their boundary values are unreachable — v == 0 is consumed by the arm
+    // above, and v == SCHEMA_VERSION never reaches this function (open_ro
+    // calls it only on a version mismatch; migrate's arms consume the rest).
+    // Documented per the triage rule rather than chased with a test that
+    // could only assert the unreachable.
     let detail = if v == 0 {
         "empty or not a ghgraph archive — run `ghgraph sync` first".to_string()
     } else if v < 0 {
@@ -292,9 +337,12 @@ fn wrong_version(path: &Path, v: i64) -> Error {
     } else if v > SCHEMA_VERSION {
         format!("newer than this ghgraph (v{SCHEMA_VERSION}); upgrade ghgraph")
     } else {
-        // Only 0 < v < SCHEMA_VERSION reaches here — currently vacuous (v==1 is
-        // handled by migrate), reserved for when SCHEMA_VERSION exceeds 1.
-        format!("not one this ghgraph (v{SCHEMA_VERSION}) has a migration path for")
+        // 0 < v < SCHEMA_VERSION: a pre-release schema. Not migrated,
+        // by policy (SCHEMA_VERSION) — the archive is a disposable cache.
+        format!(
+            "a pre-release schema this ghgraph (v{SCHEMA_VERSION}) does not migrate — \
+             the archive is a disposable cache; remove it and resync"
+        )
     };
     Error::config(format!(
         "archive {} is at schema version {v}: {detail}",
@@ -302,13 +350,15 @@ fn wrong_version(path: &Path, v: i64) -> Error {
     ))
 }
 
-/// Apply the v1 schema and stamp user_version=1 atomically. The schema apply
-/// and the version bump run inside ONE rusqlite-managed transaction (schema.sql
-/// carries no BEGIN/COMMIT of its own; the only BEGINs there are trigger
-/// bodies), and PRAGMA user_version is transactional — so a crash between the
-/// last CREATE and the stamp rolls back to user_version=0 and the next open
-/// retries from clean.
-fn apply_v1(conn: &mut Connection, path: &Path) -> Result<()> {
+/// Apply the full current schema and stamp user_version=[`SCHEMA_VERSION`]
+/// atomically (schema.sql always describes the CURRENT shape; migrations exist
+/// for archives born under older ones). The schema apply and the version bump
+/// run inside ONE rusqlite-managed transaction (schema.sql carries no
+/// BEGIN/COMMIT of its own; the only BEGINs there are trigger bodies), and
+/// PRAGMA user_version is transactional — so a crash between the last CREATE
+/// and the stamp rolls back to user_version=0 and the next open retries from
+/// clean.
+fn apply_full(conn: &mut Connection, path: &Path) -> Result<()> {
     let cannot = |e: rusqlite::Error| sqlite_err(path, "cannot initialize archive", e);
     let tx = conn.transaction().map_err(cannot)?;
     tx.execute_batch(SCHEMA).map_err(cannot)?;
@@ -553,6 +603,39 @@ mod tests {
             .err()
             .expect("a version-0 foreign db must be refused");
         assert_eq!(err.code, crate::error::Code::Configuration);
+    }
+
+    #[test]
+    fn refuses_pre_release_schema_with_resync_remedy() {
+        // Pre-release stamps are refused, not migrated (the policy at
+        // SCHEMA_VERSION), and BOTH open paths must name the actionable
+        // remedy — the archive is a disposable cache, so the remedy is
+        // remove-and-resync, never a migration that does not exist. The
+        // shape behind the stamp is irrelevant: refusal happens at the
+        // version gate, before any statement could notice the columns.
+        let s = Scratch::new();
+        let path = s.join("ghgraph.db");
+        {
+            let _a = open_rw(&path).unwrap();
+        }
+        set_raw_user_version(&path, 1);
+        for (name, err) in [
+            (
+                "open_rw",
+                open_rw(&path).err().expect("open_rw must refuse v1"),
+            ),
+            (
+                "open_ro",
+                open_ro(&path).err().expect("open_ro must refuse v1"),
+            ),
+        ] {
+            assert_eq!(err.code, crate::error::Code::Configuration, "{name}");
+            assert!(
+                err.message.contains("remove it and resync"),
+                "{name} must carry the disposable-cache remedy, got: {}",
+                err.message
+            );
+        }
     }
 
     #[test]

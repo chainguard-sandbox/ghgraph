@@ -39,6 +39,19 @@ CREATE TABLE IF NOT EXISTS prs (
   head_ref        TEXT,
   base_ref        TEXT,
   head_sha        TEXT,                  -- last commit oid
+  head_committed_at TEXT,                -- the head commit's committedDate
+                                         -- (server time). The stale-side
+                                         -- staleness bound: push ≥ commit, so
+                                         -- an approval older than this
+                                         -- provably predates the push
+                                         -- (attention.rs owns the rule). Rides
+                                         -- with head_sha — same oid ⇒ same
+                                         -- committedDate — so it is diffed but
+                                         -- never separately observed. Author-
+                                         -- controlled clock: a backdated or
+                                         -- future-dated commit can only widen
+                                         -- staleness, degrading OUT of
+                                         -- ready_to_merge, never in
   last_pushed_at  TEXT,                  -- last head push (server time); an
                                          -- approval older than it is stale.
                                          -- NULL/unknown ordering degrades a PR
@@ -46,11 +59,11 @@ CREATE TABLE IF NOT EXISTS prs (
                                          -- No defined writer, DECIDED: the
                                          -- intended source (Commit.pushedDate)
                                          -- is deprecated upstream; staleness
-                                         -- derives from committedDate + the
-                                         -- observations head_sha flip row
-                                         -- instead (queries.rs HYDRATE_PR,
-                                         -- sync.rs OBSERVED). Stays NULL,
-                                         -- which fails closed
+                                         -- derives from head_committed_at
+                                         -- above + the observations head_sha
+                                         -- flip row instead (queries.rs
+                                         -- HYDRATE_PR, sync.rs OBSERVED).
+                                         -- Stays NULL, which fails closed
   review_decision TEXT,                  -- raw API value; never trusted alone
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL,

@@ -147,16 +147,16 @@ pub fn backfill_terms(
 ///     returns null on current PRs; selecting it buys nothing and breaks
 ///     every hydration whenever GitHub drops the field. DECIDED (milestone
 ///     2, recorded at sync.rs OBSERVED): the approval-staleness signal's
-///     replacement is two bounds the sync already stores — committedDate as
-///     the stale-side proof (push ≥ commit, so approval < committedDate
-///     proves staleness, server time, no skew) and the observations table's
-///     own head_sha flip row (observed_at ≥ push, local time, so approval ≥
-///     observed_at proves freshness modulo clock skew) — no new column
-///     writer; the force-push timeline event stays rejected with the
-///     timeline (DESIGN.md). prs.last_pushed_at stays NULL, and attention's
-///     polarity contract degrades NULL/unknown ordering OUT of
-///     ready_to_merge (PLANNED, milestone 3 — attention.rs, which owns the
-///     skew margin) — the bucket under-fills, it never lies.
+///     replacement is two stored bounds — prs.head_committed_at as the
+///     stale-side proof (push ≥ commit, so approval < committedDate proves
+///     staleness, server time, no skew; schema v2 added the column the v1
+///     prose had claimed) and the observations table's own head_sha flip
+///     row (observed_at ≥ push, local time, so approval ≥ observed_at
+///     proves freshness modulo clock skew); the force-push timeline event
+///     stays rejected with the timeline (DESIGN.md). prs.last_pushed_at
+///     stays NULL, and attention's polarity contract degrades NULL/unknown
+///     ordering OUT of ready_to_merge (attention.rs, which owns the skew
+///     margin) — the bucket under-fills, it never lies.
 ///   * Every author selection in this hydration document carries __typename
 ///     (structural Bot detection at ingest, since sync --pr skips discovery)
 ///     plus databaseId via User/Bot fragments (NULL when neither fragment

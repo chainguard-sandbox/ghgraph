@@ -1,0 +1,147 @@
+{
+  "_meta": {
+    "archive": [
+      {
+        "config_pending": false,
+        "fingerprint": {
+          "bots": true,
+          "exclude_authors": [],
+          "lookback_days": 90,
+          "people": [],
+          "scope": "working",
+          "viewer": "me"
+        },
+        "hint": "stale — run: ghgraph sync",
+        "repo": "octo/alpha",
+        "streams": [
+          {
+            "age_seconds": "<AGE>",
+            "last_checked_at": "2026-01-05T00:10:00Z",
+            "stale": true,
+            "stream": "pr"
+          }
+        ]
+      },
+      {
+        "config_pending": true,
+        "fingerprint": {
+          "bots": true,
+          "exclude_authors": [],
+          "lookback_days": 90,
+          "people": [],
+          "scope": "working",
+          "viewer": "me"
+        },
+        "hint": "stale — run: ghgraph sync",
+        "repo": "octo/beta",
+        "streams": [
+          {
+            "age_seconds": "<AGE>",
+            "last_checked_at": "2026-01-04T00:10:00Z",
+            "stale": true,
+            "stream": "pr"
+          }
+        ]
+      },
+      {
+        "config_pending": true,
+        "fingerprint": {
+          "bots": true,
+          "exclude_authors": [],
+          "lookback_days": 90,
+          "people": [],
+          "scope": "working",
+          "viewer": "me"
+        },
+        "hint": "stale — run: ghgraph sync",
+        "repo": "octo/gone",
+        "streams": [
+          {
+            "age_seconds": "<AGE>",
+            "last_checked_at": "2026-01-03T00:10:00Z",
+            "stale": true,
+            "stream": "pr"
+          }
+        ]
+      }
+    ],
+    "generated_at": "<TIME>",
+    "schema_version": 1
+  },
+  "results": [
+    {
+      "author": "me",
+      "author_assoc": "OWNER",
+      "deleted_at": null,
+      "kind": "pr",
+      "matched": {
+        "comments": 0,
+        "self": true
+      },
+      "number": 2,
+      "repo": "octo/alpha",
+      "state": "OPEN",
+      "title": "Retry the sync watchdog",
+      "truncated": false,
+      "updated_at": "2026-01-06T00:00:00Z",
+      "url": "https://github.com/octo/alpha/pull/2",
+      "verified_at": "2026-01-06T00:00:00Z"
+    },
+    {
+      "author": "alice",
+      "author_assoc": "CONTRIBUTOR",
+      "deleted_at": null,
+      "kind": "pr",
+      "matched": {
+        "comments": 2,
+        "self": true
+      },
+      "number": 1,
+      "repo": "octo/alpha",
+      "state": "OPEN",
+      "title": "Harden the retry loop",
+      "truncated": false,
+      "updated_at": "2026-01-05T00:00:00Z",
+      "url": "https://github.com/octo/alpha/pull/1",
+      "verified_at": "2026-01-05T00:00:00Z"
+    },
+    {
+      "author": "erin",
+      "author_assoc": "COLLABORATOR",
+      "deleted_at": null,
+      "kind": "issue",
+      "matched": {
+        "comments": 0,
+        "self": true
+      },
+      "number": 3,
+      "repo": "octo/beta",
+      "state": "OPEN",
+      "title": "Flaky retry logic in CI",
+      "truncated": false,
+      "updated_at": "2026-01-04T12:00:00Z",
+      "url": "https://github.com/octo/beta/issues/3",
+      "verified_at": null
+    },
+    {
+      "author": "alice",
+      "author_assoc": null,
+      "deleted_at": null,
+      "kind": "issue",
+      "matched": {
+        "comments": 0,
+        "self": true
+      },
+      "number": 10,
+      "repo": "octo/alpha",
+      "state": "OPEN",
+      "title": "Retries hammer the API",
+      "truncated": false,
+      "updated_at": "2026-01-02T00:00:00Z",
+      "url": "https://github.com/octo/alpha/issues/10",
+      "verified_at": null
+    }
+  ],
+  "returned": 4,
+  "total": 4
+}

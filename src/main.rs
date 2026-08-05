@@ -54,9 +54,17 @@ enum Command {
     Prs {
         #[arg(long)]
         repo: Option<String>,
-        /// Include merged and closed PRs.
+        /// Include merged, closed, and upstream-deleted PRs.
         #[arg(long)]
         all: bool,
+        /// Only PRs authored by this login (the tracked-person one-liner:
+        /// a WHERE clause, not a monitor verb).
+        #[arg(long)]
+        author: Option<String>,
+        /// Cap the rows returned. The matching total is always disclosed:
+        /// limits govern presentation, never derivation.
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// One PR with reviews, threads, comments, and linked issues.
     Pr {
@@ -68,6 +76,12 @@ enum Command {
         reference: String,
         #[arg(long)]
         repo: Option<String>,
+        /// Truncate each body field to at most this many bytes (never
+        /// splitting a UTF-8 code point); elided bodies say so via
+        /// body_elided. Opt-in: a property of the request, distinct from
+        /// `truncated`, which is a property of the archive.
+        #[arg(long)]
+        max_body_bytes: Option<usize>,
     },
     /// Full-text search over PR titles/bodies and comments.
     Search {
@@ -130,8 +144,17 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
     match cli.command {
         Command::Sync { full, pr } => sync::run(&cfg, full, pr.as_deref()),
         Command::Attention { fail_if_any } => report::attention(&cfg, fail_if_any),
-        Command::Prs { repo, all } => report::prs(&cfg, repo.as_deref(), all),
-        Command::Pr { reference, repo } => report::pr(&cfg, &reference, repo.as_deref()),
+        Command::Prs {
+            repo,
+            all,
+            author,
+            limit,
+        } => report::prs(&cfg, repo.as_deref(), all, author.as_deref(), limit),
+        Command::Pr {
+            reference,
+            repo,
+            max_body_bytes,
+        } => report::pr(&cfg, &reference, repo.as_deref(), max_body_bytes),
         Command::Search { query, limit } => report::search(&cfg, &query, limit),
         Command::Query { sql, limit } => report::query(&cfg, sql.as_deref(), limit),
         Command::Stats => report::stats(&cfg),
