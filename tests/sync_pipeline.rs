@@ -82,7 +82,8 @@ case "$doc" in
     ;;
   *'... on Issue'*'comments(first: 100'*)
     echo "ICPAGE|run=$run|id=$id|after=$after" >> "$dir/calls.log"
-    resp="$dir/icpage-$id.json"
+    resp="$dir/icpage-$id-$after.json"
+    [ -f "$resp" ] || resp="$dir/icpage-$id.json"
     ;;
   *'labels(first: 20'*)
     echo "IHYD|run=$run|id=$id" >> "$dir/calls.log"
@@ -2244,6 +2245,59 @@ fn issue_follow_up_pages_merge_and_earn_the_witness() {
         "SELECT count(*) FROM issues WHERE number=11 AND verified_at IS NOT NULL AND truncated=0",
     );
     assert_eq!(verified, 1, "terminated pagination earns the witness");
+}
+
+// 17f'. Three pages: the mid-walk cursor ADVANCE (c1 → c2) is the arm the
+// two-page shape never exercises — a walk that cannot take it reads every
+// multi-follow-up issue as truncated.
+
+#[test]
+fn issue_walk_advances_through_a_mid_walk_cursor() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}],
+        "workers": 1, "retry_attempts": 1, "retry_budget": 5
+    }));
+    install_prs(&fake, &[]);
+    let mut a = Issue::new("I_1", 11, "2026-07-20T00:00:00Z");
+    a.comments_has_next = true;
+    a.comments_cursor = Some("c1");
+    install_issues(&fake, &[&a]);
+    let page = |cid: &str, cursor: Value, has_next: bool| {
+        json!({"data": {"node": {"comments": {
+            "totalCount": 3,
+            "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+            "nodes": [{
+                "id": cid, "body": format!("comment {cid}"),
+                "createdAt": "2026-07-10T02:00:00Z", "lastEditedAt": null,
+                "url": "https://github.com/x", "isMinimized": false,
+                "authorAssociation": "NONE", "author": author("carol", "User")}]}},
+            "rateLimit": rate_limit(4000)}})
+        .to_string()
+    };
+    fake.write("icpage-I_1-c1.json", &page("IC_p2", json!("c2"), true));
+    fake.write("icpage-I_1-c2.json", &page("IC_p3", Value::Null, false));
+
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["truncated"], 0, "{s}");
+    let pages: Vec<String> = fake
+        .calls()
+        .iter()
+        .filter(|c| c.starts_with("ICPAGE|run=1"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        pages,
+        vec![
+            "ICPAGE|run=1|id=I_1|after=c1".to_string(),
+            "ICPAGE|run=1|id=I_1|after=c2".to_string(),
+        ],
+        "the walk advances through the mid-walk cursor exactly once each"
+    );
+    let comments: i64 = fake.query_one("SELECT count(*) FROM comments WHERE parent_kind='issue'");
+    assert_eq!(comments, 3, "all three pages merge");
 }
 
 // 17g. An issue follow-up page whose cursor does not advance reads as a

@@ -2210,6 +2210,13 @@ fn hydrate_issue_one(
         pages += 1;
         node.comments.nodes.extend(page.comments.nodes);
         comments_complete = !page.comments.page_info.has_next_page;
+        // Known-equivalent mutants here, and they stay: `pages` feeds only
+        // the MAX_CONNECTION_PAGES backstop (defense-in-depth against a
+        // server advancing cursors forever — the non-advancing guard below
+        // is the live witness one level down, same argument as discovery's
+        // page counter), and the second arm's guard only chooses between
+        // exiting via {} and exiting via break when the walk is already
+        // complete — every input converges to the same state either way.
         match page.comments.page_info.end_cursor {
             Some(c) if Some(&c) != cursor.as_ref() => cursor = Some(c),
             _ if comments_complete => {}
