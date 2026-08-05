@@ -8,8 +8,13 @@
 //!     id column breaks ties); FTS rank floats are never printed; identical
 //!     archive state yields byte-identical documents modulo the enumerated
 //!     timing fields (`generated_at`, `age_seconds` — the list golden tests
-//!     mask, and the ONLY nondeterminism the contract allows). CI runs reads
-//!     under PRAGMA reverse_unordered_selects=ON to catch missing ORDER BYs
+//!     mask, and the ONLY nondeterminism the contract allows). `stale` and
+//!     `hint` are quantized functions of that same masked clock: they flip
+//!     only when age crosses the 24h boundary between two runs, never
+//!     independently of it, so a consumer masking the two enumerated fields
+//!     must read a boundary flip as clock movement, not an archive change.
+//!     CI runs reads under
+//!     PRAGMA reverse_unordered_selects=ON to catch missing ORDER BYs
 //!     (db.rs, the GHGRAPH_TEST_REVERSE_SELECTS hook).
 //!   * Reads never touch the network and never fail stale: `_meta` freshness
 //!     is advisory, in-band, and derives from sync_state.last_checked_at —

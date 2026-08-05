@@ -42,15 +42,15 @@
 //!     regressed; an exotic umask that clears owner bits could make the archive
 //!     unwritable, which surfaces as a CONFIGURATION open error.
 //!
-//! Migrations: PRAGMA user_version. 0 → apply schema.sql (always the CURRENT
+//! Versioning: PRAGMA user_version. 0 → apply schema.sql (always the CURRENT
 //! shape) → SCHEMA_VERSION, schema apply and the version bump in ONE
 //! rusqlite-managed transaction, so a crash mid-apply rolls back to 0 and the
-//! next open retries from clean — the archive is never half-migrated. Every
-//! user_version value has a defined outcome (see `migrate`); a value we do
-//! not understand is refused, never guessed. Older versions step forward
-//! through numbered fn(&mut Connection) migrations (v1→v2 is the first),
-//! each bumping the pragma inside its own transaction. No schema_version
-//! table; the pragma is the record.
+//! next open retries from clean — the archive is never half-initialized.
+//! Every user_version value has a defined outcome (see `migrate`); a value
+//! we do not understand is refused, never guessed, and pre-release stamps
+//! are refused rather than migrated — the policy and its reversal point
+//! (the first released binary) are recorded at SCHEMA_VERSION. No
+//! schema_version table; the pragma is the record.
 
 use std::fs::{DirBuilder, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -69,16 +69,30 @@ const SCHEMA: &str = include_str!("schema.sql");
 
 /// Current schema version, written to PRAGMA user_version after migration.
 /// This is the ARCHIVE version (a storage fact), not the output contract's
-/// `_meta.schema_version` (report.rs) — the archive can migrate without the
+/// `_meta.schema_version` (report.rs) — the archive can move without the
 /// output contract moving, which is exactly what v2 did (an added column
 /// feeds a derivation; no emitted field changed shape).
 ///
 /// v2: prs.head_committed_at — the stale-side approval-staleness bound. The
 /// v1 schema's own comments claimed staleness "derives from committedDate",
 /// but v1 never stored it: parse.rs validated the field and the upsert
-/// dropped it. Migrated v1 rows hold NULL (freshness reads Unknown, which
-/// fails closed) and heal on their next hydration, since the column joins
-/// the diff-gated upsert.
+/// dropped it.
+///
+/// MIGRATION POLICY, decided here so the machinery is not re-proposed every
+/// schema change: migrations begin at the first RELEASED binary — an
+/// archive someone cannot cheaply rebuild. Until then the archive is a
+/// disposable cache (that is already the corruption remedy's prose), so a
+/// pre-release schema change bumps this version and REFUSES older stamps
+/// with the remove-and-resync remedy, rather than carrying ALTER TABLE
+/// steps, their column-order constraints (an appended column must then stay
+/// last forever or `query` SELECT * forks by archive provenance), and the
+/// fixture archaeology their tests need. The bump itself is NOT optional:
+/// amending the schema in place under an unchanged version would let an
+/// old archive pass the version gate and then fail mid-verb with "no such
+/// column" classified INTERNAL — a lie about the actor. A v1→v2 ALTER
+/// TABLE migration existed briefly and was verified correct; it was deleted
+/// by this policy, not by a defect (the git history holds it if the first
+/// release ever needs the pattern back).
 pub const SCHEMA_VERSION: i64 = 2;
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
@@ -290,28 +304,14 @@ fn user_version(conn: &Connection, path: &Path) -> Result<i64> {
 fn migrate(conn: &mut Connection, path: &Path) -> Result<()> {
     match user_version(conn, path)? {
         0 => apply_full(conn, path),
-        1 => migrate_v1_to_v2(conn, path),
         v if v == SCHEMA_VERSION => Ok(()),
-        // Everything else (a newer archive, or a negative/foreign sentinel —
-        // SQLite accepts any i64 user_version) is refused, never guessed.
+        // Everything else — an older pre-release stamp (refused with the
+        // remove-and-resync remedy; migrations begin at the first release,
+        // see SCHEMA_VERSION), a newer archive, or a negative/foreign
+        // sentinel (SQLite accepts any i64 user_version) — is refused,
+        // never guessed.
         v => Err(wrong_version(path, v)),
     }
-}
-
-/// v1 → v2: add prs.head_committed_at (rationale at [`SCHEMA_VERSION`]).
-/// ALTER TABLE ADD COLUMN appends, and schema.sql declares the column last
-/// for exactly that reason: a migrated archive and a fresh one must agree on
-/// column order, or `query` SELECT * output forks by archive provenance.
-/// Step and stamp share one transaction, like every migration here: a crash
-/// between them re-runs the step from v1 cleanly.
-fn migrate_v1_to_v2(conn: &mut Connection, path: &Path) -> Result<()> {
-    let cannot = |e: rusqlite::Error| sqlite_err(path, "cannot migrate archive", e);
-    let tx = conn.transaction().map_err(cannot)?;
-    tx.execute_batch("ALTER TABLE prs ADD COLUMN head_committed_at TEXT")
-        .map_err(cannot)?;
-    tx.pragma_update(None, "user_version", 2).map_err(cannot)?;
-    tx.commit().map_err(cannot)?;
-    Ok(())
 }
 
 /// The CONFIGURATION error for an archive whose `user_version` is not the
@@ -337,10 +337,12 @@ fn wrong_version(path: &Path, v: i64) -> Error {
     } else if v > SCHEMA_VERSION {
         format!("newer than this ghgraph (v{SCHEMA_VERSION}); upgrade ghgraph")
     } else {
-        // Only 0 < v < SCHEMA_VERSION reaches here, and only from open_ro:
-        // migrate handles every such version, but a read-only connection
-        // cannot run it. The remedy is the writer, which migrates on open.
-        format!("older than this ghgraph (v{SCHEMA_VERSION}); run `ghgraph sync` to migrate it")
+        // 0 < v < SCHEMA_VERSION: a pre-release schema. Not migrated,
+        // by policy (SCHEMA_VERSION) — the archive is a disposable cache.
+        format!(
+            "a pre-release schema this ghgraph (v{SCHEMA_VERSION}) does not migrate — \
+             the archive is a disposable cache; remove it and resync"
+        )
     };
     Error::config(format!(
         "archive {} is at schema version {v}: {detail}",
@@ -603,86 +605,37 @@ mod tests {
         assert_eq!(err.code, crate::error::Code::Configuration);
     }
 
-    /// Reconstruct a v1 archive from a v2 one: drop the one column v2 added
-    /// and reset the stamp. Dropping the LAST column preserves the order of
-    /// the rest, so the reconstruction is structurally faithful — that
-    /// last-position choice is load-bearing (schema.sql, head_committed_at)
-    /// and this helper depends on it like the migration does.
-    fn make_v1(path: &Path) {
-        let conn = Connection::open(path).unwrap();
-        conn.execute_batch("ALTER TABLE prs DROP COLUMN head_committed_at")
-            .unwrap();
-        conn.pragma_update(None, "user_version", 1).unwrap();
-    }
-
     #[test]
-    fn migrates_v1_to_v2_and_matches_fresh_column_order() {
+    fn refuses_pre_release_schema_with_resync_remedy() {
+        // Pre-release stamps are refused, not migrated (the policy at
+        // SCHEMA_VERSION), and BOTH open paths must name the actionable
+        // remedy — the archive is a disposable cache, so the remedy is
+        // remove-and-resync, never a migration that does not exist. The
+        // shape behind the stamp is irrelevant: refusal happens at the
+        // version gate, before any statement could notice the columns.
         let s = Scratch::new();
         let path = s.join("ghgraph.db");
         {
             let _a = open_rw(&path).unwrap();
         }
-        make_v1(&path);
-        // A row born under v1 must survive the migration with NULL in the new
-        // column (Unknown freshness, failing closed — attention.rs).
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "INSERT INTO prs (id, repo, number, title, state, created_at, updated_at, url) \
-                 VALUES ('n1', 'o/r', 1, 't', 'OPEN', '2026-01-01T00:00:00Z', \
-                         '2026-01-01T00:00:00Z', 'https://github.com/o/r/pull/1')",
-            )
-            .unwrap();
+        set_raw_user_version(&path, 1);
+        for (name, err) in [
+            (
+                "open_rw",
+                open_rw(&path).err().expect("open_rw must refuse v1"),
+            ),
+            (
+                "open_ro",
+                open_ro(&path).err().expect("open_ro must refuse v1"),
+            ),
+        ] {
+            assert_eq!(err.code, crate::error::Code::Configuration, "{name}");
+            assert!(
+                err.message.contains("remove it and resync"),
+                "{name} must carry the disposable-cache remedy, got: {}",
+                err.message
+            );
         }
-        let migrated = open_rw(&path).unwrap();
-        assert_eq!(user_version(migrated.conn(), &path).unwrap(), 2);
-        let committed: Option<String> = migrated
-            .conn()
-            .query_row(
-                "SELECT head_committed_at FROM prs WHERE number=1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            committed, None,
-            "v1 rows migrate to NULL (Unknown, fails closed)"
-        );
-
-        // Column ORDER must agree with a fresh v2 archive, or `query`
-        // SELECT * output would fork by archive provenance.
-        let fresh_path = s.join("fresh.db");
-        let fresh = open_rw(&fresh_path).unwrap();
-        let cols = |conn: &Connection| -> Vec<String> {
-            let mut stmt = conn.prepare("PRAGMA table_info(prs)").unwrap();
-            stmt.query_map([], |r| r.get::<_, String>(1))
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap()
-        };
-        assert_eq!(
-            cols(migrated.conn()),
-            cols(fresh.conn()),
-            "migrated and fresh archives must agree on prs column order"
-        );
-    }
-
-    #[test]
-    fn ro_refuses_v1_with_migrate_remedy() {
-        // open_ro cannot migrate; it must name the writer as the remedy.
-        let s = Scratch::new();
-        let path = s.join("ghgraph.db");
-        {
-            let _a = open_rw(&path).unwrap();
-        }
-        make_v1(&path);
-        let err = open_ro(&path).err().expect("open_ro must refuse v1");
-        assert_eq!(err.code, crate::error::Code::Configuration);
-        assert!(
-            err.message.contains("ghgraph sync"),
-            "message must direct the operator to sync (which migrates), got: {}",
-            err.message
-        );
     }
 
     #[test]
