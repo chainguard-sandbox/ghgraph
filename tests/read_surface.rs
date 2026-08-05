@@ -1,5 +1,6 @@
-//! The read-surface suite (milestone 3, C1): golden files for prs / pr /
-//! search / query / stats, held under PRAGMA reverse_unordered_selects=ON
+//! The read-surface suite (milestone 3): golden files for prs / pr /
+//! search / query / stats (C1) and attention (C2), held under PRAGMA
+//! reverse_unordered_selects=ON
 //! (via db.rs's GHGRAPH_TEST_REVERSE_SELECTS hook, so the reversal applies
 //! to the very connection the verbs use), plus the error-classification
 //! table for the read path.
@@ -923,6 +924,141 @@ fn golden_attention_limited() {
     attention_config(&s, &[]);
     // --limit 1 caps each bucket's rows; totals stay disclosed.
     golden_verb(&s, "attention_limited.json", &["attention", "--limit", "1"]);
+}
+
+/// Polarity edges the golden seed can't carry: states ghgraph's own writer
+/// never produces, hand-planted because `query` proves the archive is
+/// reachable by arbitrary SQL — a derivation input is validated where it
+/// is consumed (attention.rs), and each of these pins a failure DIRECTION.
+#[test]
+fn attention_probes_polarity_edges() {
+    let s = Scratch::new();
+    seed(&s);
+    {
+        let arch = db::open_rw(&s.db_path()).unwrap();
+        let c = arch.conn();
+        // #11 — viewer's PR whose only other-party act is a review row
+        // with a NULL verdict: must read as a reply (fail-open), not
+        // vanish through SQL three-valued logic (`state IS 'APPROVED'`).
+        c.execute(
+            "INSERT INTO prs (pk, id, repo, number, title, state, is_draft, author, \
+                              created_at, updated_at, url) \
+             VALUES (11, 'PR_a11', 'octo/alpha', 11, 'Probe null verdict', 'OPEN', 0, \
+                     'me', '2026-01-02T00:00:00Z', '2026-01-05T00:00:00Z', 'u11')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO comments (id, parent_kind, parent, kind, state, author, body, \
+                                   created_at) \
+             VALUES ('RV_a11', 'pr', 11, 'review', NULL, 'bob', 'please split this', \
+                     '2026-01-03T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // #12 — requests of an UNRECOGNIZED kind: one naming the viewer
+        // (escalates into waiting_on_me), one naming someone else (never
+        // matches). Sync writes only user/team; this is the shape-drift
+        // guard's pin.
+        c.execute(
+            "INSERT INTO prs (pk, id, repo, number, title, state, is_draft, author, \
+                              created_at, updated_at, url) \
+             VALUES (12, 'PR_a12', 'octo/alpha', 12, 'Probe unknown kind', 'OPEN', 0, \
+                     'alice', '2026-01-02T00:00:00Z', '2026-01-05T00:00:00Z', 'u12')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO review_requests (pr, reviewer, kind) VALUES (12, 'ME', 'mannequin')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO review_requests (pr, reviewer, kind) VALUES (12, 'dave', 'copilot')",
+            [],
+        )
+        .unwrap();
+        // #13 — a MERGED PR of the viewer's with a fresh other-party
+        // reply: excluded from every bucket. The working-set narrowing is
+        // recorded in attention.rs with its reversal trigger; this test is
+        // the narrowing's named witness, so reversing it is an edit here,
+        // not an accident.
+        c.execute(
+            "INSERT INTO prs (pk, id, repo, number, title, state, is_draft, author, \
+                              created_at, updated_at, merged_at, url) \
+             VALUES (13, 'PR_a13', 'octo/alpha', 13, 'Probe merged reply', 'MERGED', 0, \
+                     'me', '2026-01-02T00:00:00Z', '2026-01-05T00:00:00Z', \
+                     '2026-01-04T00:00:00Z', 'u13')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO comments (id, parent_kind, parent, kind, author, body, created_at) \
+             VALUES ('C_a13', 'pr', 13, 'comment', 'alice', 'does this regress?', \
+                     '2026-01-04T12:00:00Z')",
+            [],
+        )
+        .unwrap();
+    }
+    attention_config(&s, &[]);
+    let doc = s.run_ok(&["attention"]);
+    let buckets = doc["attention"].as_array().unwrap();
+    let numbers = |name: &str| -> Vec<i64> {
+        buckets.iter().find(|b| b["bucket"] == name).unwrap()["prs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["number"].as_i64().unwrap())
+            .collect()
+    };
+    assert!(
+        numbers("they_replied").contains(&11),
+        "a verdict-less review row is a reply — only a PROVEN approval is excluded"
+    );
+    assert!(
+        numbers("waiting_on_me").contains(&12),
+        "an unrecognized request kind naming the viewer escalates"
+    );
+    for name in [
+        "waiting_on_me",
+        "they_replied",
+        "ready_to_merge",
+        "people_prs",
+    ] {
+        assert!(
+            !numbers(name).contains(&13),
+            "a merged PR is outside the working set (recorded narrowing): {name}"
+        );
+    }
+}
+
+/// EPIPE must not clobber an earned gate exit (main.rs emit). The consumer
+/// closes the pipe before reading; either the write EPIPEs (earned exit
+/// preserved) or it landed in the pipe buffer first (gate exit path runs) —
+/// both must yield 1, so the assertion is race-free even though which arm
+/// fires is not.
+#[test]
+fn gate_exit_survives_a_closed_pipe() {
+    let s = Scratch::new();
+    seed(&s);
+    attention_config(&s, &[]);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ghgraph"))
+        .arg("--config")
+        .arg(s.config_path())
+        .args(["attention", "--fail-if-any"])
+        .current_dir(&s.dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let status = child.wait().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a closed pipe means the consumer went away, never all-clear"
+    );
 }
 
 #[test]

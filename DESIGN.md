@@ -234,8 +234,11 @@ scaffolding, tooling — belongs in a flag (the `--help`/`--version` family) or
 the Makefile, not in a command that would have no MCP counterpart. stdout is
 always one JSON document (carve-outs:
 `--help`/`--version`, and abnormal exit, where empty stdout plus nonzero exit
-reads as INTERNAL); progress goes to stderr; a closed pipe is a silent
-exit 0, never a panic. Errors are typed envelopes, and the code names the
+reads as INTERNAL); progress goes to stderr; a closed pipe is silent —
+no panic, no extra bytes — and the process keeps the exit code it had
+already earned before the write (a tripped gate still exits 1, an error
+still exits 2; a plain read exits 0): EPIPE means the consumer went away,
+never "all clear". Errors are typed envelopes, and the code names the
 actor who can fix it: a typo in user SQL is USER_INPUT, a full disk is
 CONFIGURATION with remedy text (the archive is a disposable cache — remove
 and resync), INTERNAL means file a ghgraph bug and nothing else. Every read

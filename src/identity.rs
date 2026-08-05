@@ -581,6 +581,11 @@ mod tests {
         // Stored as typed (display text, no canonical fold); the equivalence
         // against API text is login_eq, applied where teams are matched.
         assert_eq!(TeamName::new("Platform").unwrap().as_str(), "Platform");
+        assert_eq!(
+            TeamName::new("Platform").unwrap().to_string(),
+            "Platform",
+            "Display renders the name (the mutant that returns Ok(()) writes nothing)"
+        );
         assert!(login_eq("Platform", "platform"));
     }
 

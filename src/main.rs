@@ -122,33 +122,45 @@ fn main() {
                 std::process::exit(0);
             }
             _ => {
-                emit(&error::Error::user(e.to_string()).envelope());
+                emit(&error::Error::user(e.to_string()).envelope(), 2);
                 std::process::exit(2);
             }
         },
     };
     match run(cli) {
         Ok((doc, exit)) => {
-            emit(&format!("{doc:#}"));
+            emit(&format!("{doc:#}"), exit);
             if exit != 0 {
                 std::process::exit(exit);
             }
         }
         Err(e) => {
-            emit(&e.envelope());
+            emit(&e.envelope(), 2);
             std::process::exit(2);
         }
     }
 }
 
-/// The single stdout writer. A closed pipe (`ghgraph … | head`) is a silent
-/// success, never a panic — `println!` would panic on EPIPE, violating the
-/// stdout contract every consumer depends on.
-fn emit(doc: &str) {
+/// The single stdout writer. A closed pipe (`ghgraph … | head`) is silent —
+/// no panic (`println!` would panic on EPIPE, violating the stdout contract)
+/// and no extra bytes — but the process keeps the exit code it had already
+/// EARNED before the write: a tripped gate exits 1 and an error exits 2
+/// even when the consumer stopped reading. EPIPE means "consumer went
+/// away", never "all clear" — a gate that cannot prove all-clear must not
+/// report it (report::attention_has_demands owns that doctrine). A plain
+/// ungated read still exits 0, which is the original decision's substance.
+fn emit(doc: &str, earned_exit: i32) {
     use std::io::Write;
     match writeln!(std::io::stdout().lock(), "{doc}") {
         Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+        // The BrokenPipe guard is asserted by test only from the EPIPE
+        // side (a closed-pipe consumer); the other side — a non-EPIPE
+        // stdout write failure exiting 2 — needs an EBADF/EIO stdout no
+        // portable harness constructs, so the guard's `== BrokenPipe`
+        // direction is held by this comment and review, not a test
+        // (the mutant flipping it to `true` survives; equivalent-in-
+        // practice, recorded rather than chased with theater).
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(earned_exit),
         Err(_) => std::process::exit(2),
     }
 }

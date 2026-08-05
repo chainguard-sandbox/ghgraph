@@ -2448,3 +2448,75 @@ fn strict_gates_the_exit_code_on_disclosed_incompleteness() {
     assert_eq!(s["health"]["quarantined"], 1, "{s}");
     assert!(ghgraph::sync::incomplete(&doc));
 }
+
+// ---------------------------------------------------------------------------
+// 13. The sync summary golden — the seventh verb's byte-level record.
+
+/// Same contract as tests/read_surface.rs's golden(): regenerate with
+/// GHGRAPH_UPDATE_GOLDENS=1 and review the diff like code.
+fn golden(name: &str, doc: &Value) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/goldens")
+        .join(name);
+    let got = serde_json::to_string_pretty(doc).unwrap() + "\n";
+    if std::env::var_os("GHGRAPH_UPDATE_GOLDENS").is_some() {
+        std::fs::write(&path, &got).unwrap();
+        return;
+    }
+    let want = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        panic!("missing golden {name} — generate with GHGRAPH_UPDATE_GOLDENS=1 and review")
+    });
+    assert_eq!(
+        got, want,
+        "golden {name} diverged — if intended, regenerate and review the diff"
+    );
+}
+
+#[test]
+fn golden_sync_summary() {
+    // Fixture responses make every summary field deterministic except the
+    // enumerated timing fields (sync.rs module docs: subprocess_seconds,
+    // sleep_seconds), masked here exactly as read_surface masks _meta
+    // timing — and nothing else, or the golden proves less than it claims.
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    let b = Pr::new("PR_2", 2, "2026-07-20T11:00:00Z");
+    install_prs(&fake, &[&a, &b]);
+    let mut doc = fake.sync_ok();
+    for repo in doc["sync"]["repos"].as_array_mut().unwrap() {
+        repo["cost"]["subprocess_seconds"] = json!("<SECS>");
+        repo["cost"]["sleep_seconds"] = json!("<SECS>");
+    }
+    golden("sync.json", &doc);
+}
+
+// ---------------------------------------------------------------------------
+// 14. retry_after rides the TRANSIENT envelope when gh returned a reset.
+
+#[test]
+fn targeted_rate_exhaustion_envelope_carries_retry_after() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    // The PR_ID lookup succeeds (its rateLimit envelope teaches resetAt);
+    // the hydration then hits the primary rate limit — typed RateExhausted,
+    // one attempt, no quarantine (budget exhaustion is not the PR's fault).
+    fake.write(
+        "prid.json",
+        &json!({"data": {"repository": {"pullRequest": {"id": "PR_1"}},
+                 "rateLimit": rate_limit(4000)}})
+        .to_string(),
+    );
+    fake.write(
+        "stderr-PR_1",
+        "gh: API rate limit exceeded for user (HTTP 403)",
+    );
+    let (code, doc, stderr) = fake.run(&["sync", "--pr", "o/n#1"]);
+    assert_eq!(code, 2, "stderr:\n{stderr}");
+    let err = &doc.expect("typed envelope on stdout")["error"];
+    assert_eq!(err["code"], "TRANSIENT", "{err}");
+    assert_eq!(
+        err["retry_after"], "2026-08-01T00:00:00Z",
+        "the reset the run learned rides the envelope: {err}"
+    );
+}

@@ -219,6 +219,13 @@ pub struct Config {
     /// request is a demand on SOMEONE, provably not on any particular
     /// viewer — which is why the default (empty) surfaces none, rather
     /// than fail-open flooding every operator with every team's queue.
+    /// Scope of a declaration: the NAME, not the org — a declared name
+    /// matches that display name in EVERY synced repo,
+    /// ASCII-case-insensitively, so a same-named team in another synced
+    /// org can add spurious waiting_on_me rows (it can never reach
+    /// ready_to_merge). Accepted: the operator opted into every synced
+    /// repo and uncertainty escalates; org-scoped declarations wait for
+    /// a real multi-org operator hitting the collision.
     #[serde(default)]
     pub teams: Vec<TeamName>,
     /// Archive path. Default: $XDG_DATA_HOME/ghgraph/ghgraph.db.

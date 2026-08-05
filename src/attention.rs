@@ -48,7 +48,9 @@
 //!                     request matching a declared config.teams name
 //!                     (membership is declared, not verified — config.rs
 //!                     records why the empty default surfaces no team
-//!                     requests rather than all of them). Or an unresolved
+//!                     requests rather than all of them; a request of an
+//!                     UNRECOGNIZED kind naming the viewer escalates —
+//!                     shape drift must not drop a request). Or an unresolved
 //!                     thread on viewer's OWN PR whose last substantive
 //!                     speaker is the other party ([`waiting_on`] == Me);
 //!                     the same state on someone else's PR is a reply, not
@@ -63,8 +65,13 @@
 //!                     and counting it would shunt every freshly-approved
 //!                     PR into this bucket ahead of that one (priority
 //!                     order) — starving ready_to_merge structurally. A
-//!                     CHANGES_REQUESTED or COMMENTED review IS a reply:
-//!                     it carries words the viewer must act on. Two known
+//!                     CHANGES_REQUESTED or COMMENTED review IS a reply
+//!                     (COMMENTED arrives only in archives whose review
+//!                     rows carry it — today's ingest query is
+//!                     opinionated-only), and so does a review row whose
+//!                     verdict is missing: only a PROVEN approval is
+//!                     excluded, absence of a verdict fails open like
+//!                     every other derivation input here. Two known
 //!                     narrowings, PR-level recency and push-is-not-
 //!                     activity (a head flip is an observation, not a
 //!                     comment, and its stamp is local time — cross-clock

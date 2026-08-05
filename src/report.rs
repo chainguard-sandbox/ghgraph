@@ -146,7 +146,8 @@ use crate::time::Rfc3339Utc;
 /// from db::SCHEMA_VERSION (the archive's storage version): the archive can
 /// migrate without a consumer-visible change, which is exactly what archive
 /// v2 was. Version 1 FROZE with milestone 3 — all seven verbs golden
-/// (tests/read_surface.rs holds the byte-level record). From here changes
+/// (tests/read_surface.rs holds the read verbs' byte-level record,
+/// tests/sync_pipeline.rs the sync summary's). From here changes
 /// are additive-only: a new field or a new always-present key is a golden
 /// regeneration; renaming, removing, retyping, or re-meaning anything bumps
 /// this and is a design event, not an edit.
@@ -257,14 +258,19 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
         )
         .map_err(classify_ours)?;
     // An APPROVED review verdict is not a reply (attention.rs module docs:
-    // counting it would starve ready_to_merge behind they_replied).
+    // counting it would starve ready_to_merge behind they_replied). `IS`,
+    // not `=`: a review row with a NULL state must COUNT as activity —
+    // under `=`, three-valued logic makes the NOT arm NULL and drops the
+    // row, silently suppressing a demand (fail-closed, the wrong
+    // polarity). Unreachable from ghgraph's own writer, but a derivation
+    // input is validated where it is consumed (attention.rs).
     let mut other_last_stmt = conn
         .prepare(
             "SELECT MAX(created_at) FROM comments \
              WHERE parent_kind = 'pr' AND parent = ?1 AND deleted_at IS NULL \
                AND is_minimized = 0 \
                AND (author IS NULL OR author <> ?2 COLLATE NOCASE) \
-               AND NOT (kind = 'review' AND state = 'APPROVED')",
+               AND NOT (kind = 'review' AND state IS 'APPROVED')",
         )
         .map_err(classify_ours)?;
 
@@ -289,9 +295,14 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
         let requested_via: Vec<&(String, String)> = requests
             .iter()
             .filter(|(reviewer, kind)| match kind.as_str() {
-                "user" => login_eq(reviewer, viewer),
                 "team" => cfg.teams.iter().any(|t| login_eq(t.as_str(), reviewer)),
-                _ => false,
+                // 'user' — and, deliberately, any UNRECOGNIZED kind: sync
+                // writes only 'user'/'team' (schema.sql), so an unknown
+                // kind is shape drift, and one naming the viewer escalates
+                // rather than silently dropping a request addressed to
+                // them (uncertainty may add to waiting_on_me). One arm for
+                // both, or the 'user' arm is a mutant-shaped duplicate.
+                _ => login_eq(reviewer, viewer),
             })
             .collect();
 

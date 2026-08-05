@@ -435,11 +435,12 @@ pub enum Msg {
     },
     /// The rate-limit floor stopped this stream; typed so the summary and
     /// stats never string-sniff. The watermark holds at the last completed
-    /// window boundary. reset_at's consumer is the milestone-3 contract
-    /// freeze (`retry_after` on TRANSIENT/deferred disclosures); the writer
-    /// discards it until that field exists — carried now because the
-    /// message shape is the workers' contract and adding it later would
-    /// touch every send site.
+    /// window boundary. reset_at feeds `retry_after` on the TRANSIENT
+    /// envelope where an envelope exists (the targeted `sync --pr` path);
+    /// a full run's deferral is a summary disclosure, not an error, so
+    /// here the field waits for a summary consumer — carried in the
+    /// message because its shape is the workers' contract and adding it
+    /// later would touch every send site.
     Deferred {
         repo: String,
         stream: Stream,
@@ -3040,10 +3041,12 @@ fn upsert_children(
                     // Invisible (None) or fragment-less (Unresolved: Bot,
                     // Mannequin, EnterpriseTeam) reviewers have no name to
                     // store. The request is real — totalCount counts it —
-                    // but a row needs an identity; the viewer's own
-                    // requests are always visible to the viewer, so the
-                    // demand surface (attention) cannot under-fill from
-                    // this skip.
+                    // but a row needs an identity; the viewer's own USER
+                    // requests are always visible to the viewer, and a
+                    // team request under-fills only for a team the viewer
+                    // cannot see, which a truthfully-declared config.teams
+                    // membership rules out — so the demand surface
+                    // (attention) cannot under-fill from this skip.
                     Some(parse::RequestedReviewer::Unresolved(_)) | None => {}
                 }
             }
@@ -3772,7 +3775,12 @@ fn run_targeted(cfg: &Config, archive: &mut RwArchive, reference: &str) -> Resul
         ))),
         HydrateEnd::RateExhausted => Err(Error::transient(
             "the GraphQL point budget is exhausted; retry after it resets",
-        )),
+        )
+        // The freeze batch's TRANSIENT disclosure: resetAt is API data the
+        // telemetry already carries when any call in this run returned a
+        // rateLimit envelope; absent one, the envelope simply omits it
+        // ("when gh returned one" — DESIGN.md, command surface).
+        .with_retry_after(gh_ctx.tel.reset_at.as_ref().map(|t| t.as_str().to_string()))),
         HydrateEnd::Fatal(error) => Err(error),
     }
 }
