@@ -445,8 +445,12 @@ pub struct ReviewRequestNode {
     /// (tests/fixtures/hydrate_pr_comments.json carries one), deletion
     /// another. It does NOT mean "no reviewer": the request is real and
     /// totalCount counts it, so a consumer must never read `None` as
-    /// gone/deleted (sync.rs upserts it as an unresolvable request row;
-    /// the witness rule at counted_complete owns the count judgment).
+    /// gone/deleted (sync.rs SKIPS it — a row needs an identity — and the
+    /// demand surface cannot under-fill from that skip: the viewer's own
+    /// USER requests are always visible to the viewer, and a team request
+    /// under-fills only for a team the viewer cannot see, which a
+    /// truthfully-declared config.teams membership rules out; the
+    /// witness rule at counted_complete owns the count judgment).
     #[serde(deserialize_with = "nullable")]
     pub requested_reviewer: Option<RequestedReviewer>,
 }

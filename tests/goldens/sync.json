@@ -1,0 +1,45 @@
+{
+  "sync": {
+    "rate_remaining": 4000,
+    "repos": [
+      {
+        "cost": {
+          "bytes_parsed": 4513,
+          "rate_cost": 3,
+          "sleep_seconds": "<SECS>",
+          "sleeps": 0,
+          "subprocess_count": 3,
+          "subprocess_seconds": "<SECS>"
+        },
+        "counts": {
+          "fetched": 2,
+          "filtered": 0,
+          "observations": 0,
+          "soft_deleted": 0,
+          "unchanged": 0,
+          "upserted": 2
+        },
+        "health": {
+          "deferred_at_floor": false,
+          "discovery_truncated": 0,
+          "errors": [],
+          "masked_hits": 0,
+          "quarantined": 0,
+          "rate_limit_unknown": 0,
+          "truncated": 0,
+          "watchdog_kills": 0
+        },
+        "refresh": {
+          "bodies_skipped": 0,
+          "escalations": {},
+          "full_walks": 0,
+          "quiet_mutations_found": 0,
+          "reverified": 0,
+          "reverify_shed": 0,
+          "tail_hits": 0
+        },
+        "repo": "o/n"
+      }
+    ]
+  }
+}

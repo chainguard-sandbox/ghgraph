@@ -435,11 +435,12 @@ pub enum Msg {
     },
     /// The rate-limit floor stopped this stream; typed so the summary and
     /// stats never string-sniff. The watermark holds at the last completed
-    /// window boundary. reset_at's consumer is the milestone-3 contract
-    /// freeze (`retry_after` on TRANSIENT/deferred disclosures); the writer
-    /// discards it until that field exists — carried now because the
-    /// message shape is the workers' contract and adding it later would
-    /// touch every send site.
+    /// window boundary. reset_at feeds `retry_after` on the TRANSIENT
+    /// envelope where an envelope exists (the targeted `sync --pr` path);
+    /// a full run's deferral is a summary disclosure, not an error, so
+    /// here the field waits for a summary consumer — carried in the
+    /// message because its shape is the workers' contract and adding it
+    /// later would touch every send site.
     Deferred {
         repo: String,
         stream: Stream,
@@ -3040,10 +3041,12 @@ fn upsert_children(
                     // Invisible (None) or fragment-less (Unresolved: Bot,
                     // Mannequin, EnterpriseTeam) reviewers have no name to
                     // store. The request is real — totalCount counts it —
-                    // but a row needs an identity; the viewer's own
-                    // requests are always visible to the viewer, so the
-                    // demand surface (attention) cannot under-fill from
-                    // this skip.
+                    // but a row needs an identity; the viewer's own USER
+                    // requests are always visible to the viewer, and a
+                    // team request under-fills only for a team the viewer
+                    // cannot see, which a truthfully-declared config.teams
+                    // membership rules out — so the demand surface
+                    // (attention) cannot under-fill from this skip.
                     Some(parse::RequestedReviewer::Unresolved(_)) | None => {}
                 }
             }
@@ -3550,6 +3553,46 @@ fn summary(tallies: &BTreeMap<String, RepoTally>) -> Value {
     })
 }
 
+/// Did this run leave the archive incomplete? The `sync --strict` gate
+/// predicate: main.rs derives the exit code from this over the summary that
+/// was emitted, with no flag in scope on the writing path — gate flags
+/// change the exit code, never a byte of JSON, and reading the DISCLOSED
+/// document means the gate and a consumer parsing stdout cannot disagree.
+///
+/// Gating health tallies: `truncated`, `quarantined`, `discovery_truncated`,
+/// `deferred_at_floor`, and a non-empty `errors` — each names data the
+/// archive is known to be missing after the run. Excluded on purpose:
+/// `watchdog_kills` and `rate_limit_unknown` (an event retried to success
+/// leaves the archive complete — if it wasn't, one of the gating tallies
+/// already fired) and `masked_hits` (masking is the discovery mechanism
+/// working, not data missing). The targeted form (`sync --pr`) is incomplete
+/// iff its one hydration reports truncated. A document this function cannot
+/// read counts as incomplete — fail-open, the report::attention_has_demands
+/// posture; unreachable from [`run`]'s output by construction, pinned by
+/// test against drift.
+pub fn incomplete(doc: &Value) -> bool {
+    if let Some(pr) = doc.pointer("/sync/pr") {
+        return pr.get("truncated").and_then(Value::as_bool) != Some(false);
+    }
+    match doc.pointer("/sync/repos").and_then(Value::as_array) {
+        None => true,
+        Some(repos) => repos.iter().any(|r| {
+            let health = &r["health"];
+            // Tally counts; deferred_at_floor is the per-repo FLAG (the
+            // floor is run-wide, so the summary carries a bool, not an
+            // event count).
+            ["truncated", "quarantined", "discovery_truncated"]
+                .iter()
+                .any(|k| health.get(*k).and_then(Value::as_u64) != Some(0))
+                || health.get("deferred_at_floor").and_then(Value::as_bool) != Some(false)
+                || health
+                    .get("errors")
+                    .and_then(Value::as_array)
+                    .is_none_or(|e| !e.is_empty())
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // sync --pr: the targeted path (doc on `run`)
 
@@ -3732,7 +3775,12 @@ fn run_targeted(cfg: &Config, archive: &mut RwArchive, reference: &str) -> Resul
         ))),
         HydrateEnd::RateExhausted => Err(Error::transient(
             "the GraphQL point budget is exhausted; retry after it resets",
-        )),
+        )
+        // The freeze batch's TRANSIENT disclosure: resetAt is API data the
+        // telemetry already carries when any call in this run returned a
+        // rateLimit envelope; absent one, the envelope simply omits it
+        // ("when gh returned one" — DESIGN.md, command surface).
+        .with_retry_after(gh_ctx.tel.reset_at.as_ref().map(|t| t.as_str().to_string()))),
         HydrateEnd::Fatal(error) => Err(error),
     }
 }
@@ -4298,5 +4346,65 @@ mod tests {
             tail_conservation(&arch, 0, &[], true),
             TailVerdict::Escalate("count imbalance")
         );
+    }
+
+    /// The --strict classification table: which disclosed fields gate and
+    /// which deliberately do not (the doc on `incomplete` argues each).
+    #[test]
+    fn strict_incompleteness_reads_the_disclosed_summary() {
+        let full_run = |health: Value| {
+            json!({"sync": {"repos": [
+                {"repo": "o/n", "health": health},
+            ], "rate_remaining": 4000}})
+        };
+        let clean = json!({
+            "truncated": 0, "quarantined": 0, "discovery_truncated": 0,
+            "deferred_at_floor": false, "watchdog_kills": 0, "masked_hits": 0,
+            "rate_limit_unknown": 0, "errors": [],
+        });
+        assert!(!incomplete(&full_run(clean.clone())));
+        // Each gating field fires alone; the floor is the summary's one
+        // BOOLEAN health field (run-wide flag, not an event count), so it
+        // gets its own arm — and the type mismatch either way must read
+        // incomplete, not clean (the shape-drift pin).
+        for k in ["truncated", "quarantined", "discovery_truncated"] {
+            let mut h = clean.clone();
+            h[k] = json!(1);
+            assert!(incomplete(&full_run(h)), "{k} must gate");
+        }
+        let mut h = clean.clone();
+        h["deferred_at_floor"] = json!(true);
+        assert!(incomplete(&full_run(h)), "deferred_at_floor must gate");
+        let mut h = clean.clone();
+        h["deferred_at_floor"] = json!(0);
+        assert!(
+            incomplete(&full_run(h)),
+            "a number where the flag belongs is shape drift, never all-clear"
+        );
+        let mut h = clean.clone();
+        h["errors"] = json!(["boom"]);
+        assert!(incomplete(&full_run(h)), "errors must gate");
+        // The deliberate exclusions: disclosed, never gating alone.
+        for k in ["watchdog_kills", "masked_hits", "rate_limit_unknown"] {
+            let mut h = clean.clone();
+            h[k] = json!(3);
+            assert!(!incomplete(&full_run(h)), "{k} must not gate");
+        }
+        // The targeted form gates on its one hydration's completeness.
+        let targeted = |truncated: bool| {
+            json!({"sync": {"pr": {
+                "repo": "o/n", "number": 1, "outcome": "hydrated",
+                "verified": !truncated, "truncated": truncated,
+            }}})
+        };
+        assert!(!incomplete(&targeted(false)));
+        assert!(incomplete(&targeted(true)));
+        // Unreadable documents fail open (drift pin: reachable only if
+        // run()'s output shape moves without this predicate moving).
+        assert!(incomplete(&json!({})));
+        assert!(incomplete(&json!({"sync": {"repos": "not an array"}})));
+        assert!(incomplete(&full_run(
+            json!({"truncated": "NaN", "errors": []})
+        )));
     }
 }

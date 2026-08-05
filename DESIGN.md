@@ -234,8 +234,11 @@ scaffolding, tooling — belongs in a flag (the `--help`/`--version` family) or
 the Makefile, not in a command that would have no MCP counterpart. stdout is
 always one JSON document (carve-outs:
 `--help`/`--version`, and abnormal exit, where empty stdout plus nonzero exit
-reads as INTERNAL); progress goes to stderr; a closed pipe is a silent
-exit 0, never a panic. Errors are typed envelopes, and the code names the
+reads as INTERNAL); progress goes to stderr; a closed pipe is silent —
+no panic, no extra bytes — and the process keeps the exit code it had
+already earned before the write (a tripped gate still exits 1, an error
+still exits 2; a plain read exits 0): EPIPE means the consumer went away,
+never "all clear". Errors are typed envelopes, and the code names the
 actor who can fix it: a typo in user SQL is USER_INPUT, a full disk is
 CONFIGURATION with remedy text (the archive is a disposable cache — remove
 and resync), INTERNAL means file a ghgraph bug and nothing else. Every read
@@ -266,7 +269,11 @@ Project scope adds maintainer buckets under the same rule: `needs_reviewer`
 labels, no assignee, no maintainer reply) are demands, so they fail open.
 Buckets derive from archive state at read time: `people_prs` membership is
 `author ∈ config.people` regardless of which scope or flavor ingested the
-row, and maintainer buckets are emitted only for repos configured at
+row, a team review request reaches `waiting_on_me` only through a declared
+`config.teams` name (membership is declared, not verified — team rosters
+are not local data, and without the declaration a team request provably
+addresses no particular viewer; config.rs records the argument), and
+maintainer buckets are emitted only for repos configured at
 project scope when read — archive contents never create a bucket. Limits
 (`--limit`, with disclosed totals, always) govern presentation; polarity
 governs derivation — a limit is never precedent for suppressing a demand.

@@ -162,8 +162,10 @@ CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments (thread);
 -- Current review requests, replaced wholesale per PR per sync. Role ("mine" vs
 -- "reviewing") is derived at query time from author + this table — a stored
 -- role column would go stale and mislabel author-and-reviewer PRs. kind keeps
--- a user "platform" distinct from a team "platform": a team request reaches
--- waiting_on_me by team name, a user request by login (attention.rs).
+-- a user "platform" distinct from a team "platform": a user request reaches
+-- waiting_on_me by login, a team request only through a team name the
+-- operator DECLARED in config.teams — the empty default surfaces none
+-- (attention.rs owns the bucket rule, config.rs the declaration argument).
 CREATE TABLE IF NOT EXISTS review_requests (
   pr       INTEGER NOT NULL,             -- prs.pk
   reviewer TEXT NOT NULL,

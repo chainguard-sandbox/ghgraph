@@ -1,0 +1,152 @@
+{
+  "_meta": {
+    "archive": [
+      {
+        "config_pending": true,
+        "fingerprint": {
+          "bots": true,
+          "exclude_authors": [],
+          "lookback_days": 90,
+          "people": [],
+          "scope": "working",
+          "viewer": "me"
+        },
+        "hint": "stale — run: ghgraph sync",
+        "repo": "octo/alpha",
+        "streams": [
+          {
+            "age_seconds": "<AGE>",
+            "last_checked_at": "2026-01-05T00:10:00Z",
+            "stale": true,
+            "stream": "pr"
+          }
+        ]
+      },
+      {
+        "config_pending": true,
+        "fingerprint": {
+          "bots": true,
+          "exclude_authors": [],
+          "lookback_days": 90,
+          "people": [],
+          "scope": "working",
+          "viewer": "me"
+        },
+        "hint": "stale — run: ghgraph sync",
+        "repo": "octo/beta",
+        "streams": [
+          {
+            "age_seconds": "<AGE>",
+            "last_checked_at": "2026-01-04T00:10:00Z",
+            "stale": true,
+            "stream": "pr"
+          }
+        ]
+      },
+      {
+        "config_pending": true,
+        "fingerprint": {
+          "bots": true,
+          "exclude_authors": [],
+          "lookback_days": 90,
+          "people": [],
+          "scope": "working",
+          "viewer": "me"
+        },
+        "hint": "stale — run: ghgraph sync",
+        "repo": "octo/gone",
+        "streams": [
+          {
+            "age_seconds": "<AGE>",
+            "last_checked_at": "2026-01-03T00:10:00Z",
+            "stale": true,
+            "stream": "pr"
+          }
+        ]
+      }
+    ],
+    "generated_at": "<TIME>",
+    "schema_version": 1
+  },
+  "attention": [
+    {
+      "bucket": "waiting_on_me",
+      "prs": [
+        {
+          "author": "me",
+          "author_assoc": "OWNER",
+          "draft": false,
+          "number": 9,
+          "repo": "octo/alpha",
+          "requested_via": [],
+          "threads_waiting": 1,
+          "title": "Split the report module",
+          "truncated": false,
+          "updated_at": "2026-01-06T12:00:00Z",
+          "url": "https://github.com/octo/alpha/pull/9",
+          "verified_at": "2026-01-06T12:00:00Z"
+        }
+      ],
+      "returned": 1,
+      "total": 2
+    },
+    {
+      "bucket": "they_replied",
+      "prs": [
+        {
+          "author": "alice",
+          "author_assoc": "CONTRIBUTOR",
+          "draft": false,
+          "last_other_activity_at": "2026-01-04T00:00:00Z",
+          "number": 1,
+          "repo": "octo/alpha",
+          "title": "Harden the retry loop",
+          "truncated": false,
+          "updated_at": "2026-01-05T00:00:00Z",
+          "url": "https://github.com/octo/alpha/pull/1",
+          "verified_at": "2026-01-05T00:00:00Z"
+        }
+      ],
+      "returned": 1,
+      "total": 1
+    },
+    {
+      "bucket": "ready_to_merge",
+      "prs": [
+        {
+          "author": "me",
+          "author_assoc": "OWNER",
+          "draft": false,
+          "number": 2,
+          "repo": "octo/alpha",
+          "title": "Retry the sync watchdog",
+          "truncated": false,
+          "updated_at": "2026-01-06T00:00:00Z",
+          "url": "https://github.com/octo/alpha/pull/2",
+          "verified_at": "2026-01-06T00:00:00Z"
+        }
+      ],
+      "returned": 1,
+      "total": 1
+    },
+    {
+      "bucket": "people_prs",
+      "prs": [
+        {
+          "author": "alice",
+          "author_assoc": "CONTRIBUTOR",
+          "draft": false,
+          "number": 8,
+          "repo": "octo/alpha",
+          "title": "Document the archive layout",
+          "truncated": false,
+          "updated_at": "2026-01-04T12:00:00Z",
+          "url": "https://github.com/octo/alpha/pull/8",
+          "verified_at": "2026-01-04T12:00:00Z"
+        }
+      ],
+      "returned": 1,
+      "total": 1
+    }
+  ]
+}

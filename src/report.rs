@@ -79,6 +79,29 @@
 //!   `author_id` stays internal everywhere: identity plumbing, not a display
 //!   field (ROADMAP, freeze batch). `head_committed_at` also stays internal:
 //!   the derived staleness fields carry its meaning.
+//!   * `attention` emits the four buckets as an ARRAY — the one place key
+//!     order matters (fixed order IS priority, attention.rs) and sorted-key
+//!     objects cannot carry it:
+//!
+//! ```text
+//! { "_meta": ...,
+//!   "attention": [ { "bucket": "waiting_on_me" | "they_replied" |
+//!                              "ready_to_merge" | "people_prs",
+//!                    "total", "returned",
+//!                    "prs": [ { repo, number, title, draft, author,
+//!                               author_assoc, updated_at, url, truncated,
+//!                               verified_at,
+//!                               requested_via? threads_waiting?      (waiting_on_me)
+//!                               last_other_activity_at? } ] } ] }    (they_replied)
+//! ```
+//!
+//!   Rows are locators (search's argument), recency-ordered (updated_at
+//!   DESC, tiebroken total by repo, number); every bucket appears even
+//!   when empty — an empty array IS the "checked, nothing" disclosure.
+//!   `--fail-if-any` never reaches this module: main.rs derives the exit
+//!   code from [`attention_has_demands`] over the emitted document, built
+//!   with no flag in scope — gate flags change the exit code, never a
+//!   byte of JSON, and the signature is the mechanism.
 //!   * `search` regroups hits by their parent PR/issue: bm25 ranks from
 //!     separate FTS indexes (prs_fts, comments_fts, issues_fts) are not
 //!     comparable, so no cross-index rank exists to sort by, honest or
@@ -115,24 +138,350 @@ use crate::attention::{self, PushBounds, ReviewSignal, ThreadComment};
 use crate::config::Config;
 use crate::db::{self, RoArchive};
 use crate::error::{Error, Result};
-use crate::identity::RepoName;
+use crate::identity::{RepoName, login_eq};
 use crate::refs;
 use crate::time::Rfc3339Utc;
 
 /// The OUTPUT-CONTRACT version stamped into `_meta.schema_version`. Distinct
 /// from db::SCHEMA_VERSION (the archive's storage version): the archive can
 /// migrate without a consumer-visible change, which is exactly what archive
-/// v2 was. Version 1 freezes at the end of milestone 3 (all seven verbs
-/// golden); from that point changes are additive-only and anything else
-/// bumps this.
+/// v2 was. Version 1 FROZE with milestone 3 — all seven verbs golden
+/// (tests/read_surface.rs holds the read verbs' byte-level record,
+/// tests/sync_pipeline.rs the sync summary's). From here changes
+/// are additive-only: a new field or a new always-present key is a golden
+/// regeneration; renaming, removing, retyping, or re-meaning anything bumps
+/// this and is a design event, not an edit.
 pub const CONTRACT_VERSION: u64 = 1;
 
 /// A stream is stale when unchecked for longer than this (24h), or never
 /// checked. Advisory only — reads never fail stale.
 const STALE_AFTER_SECS: i64 = 86_400;
 
-pub fn attention(_cfg: &Config, _fail_if_any: bool) -> Result<Value> {
-    todo!("PLANNED (milestone 3): buckets per attention.rs module docs; --fail-if-any reserved")
+pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
+    let archive = open(cfg)?;
+    let conn = read_snapshot(&archive)?;
+    let conn = &*conn;
+    let viewer = cfg.viewer.as_str();
+
+    // Candidates: every open, not-upstream-deleted PR (the bucket scope —
+    // attention.rs module docs own the argument). Iteration order (repo,
+    // number) is a total order; the per-bucket recency sort below re-orders
+    // deterministically on top of it.
+    let mut cand_stmt = conn
+        .prepare(
+            "SELECT pk, repo, number, title, is_draft, author, author_assoc, \
+                    review_decision, created_at, updated_at, url, truncated, verified_at, \
+                    head_committed_at \
+             FROM prs WHERE state = 'OPEN' AND deleted_at IS NULL ORDER BY repo, number",
+        )
+        .map_err(classify_ours)?;
+    struct Cand {
+        pk: i64,
+        repo: String,
+        number: i64,
+        title: String,
+        draft: bool,
+        author: Option<String>,
+        author_assoc: Option<String>,
+        review_decision: Option<String>,
+        created_at: String,
+        updated_at: String,
+        url: String,
+        truncated: bool,
+        verified_at: Option<String>,
+        head_committed_at: Option<String>,
+    }
+    let cands: Vec<Cand> = cand_stmt
+        .query_map([], |r| {
+            Ok(Cand {
+                pk: r.get(0)?,
+                repo: r.get(1)?,
+                number: r.get(2)?,
+                title: r.get(3)?,
+                draft: r.get(4)?,
+                author: r.get(5)?,
+                author_assoc: r.get(6)?,
+                review_decision: r.get(7)?,
+                created_at: r.get(8)?,
+                updated_at: r.get(9)?,
+                url: r.get(10)?,
+                truncated: r.get(11)?,
+                verified_at: r.get(12)?,
+                head_committed_at: r.get(13)?,
+            })
+        })
+        .map_err(classify_ours)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(classify_ours)?;
+
+    // One prepared statement per signal, reused across candidates.
+    let mut rq_stmt = conn
+        .prepare("SELECT reviewer, kind FROM review_requests WHERE pr = ?1 ORDER BY kind, reviewer")
+        .map_err(classify_ours)?;
+    let mut rev_stmt = conn
+        .prepare(
+            "SELECT author, state, created_at FROM comments \
+             WHERE parent_kind = 'pr' AND parent = ?1 AND kind = 'review' \
+               AND deleted_at IS NULL \
+             ORDER BY created_at, id",
+        )
+        .map_err(classify_ours)?;
+    let mut flip_stmt = conn
+        .prepare(
+            "SELECT observed_at FROM observations \
+             WHERE pr = ?1 AND field = 'head_sha' \
+             ORDER BY observed_at DESC, seq DESC LIMIT 1",
+        )
+        .map_err(classify_ours)?;
+    let mut thread_stmt = conn
+        .prepare(
+            "SELECT pk FROM review_threads \
+             WHERE pr = ?1 AND deleted_at IS NULL AND is_resolved = 0 ORDER BY pk",
+        )
+        .map_err(classify_ours)?;
+    let mut tc_stmt = conn
+        .prepare(
+            "SELECT author, is_minimized, deleted_at IS NOT NULL FROM comments \
+             WHERE thread = ?1 ORDER BY created_at, id",
+        )
+        .map_err(classify_ours)?;
+    // Substantive activity split by party. Minimized and deleted comments
+    // are neither activity nor participation (attention.rs); logins compare
+    // by login_eq semantics — ASCII logins make COLLATE NOCASE the same
+    // equivalence (identity.rs, the prs --author precedent). MAX over
+    // RFC 3339 "Z" ingest text; attention.rs re-parses before judging.
+    let mut viewer_last_stmt = conn
+        .prepare(
+            "SELECT MAX(created_at) FROM comments \
+             WHERE parent_kind = 'pr' AND parent = ?1 AND deleted_at IS NULL \
+               AND is_minimized = 0 AND author = ?2 COLLATE NOCASE",
+        )
+        .map_err(classify_ours)?;
+    // An APPROVED review verdict is not a reply (attention.rs module docs:
+    // counting it would starve ready_to_merge behind they_replied). `IS`,
+    // not `=`: a review row with a NULL state must COUNT as activity —
+    // under `=`, three-valued logic makes the NOT arm NULL and drops the
+    // row, silently suppressing a demand (fail-closed, the wrong
+    // polarity). Unreachable from ghgraph's own writer, but a derivation
+    // input is validated where it is consumed (attention.rs).
+    let mut other_last_stmt = conn
+        .prepare(
+            "SELECT MAX(created_at) FROM comments \
+             WHERE parent_kind = 'pr' AND parent = ?1 AND deleted_at IS NULL \
+               AND is_minimized = 0 \
+               AND (author IS NULL OR author <> ?2 COLLATE NOCASE) \
+               AND NOT (kind = 'review' AND state IS 'APPROVED')",
+        )
+        .map_err(classify_ours)?;
+
+    // (updated_at, repo, number, row) per bucket, sorted after collection.
+    let mut buckets: Vec<Vec<(String, String, i64, Value)>> =
+        attention::Bucket::ALL.iter().map(|_| Vec::new()).collect();
+
+    for cand in &cands {
+        let viewers_pr = cand.author.as_deref().is_some_and(|a| login_eq(a, viewer));
+        let person_pr = cand
+            .author
+            .as_deref()
+            .is_some_and(|a| cfg.people.iter().any(|p| login_eq(p.as_str(), a)));
+
+        // Review requests addressing the viewer: user rows by login, team
+        // rows by a declared config.teams name (config.rs owns why).
+        let requests: Vec<(String, String)> = rq_stmt
+            .query_map([cand.pk], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(classify_ours)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(classify_ours)?;
+        let requested_via: Vec<&(String, String)> = requests
+            .iter()
+            .filter(|(reviewer, kind)| match kind.as_str() {
+                "team" => cfg.teams.iter().any(|t| login_eq(t.as_str(), reviewer)),
+                // 'user' — and, deliberately, any UNRECOGNIZED kind: sync
+                // writes only 'user'/'team' (schema.sql), so an unknown
+                // kind is shape drift, and one naming the viewer escalates
+                // rather than silently dropping a request addressed to
+                // them (uncertainty may add to waiting_on_me). One arm for
+                // both, or the 'user' arm is a mutant-shaped duplicate.
+                _ => login_eq(reviewer, viewer),
+            })
+            .collect();
+
+        let reviews: Vec<(Option<String>, Option<String>, String)> = rev_stmt
+            .query_map([cand.pk], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(classify_ours)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(classify_ours)?;
+        let viewer_reviewed = reviews
+            .iter()
+            .any(|(author, _, _)| author.as_deref().is_some_and(|a| login_eq(a, viewer)));
+        let head_flip: Option<String> = flip_stmt
+            .query_row([cand.pk], |r| r.get(0))
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(classify_ours(e)),
+            })?;
+        let bounds = PushBounds {
+            head_committed_at: cand.head_committed_at.as_deref(),
+            head_flip_observed_at: head_flip.as_deref(),
+        };
+        let signals: Vec<ReviewSignal<'_>> = reviews
+            .iter()
+            .filter_map(|(author, state, at)| {
+                state.as_ref().map(|s| ReviewSignal {
+                    reviewer: author.as_deref().unwrap_or(""),
+                    state: s,
+                    submitted_at: at,
+                })
+            })
+            .collect();
+        let effective = attention::effective_review_state(&signals, &bounds);
+
+        let unresolved: Vec<i64> = thread_stmt
+            .query_map([cand.pk], |r| r.get(0))
+            .map_err(classify_ours)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(classify_ours)?;
+        let mut threads_waiting = 0u64;
+        for tpk in &unresolved {
+            let tc: Vec<(Option<String>, bool, bool)> = tc_stmt
+                .query_map([tpk], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map_err(classify_ours)?
+                .collect::<std::result::Result<_, _>>()
+                .map_err(classify_ours)?;
+            let tc: Vec<ThreadComment<'_>> = tc
+                .iter()
+                .map(|(author, minimized, deleted)| ThreadComment {
+                    author: author.as_deref(),
+                    is_minimized: *minimized,
+                    deleted: *deleted,
+                })
+                .collect();
+            if attention::waiting_on(viewer, cand.author.as_deref(), false, &tc)
+                == Some(attention::WaitingOn::Me)
+            {
+                threads_waiting += 1;
+            }
+        }
+
+        let viewer_spoke_at: Option<String> = viewer_last_stmt
+            .query_row(rusqlite::params![cand.pk, viewer], |r| r.get(0))
+            .map_err(classify_ours)?;
+        // Authorship is participation, at the PR's created_at; both stamps
+        // are canonical "Z" ingest text, so lexicographic max agrees with
+        // time order (and a non-canonical stray fails open in attention.rs).
+        let viewer_last = match (viewer_spoke_at, viewers_pr) {
+            (Some(spoke), true) => Some(spoke.max(cand.created_at.clone())),
+            (Some(spoke), false) => Some(spoke),
+            (None, true) => Some(cand.created_at.clone()),
+            (None, false) => None,
+        };
+        let other_last: Option<String> = other_last_stmt
+            .query_row(rusqlite::params![cand.pk, viewer], |r| r.get(0))
+            .map_err(classify_ours)?;
+
+        let placed = attention::bucket(&attention::PrSignals {
+            viewers_pr,
+            person_pr,
+            draft: cand.draft,
+            truncated: cand.truncated,
+            review_decision: cand.review_decision.as_deref(),
+            requested_of_viewer: !requested_via.is_empty(),
+            thread_demands_viewer: threads_waiting > 0,
+            viewer_last_activity_at: viewer_last.as_deref(),
+            last_other_activity_at: other_last.as_deref(),
+            effective,
+            has_unresolved_threads: !unresolved.is_empty(),
+            viewer_reviewed,
+        });
+        let Some(placed) = placed else { continue };
+
+        let mut row = json!({
+            "repo": cand.repo,
+            "number": cand.number,
+            "title": cand.title,
+            "draft": cand.draft,
+            "author": cand.author,
+            "author_assoc": cand.author_assoc,
+            "updated_at": cand.updated_at,
+            "url": cand.url,
+            "truncated": cand.truncated,
+            "verified_at": cand.verified_at,
+        });
+        let obj = row.as_object_mut().expect("built as an object above");
+        match placed {
+            attention::Bucket::WaitingOnMe => {
+                // The evidence for each arm of the bucket rule: which
+                // requests address the viewer, and how many unresolved
+                // threads on the viewer's own PR wait on them (the own-PR
+                // restriction is the bucket's, so the disclosed count
+                // matches what qualified the row; participated threads on
+                // others' PRs surface via they_replied instead).
+                obj.insert(
+                    "requested_via".into(),
+                    Value::Array(
+                        requested_via
+                            .iter()
+                            .map(|(reviewer, kind)| json!({ "kind": kind, "reviewer": reviewer }))
+                            .collect(),
+                    ),
+                );
+                obj.insert(
+                    "threads_waiting".into(),
+                    json!(if viewers_pr { threads_waiting } else { 0 }),
+                );
+            }
+            attention::Bucket::TheyReplied => {
+                obj.insert("last_other_activity_at".into(), json!(other_last));
+            }
+            attention::Bucket::ReadyToMerge | attention::Bucket::PeoplePrs => {}
+        }
+        let idx = attention::Bucket::ALL
+            .iter()
+            .position(|b| *b == placed)
+            .expect("ALL enumerates every bucket");
+        buckets[idx].push((cand.updated_at.clone(), cand.repo.clone(), cand.number, row));
+    }
+
+    // Per-bucket recency order (updated_at DESC — search's argument for the
+    // meaningful work-memory axis), tiebroken to total by (repo, number).
+    // --limit caps rows per bucket; totals stay disclosed (limits govern
+    // presentation, polarity governs derivation — attention.rs).
+    let cap = limit.unwrap_or(usize::MAX);
+    let out: Vec<Value> = attention::Bucket::ALL
+        .iter()
+        .zip(buckets)
+        .map(|(b, mut rows)| {
+            rows.sort_by(|(ua, ra, na, _), (ub, rb, nb, _)| {
+                ub.cmp(ua).then_with(|| ra.cmp(rb)).then_with(|| na.cmp(nb))
+            });
+            let total = rows.len();
+            let prs: Vec<Value> = rows.into_iter().take(cap).map(|(_, _, _, v)| v).collect();
+            json!({
+                "bucket": b.as_str(),
+                "total": total,
+                "returned": prs.len(),
+                "prs": prs,
+            })
+        })
+        .collect();
+
+    Ok(json!({ "_meta": meta(cfg, conn)?, "attention": out }))
+}
+
+/// Does an `attention` document carry any demand? Reads the DISCLOSED
+/// per-bucket totals of the document that was (or will be) emitted, so the
+/// gate and a consumer parsing stdout can never disagree. A document this
+/// function cannot read counts as demanding (fail-open: a gate that cannot
+/// prove "all clear" must not report it) — unreachable from [`attention`]'s
+/// output by construction, pinned by test against drift.
+pub fn attention_has_demands(doc: &Value) -> bool {
+    match doc.get("attention").and_then(Value::as_array) {
+        None => true,
+        Some(buckets) => buckets
+            .iter()
+            .any(|b| b.get("total").and_then(Value::as_u64) != Some(0)),
+    }
 }
 
 pub fn prs(
@@ -1496,6 +1845,33 @@ mod tests {
         assert_eq!(
             classify_user_query(sqlite(rusqlite::ffi::SQLITE_ERROR)).code,
             Code::UserInput
+        );
+    }
+
+    /// The --fail-if-any gate reads the disclosed totals; anything it
+    /// cannot read is a demand (fail-open). The unreadable arms are drift
+    /// pins: reachable only if attention()'s output shape moves without
+    /// this predicate moving.
+    #[test]
+    fn fail_if_any_reads_the_disclosed_totals() {
+        let doc = |totals: [u64; 4]| {
+            json!({"attention": [
+                {"bucket": "waiting_on_me", "total": totals[0], "returned": 0, "prs": []},
+                {"bucket": "they_replied", "total": totals[1], "returned": 0, "prs": []},
+                {"bucket": "ready_to_merge", "total": totals[2], "returned": 0, "prs": []},
+                {"bucket": "people_prs", "total": totals[3], "returned": 0, "prs": []},
+            ]})
+        };
+        assert!(!attention_has_demands(&doc([0, 0, 0, 0])));
+        for i in 0..4 {
+            let mut t = [0u64; 4];
+            t[i] = 1;
+            assert!(attention_has_demands(&doc(t)), "bucket {i} must trip");
+        }
+        assert!(attention_has_demands(&json!({})), "unreadable fails open");
+        assert!(
+            attention_has_demands(&json!({"attention": [{"bucket": "waiting_on_me"}]})),
+            "a missing total is never all-clear"
         );
     }
 

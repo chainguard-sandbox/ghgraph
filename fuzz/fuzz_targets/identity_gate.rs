@@ -18,7 +18,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use ghgraph::identity::{AuthorPattern, Login, RepoName, is_bot, login_eq};
+use ghgraph::identity::{AuthorPattern, Login, RepoName, TeamName, is_bot, login_eq};
 
 fn valid_login_chars(s: &str) -> bool {
     !s.is_empty()
@@ -53,6 +53,26 @@ fuzz_target!(|data: &[u8]| {
             "name half not re-recognized: {name:?}"
         );
         assert_eq!(RepoName::new(c).ok().as_ref(), Some(&r), "canonicalization idempotent");
+    }
+
+    if let Ok(t) = TeamName::new(s) {
+        let c = t.as_str();
+        // Independent recognizer for the plausibility gate (chars-based vs
+        // the constructor's mixed checks): the accepted set must not widen.
+        assert!(
+            !c.is_empty()
+                && c.len() <= 255
+                && c.chars().all(|ch| !ch.is_control())
+                && !c.starts_with(char::is_whitespace)
+                && !c.ends_with(char::is_whitespace),
+            "accepted team name not re-recognized: {c:?}"
+        );
+        assert_eq!(c, s, "stored as typed: no fold, no trim");
+        assert_eq!(
+            TeamName::new(c).ok().as_ref(),
+            Some(&t),
+            "acceptance idempotent"
+        );
     }
 
     if let Ok(p) = AuthorPattern::parse(s) {
