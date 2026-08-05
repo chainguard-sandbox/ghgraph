@@ -1886,6 +1886,33 @@ fn issue_stream_hydrates_populates_fts_and_replays_clean() {
     ));
     assert_eq!(stamps, 2, "replay must not move issue verified_at");
     assert_eq!(dump1, fake.dump(), "byte-identical archive after replay");
+
+    // A real change on a verified, untruncated row: the witnessed refetch
+    // both writes the field and MOVES the stamp — the field_changed arm of
+    // the stamp rule standing alone (no truncation, no re-verify origin).
+    let mut a2 = Issue::new("I_1", 11, "2026-07-23T00:00:00Z");
+    a2.labels = vec!["zeta", "bug", "bug"];
+    a2.assignees = vec!["bob"];
+    a2.body = "the frobnicator misfires".into();
+    a2.title = "retitled upstream".into();
+    install_issues(&fake, &[&a2, &b]);
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["counts"]["upserted"], 1, "{s}");
+    let (title, verified_at): (String, Option<String>) = fake
+        .db()
+        .query_row(
+            "SELECT title, verified_at FROM issues WHERE repo='o/n' AND number=11",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(title, "retitled upstream");
+    assert_ne!(
+        verified_at.as_deref(),
+        Some(recent.as_str()),
+        "a changed witnessed refetch re-stamps"
+    );
 }
 
 // 17a'. Off means off, at both gates: a project repo with issues: false
@@ -1979,6 +2006,22 @@ fn issue_stream_upgrades_linked_rows_and_linked_never_downgrades() {
         fake.query_one("SELECT hydration_source FROM issues WHERE repo='o/n' AND number=101");
     assert_eq!(source, "linked");
 
+    // Run 1b: the linked TARGET changes upstream while the PR itself does
+    // not — the freshen is the run's only write, and it must both land
+    // and count (a linked-owned row is this writer's to keep fresh).
+    {
+        let mut refreshed: Value = serde_json::from_str(&pr.refresh()).unwrap();
+        refreshed["data"]["node"]["closingIssuesReferences"]["nodes"][0]["title"] =
+            json!("fresher linked title");
+        fake.write("refresh-PR_1.json", &refreshed.to_string());
+    }
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["counts"]["upserted"], 1, "the freshen counts: {s}");
+    let title: String = fake.query_one("SELECT title FROM issues WHERE repo='o/n' AND number=101");
+    assert_eq!(title, "fresher linked title");
+    fake.write("refresh-PR_1.json", &pr.refresh());
+
     // Run 2: the issue stream discovers the same issue; hydration upgrades.
     let mut upstream = Issue::new("I_PR_1", 101, "2026-07-22T00:00:00Z");
     upstream.title = "stream-owned title".into();
@@ -1999,10 +2042,11 @@ fn issue_stream_upgrades_linked_rows_and_linked_never_downgrades() {
     assert_eq!(labels, r#"["triaged"]"#);
     assert!(verified_at.is_some(), "witnessed upgrade stamps");
 
-    // Run 3: PRs only again (issue stream empty this run); the PR's linked
-    // reference still carries the OLD title — the fill-only writer must
-    // not clobber the stream row with it.
-    fake.write("idisc-3-0.json", &discovery_nodes(vec![], None, 4000));
+    // Final run: PRs only again (issue stream empty this run); the PR's
+    // linked reference still carries the OLD title — the fill-only writer
+    // must not clobber the stream row with it. (Run 4: run 1b above
+    // shifted the numbering.)
+    fake.write("idisc-4-0.json", &discovery_nodes(vec![], None, 4000));
     fake.sync_ok();
     let title: String = fake.query_one("SELECT title FROM issues WHERE repo='o/n' AND number=101");
     assert_eq!(
@@ -2583,6 +2627,24 @@ fn drained_issue_resurrects_on_linked_sighting() {
     assert!(deleted.is_none(), "a live sighting clears the drain");
     assert_eq!(source, "stream", "ownership does not move");
     assert_eq!(title, "stream title", "content does not move either");
+
+    // The resurrect is a CONTENT change and must count as one: re-delete
+    // the row directly, replay the otherwise-unchanged PR — the only write
+    // in the run is the sighting's deleted_at clear, and upserted must say
+    // so (a silent resurrect would hide the flip from the summary).
+    fake.db()
+        .execute(
+            "UPDATE issues SET deleted_at = '2026-01-01T00:00:00Z' WHERE number = 101",
+            [],
+        )
+        .unwrap();
+    fake.write("idisc-6-0.json", &discovery_nodes(vec![], None, 4000));
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["counts"]["upserted"], 1, "the resurrect counts: {s}");
+    let deleted: Option<String> =
+        fake.query_one("SELECT deleted_at FROM issues WHERE repo='o/n' AND number=101");
+    assert!(deleted.is_none());
 }
 
 // 17l. A repo failure increments starvation only for the streams THIS RUN

@@ -4158,11 +4158,16 @@ fn upsert_issue_stream(
             // whose upgrade must flip hydration_source — which trips
             // field_changed first. Its mutants are equivalent by that
             // precondition, and stay; the arm itself stays because the
-            // precondition lives in ANOTHER function's SQL. Targeted is
-            // unreachable on the issue path today (--pr is PR-only by
-            // verb contract) — written for rule parity, so a future
-            // --issue lands on the decided policy instead of re-deriving
-            // it; its mutants are equivalent by the same argument.
+            // precondition lives in ANOTHER function's SQL. The truncated
+            // arm co-fires with field_changed for the same reason (a
+            // healing walk flips the stored truncated column, a diffed
+            // field) — load-bearing only on the PR side, where the
+            // TailHit carry can hold the column still; kept for rule
+            // parity, mutants equivalent. Targeted is unreachable on the
+            // issue path today (--pr is PR-only by verb contract) —
+            // written for rule parity, so a future --issue lands on the
+            // decided policy instead of re-deriving it; its mutants are
+            // equivalent by the same argument.
             let stamp = b.verified()
                 && (field_changed
                     || old_verified_at.is_none()
@@ -4261,6 +4266,12 @@ fn upsert_linked_issue(
             now.as_str()
         ],
     )?;
+    // The early return's comparison mutants are known-equivalent, and
+    // stay: an insert-as-the-run's-only-change would need an absent row
+    // beside an otherwise-unchanged PR, which no flow constructs (a PR's
+    // first contact is itself a change, and rows never hard-delete), and
+    // the mutant's fall-through freshen no-ops against the just-inserted
+    // values.
     if inserted > 0 {
         *changed = true;
         return Ok(());
