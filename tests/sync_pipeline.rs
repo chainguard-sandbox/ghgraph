@@ -2,13 +2,15 @@
 // recursion limit; raising it is cosmetic, not architectural.
 #![recursion_limit = "256"]
 
-//! The milestone-2 load-bearing suite (ROADMAP): fixture replay with zero
-//! row and zero FTS deltas (including a metadata-only flip proving the FTS
-//! WHEN guards), SIGKILL at arbitrary points (watermark never leads data;
-//! the redo converges), two-process lock contention, floor-injection
-//! deferral across runs (window banking, monotone watermark, no double
-//! hydration of banked windows), a config-transition test per fingerprint
-//! case including person removal, and the quarantine lifecycle.
+//! The sync pipeline's load-bearing suite (ROADMAP milestones 2 and 4):
+//! fixture replay with zero row and zero FTS deltas (including a
+//! metadata-only flip proving the FTS WHEN guards), SIGKILL at arbitrary
+//! points (watermark never leads data; the redo converges), two-process
+//! lock contention, floor-injection deferral across runs (window banking,
+//! monotone watermark, no double hydration of banked windows), a
+//! config-transition test per fingerprint case including person removal,
+//! the quarantine lifecycle, and the issue stream (stream-typed dispatch,
+//! per-stream watermarks, the linked-cache ownership rule).
 //!
 //! Every test drives the REAL binary (CARGO_BIN_EXE_ghgraph) end to end
 //! with a scripted fake `gh` reached through the child's PATH — the same
@@ -63,10 +65,29 @@ done
 run=$(cat "$dir/run_n" 2>/dev/null || echo 1)
 case "$doc" in
   *'search(type: ISSUE'*)
-    seqf="$dir/disc_seq_$run"; s=$(cat "$seqf" 2>/dev/null || echo 0); echo $((s+1)) > "$seqf"
-    echo "DISC|run=$run|seq=$s|q=$q" >> "$dir/calls.log"
-    resp="$dir/disc-$run-$s.json"
-    [ -f "$resp" ] || resp="$dir/disc-default.json"
+    case "$q" in
+      *'is:issue'*)
+        seqf="$dir/idisc_seq_$run"; s=$(cat "$seqf" 2>/dev/null || echo 0); echo $((s+1)) > "$seqf"
+        echo "IDISC|run=$run|seq=$s|q=$q" >> "$dir/calls.log"
+        resp="$dir/idisc-$run-$s.json"
+        [ -f "$resp" ] || resp="$dir/idisc-default.json"
+        ;;
+      *)
+        seqf="$dir/disc_seq_$run"; s=$(cat "$seqf" 2>/dev/null || echo 0); echo $((s+1)) > "$seqf"
+        echo "DISC|run=$run|seq=$s|q=$q" >> "$dir/calls.log"
+        resp="$dir/disc-$run-$s.json"
+        [ -f "$resp" ] || resp="$dir/disc-default.json"
+        ;;
+    esac
+    ;;
+  *'... on Issue'*'comments(first: 100'*)
+    echo "ICPAGE|run=$run|id=$id|after=$after" >> "$dir/calls.log"
+    resp="$dir/icpage-$id.json"
+    ;;
+  *'labels(first: 20'*)
+    echo "IHYD|run=$run|id=$id" >> "$dir/calls.log"
+    if [ -f "$dir/stderr-$id" ]; then cat "$dir/stderr-$id" >&2; exit 1; fi
+    resp="$dir/ihyd-$id.json"
     ;;
   *'PullRequestReviewThread'*)
     echo "TBODIES|run=$run|id=$id" >> "$dir/calls.log"
@@ -122,6 +143,11 @@ impl Fake {
         let fake = Fake { dir };
         fake.write_exec("gh", GH_SCRIPT);
         fake.write("user.json", r#"{"login":"viewer"}"#);
+        // The issue stream's discovery default: empty. Present from the
+        // start so a project-scope test that only exercises PRs gets an
+        // empty issue walk instead of a missing-fixture transport failure;
+        // issue tests overwrite it via install_issues.
+        fake.write("idisc-default.json", &discovery(&[], None, 4000));
         fake
     }
 
@@ -196,6 +222,16 @@ impl Fake {
             .iter()
             .filter_map(|l| {
                 l.strip_prefix(&format!("REFRESH|run={run}|id="))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    fn issue_hydrations(&self, run: u32) -> Vec<String> {
+        self.calls()
+            .iter()
+            .filter_map(|l| {
+                l.strip_prefix(&format!("IHYD|run={run}|id="))
                     .map(str::to_string)
             })
             .collect()
@@ -486,7 +522,14 @@ impl Pr {
 }
 
 fn discovery(hits: &[&Pr], issue_count: Option<i64>, remaining: u32) -> String {
-    let nodes: Vec<Value> = hits.iter().map(|p| p.hit()).collect();
+    discovery_nodes(
+        hits.iter().map(|p| p.hit()).collect(),
+        issue_count,
+        remaining,
+    )
+}
+
+fn discovery_nodes(nodes: Vec<Value>, issue_count: Option<i64>, remaining: u32) -> String {
     json!({
         "data": {
             "search": {
@@ -498,6 +541,109 @@ fn discovery(hits: &[&Pr], issue_count: Option<i64>, remaining: u32) -> String {
         }
     })
     .to_string()
+}
+
+/// The issue-stream sibling of [`Pr`]: builds DISCOVERY hits and
+/// HYDRATE_ISSUE responses shaped exactly like the live documents
+/// (parse.rs pins the shape offline; capture.rs re-captures it live).
+struct Issue {
+    id: &'static str,
+    number: i64,
+    updated_at: &'static str,
+    title: String,
+    body: String,
+    state: &'static str,
+    author_login: String,
+    author_type: &'static str,
+    labels: Vec<&'static str>,
+    assignees: Vec<&'static str>,
+    comment_ids: Vec<String>,
+    remaining: u32,
+    repo: String,
+    /// comments pageInfo claims another page (with no cursor to walk):
+    /// the witness-withholding shape.
+    comments_has_next: bool,
+    /// A real follow-up cursor: the walkable multi-page shape.
+    comments_cursor: Option<&'static str>,
+}
+
+impl Issue {
+    fn new(id: &'static str, number: i64, updated_at: &'static str) -> Issue {
+        Issue {
+            id,
+            number,
+            updated_at,
+            title: format!("issue title {number}"),
+            body: format!("issue body {number}"),
+            state: "OPEN",
+            author_login: "alice".into(),
+            author_type: "User",
+            labels: vec!["bug"],
+            assignees: vec![],
+            comment_ids: vec![format!("IC_{id}")],
+            remaining: 4000,
+            repo: "o/n".into(),
+            comments_has_next: false,
+            comments_cursor: None,
+        }
+    }
+
+    fn hit(&self) -> Value {
+        json!({
+            "id": self.id,
+            "updatedAt": self.updated_at,
+            "author": {"login": self.author_login, "__typename": self.author_type}
+        })
+    }
+
+    fn hydration(&self) -> String {
+        let comments: Vec<Value> = self
+            .comment_ids
+            .iter()
+            .map(|cid| {
+                json!({
+                    "id": cid, "body": format!("comment {cid}"),
+                    "createdAt": "2026-07-10T00:00:00Z", "lastEditedAt": null,
+                    "url": "https://github.com/x", "isMinimized": false,
+                    "authorAssociation": "NONE", "author": author("carol", "User")
+                })
+            })
+            .collect();
+        let labels: Vec<Value> = self.labels.iter().map(|l| json!({"name": l})).collect();
+        let assignees: Vec<Value> = self.assignees.iter().map(|a| json!({"login": a})).collect();
+        json!({
+            "data": {
+                "node": {
+                    "id": self.id, "number": self.number, "title": self.title,
+                    "body": self.body, "state": self.state,
+                    "url": format!("https://github.com/{}/issues/{}", self.repo, self.number),
+                    "author": author(&self.author_login, self.author_type),
+                    "authorAssociation": "NONE",
+                    "repository": {"nameWithOwner": self.repo},
+                    "createdAt": "2026-07-01T00:00:00Z",
+                    "updatedAt": self.updated_at,
+                    "labels": {"totalCount": labels.len(), "nodes": labels},
+                    "assignees": {"totalCount": assignees.len(), "nodes": assignees},
+                    "comments": {"totalCount": comments.len() + usize::from(self.comments_has_next),
+                        "pageInfo": {"hasNextPage": self.comments_has_next,
+                                     "endCursor": self.comments_cursor},
+                        "nodes": comments}
+                },
+                "rateLimit": rate_limit(self.remaining)
+            }
+        })
+        .to_string()
+    }
+}
+
+fn install_issues(fake: &Fake, issues: &[&Issue]) {
+    fake.write(
+        "idisc-default.json",
+        &discovery_nodes(issues.iter().map(|i| i.hit()).collect(), None, 4000),
+    );
+    for issue in issues {
+        fake.write(&format!("ihyd-{}.json", issue.id), &issue.hydration());
+    }
 }
 
 fn base_config() -> Value {
@@ -1573,10 +1719,11 @@ fn floor_boundary_is_strict() {
 }
 
 // ---------------------------------------------------------------------------
-// 17. The default project-scope config (issues on) syncs its PR stream
-// cleanly: the stream-typed discovery terms keep Issue ids out of PR
-// hydration entirely (the B2 panel's S1 — before the fix, every issue in
-// a project repo became an eternal parse-class quarantine row).
+// 17. Stream-typed dispatch, both directions (the B2 panel's S1, upgraded
+// for milestone 4): the PR walk's terms never carry is:issue and an Issue
+// id never reaches HYDRATE_PR — before the typed terms, every issue in a
+// project repo became an eternal parse-class quarantine row — and,
+// symmetrically, a PR id never reaches HYDRATE_ISSUE.
 
 #[test]
 fn default_project_scope_never_discovers_issues_into_pr_hydration() {
@@ -1590,17 +1737,329 @@ fn default_project_scope_never_discovers_issues_into_pr_hydration() {
     }));
     let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
     install_prs(&fake, &[&a]);
+    let i = Issue::new("I_9", 9, "2026-07-20T11:00:00Z");
+    install_issues(&fake, &[&i]);
 
     let doc = fake.sync_ok();
     let s = fake.repo_summary(&doc, "o/n");
     assert_eq!(s["health"]["quarantined"], 0, "{s}");
-    assert_eq!(s["counts"]["fetched"], 1);
+    assert_eq!(s["counts"]["fetched"], 2, "one PR + one issue");
+    assert_eq!(fake.hydrations(1), vec!["PR_1"], "PR walk: PR ids only");
+    assert_eq!(
+        fake.issue_hydrations(1),
+        vec!["I_9"],
+        "issue walk: issue ids only, through HYDRATE_ISSUE"
+    );
     for call in fake.calls() {
-        assert!(
-            !call.contains("is:issue"),
-            "the milestone-2 PR walk must never emit an issue term: {call}"
-        );
+        if call.starts_with("DISC|") {
+            assert!(
+                !call.contains("is:issue"),
+                "the PR walk must never emit an issue term: {call}"
+            );
+        }
+        if call.starts_with("IDISC|") {
+            assert!(
+                call.contains("is:issue"),
+                "the issue walk's terms are issue-typed: {call}"
+            );
+        }
     }
+}
+
+// 17a. The issue stream end to end: hydration writes the row (labels and
+// assignees canonical), its comments land under parent_kind='issue', FTS
+// serves them, the (repo,'issue') watermark advances independently of the
+// PR stream's, and an unchanged replay writes nothing — the same replay
+// idempotence bar the PR stream clears.
+
+#[test]
+fn issue_stream_hydrates_populates_fts_and_replays_clean() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}],
+        "workers": 1,
+        "retry_attempts": 1,
+        "retry_budget": 5
+    }));
+    let pr = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    install_prs(&fake, &[&pr]);
+    let mut a = Issue::new("I_1", 11, "2026-07-20T12:00:00Z");
+    a.labels = vec!["zeta", "bug", "bug"]; // canonicalized: sorted, deduped
+    a.assignees = vec!["bob"];
+    a.body = "the frobnicator misfires".into();
+    let b = Issue::new("I_2", 12, "2026-07-19T09:00:00Z");
+    install_issues(&fake, &[&a, &b]);
+
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["counts"]["fetched"], 3, "{s}");
+    assert_eq!(
+        s["health"],
+        json!({
+            "truncated": 0, "quarantined": 0, "discovery_truncated": 0,
+            "deferred_at_floor": false, "watchdog_kills": 0, "masked_hits": 0,
+            "rate_limit_unknown": 0, "errors": []
+        })
+    );
+
+    let labels: String = fake.query_one(
+        "SELECT labels FROM issues WHERE repo='o/n' AND number=11 AND hydration_source='stream'",
+    );
+    assert_eq!(labels, r#"["bug","zeta"]"#, "canonical: sorted, deduped");
+    let assignees: String =
+        fake.query_one("SELECT assignees FROM issues WHERE repo='o/n' AND number=11");
+    assert_eq!(assignees, r#"["bob"]"#);
+    let verified: i64 = fake.query_one(
+        "SELECT count(*) FROM issues WHERE repo='o/n' AND hydration_source='stream' \
+         AND verified_at IS NOT NULL AND truncated = 0",
+    );
+    assert_eq!(verified, 2, "witnessed hydrations stamp");
+    let issue_comments: i64 = fake.query_one(
+        "SELECT count(*) FROM comments c JOIN issues i ON c.parent = i.pk \
+         WHERE c.parent_kind = 'issue' AND i.repo = 'o/n' AND i.number IN (11, 12)",
+    );
+    assert_eq!(issue_comments, 2);
+    let fts_hits: i64 =
+        fake.query_one("SELECT count(*) FROM issues_fts WHERE issues_fts MATCH 'frobnicator'");
+    assert_eq!(fts_hits, 1, "the stream writer feeds issues_fts");
+
+    // Per-stream watermarks: each stream's max updatedAt, independently.
+    let pr_wm: String = fake
+        .query_one("SELECT last_item_updated_at FROM sync_state WHERE repo='o/n' AND stream='pr'");
+    let issue_wm: String = fake.query_one(
+        "SELECT last_item_updated_at FROM sync_state WHERE repo='o/n' AND stream='issue'",
+    );
+    assert_eq!(pr_wm, "2026-07-20T10:00:00Z");
+    assert_eq!(issue_wm, "2026-07-20T12:00:00Z");
+
+    // Replay: an unchanged remote writes no row, no observation, no FTS
+    // churn — and re-hydrates nothing it already full-walked... it DOES
+    // re-hydrate (the overlap window rediscovers), but the diff gate makes
+    // every write a no-op.
+    let dump1 = fake.dump();
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["counts"]["upserted"], 0, "replay upserts nothing: {s}");
+    assert_eq!(dump1, fake.dump(), "byte-identical archive after replay");
+}
+
+// 17b. Issue-stream filters: a bot-authored issue is skipped at discovery
+// (no hydration subprocess), counted as filtered, and STILL advances the
+// issue watermark — declined, not unfetched, exactly the PR-stream rule.
+
+#[test]
+fn issue_stream_filters_bots_and_still_advances() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}], // bots default OFF
+        "workers": 1,
+        "retry_attempts": 1,
+        "retry_budget": 5
+    }));
+    install_prs(&fake, &[]);
+    let mut bot = Issue::new("I_B", 21, "2026-07-22T00:00:00Z");
+    bot.author_login = "dependabot".into();
+    bot.author_type = "Bot";
+    let human = Issue::new("I_H", 22, "2026-07-21T00:00:00Z");
+    install_issues(&fake, &[&bot, &human]);
+
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["counts"]["filtered"], 1, "{s}");
+    assert_eq!(s["counts"]["fetched"], 1);
+    assert_eq!(
+        fake.issue_hydrations(1),
+        vec!["I_H"],
+        "the filtered issue costs discovery only"
+    );
+    let issue_wm: String = fake.query_one(
+        "SELECT last_item_updated_at FROM sync_state WHERE repo='o/n' AND stream='issue'",
+    );
+    assert_eq!(
+        issue_wm, "2026-07-22T00:00:00Z",
+        "the bot issue's updatedAt advances the fold: filtered is declined, not unfetched"
+    );
+}
+
+// 17c. The linked-cache upgrade, both directions of the ownership rule:
+// stream hydration takes over a fill-only 'linked' row (labels land,
+// verified_at stamps), and the linked writer can never downgrade it back —
+// a later PR sync carrying staler linked data leaves the stream row
+// untouched.
+
+#[test]
+fn issue_stream_upgrades_linked_rows_and_linked_never_downgrades() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}],
+        "workers": 1,
+        "retry_attempts": 1,
+        "retry_budget": 5
+    }));
+    // Run 1: PRs only. PR_1's closingIssuesReferences plants the linked
+    // cache row for issue number 101 (Pr::hydration's fixture shape).
+    let pr = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    install_prs(&fake, &[&pr]);
+    fake.write("idisc-1-0.json", &discovery_nodes(vec![], None, 4000));
+    fake.sync_ok();
+    let source: String =
+        fake.query_one("SELECT hydration_source FROM issues WHERE repo='o/n' AND number=101");
+    assert_eq!(source, "linked");
+
+    // Run 2: the issue stream discovers the same issue; hydration upgrades.
+    let mut upstream = Issue::new("I_PR_1", 101, "2026-07-22T00:00:00Z");
+    upstream.title = "stream-owned title".into();
+    upstream.labels = vec!["triaged"];
+    install_issues(&fake, &[&upstream]);
+    fake.sync_ok();
+    let (source, title, labels, verified_at): (String, String, String, Option<String>) = fake
+        .db()
+        .query_row(
+            "SELECT hydration_source, title, labels, verified_at FROM issues \
+             WHERE repo='o/n' AND number=101",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(source, "stream", "hydration takes ownership");
+    assert_eq!(title, "stream-owned title");
+    assert_eq!(labels, r#"["triaged"]"#);
+    assert!(verified_at.is_some(), "witnessed upgrade stamps");
+
+    // Run 3: PRs only again (issue stream empty this run); the PR's linked
+    // reference still carries the OLD title — the fill-only writer must
+    // not clobber the stream row with it.
+    fake.write("idisc-3-0.json", &discovery_nodes(vec![], None, 4000));
+    fake.sync_ok();
+    let title: String = fake.query_one("SELECT title FROM issues WHERE repo='o/n' AND number=101");
+    assert_eq!(
+        title, "stream-owned title",
+        "linked data never downgrades a stream row"
+    );
+}
+
+// 17d. Issue truncation discipline: a comments walk that cannot terminate
+// lands the row truncated with no verified_at and sweeps nothing; the next
+// run's complete walk heals it — witnessed, stamped, swept.
+
+#[test]
+fn issue_truncation_never_sweeps_and_heals_on_the_complete_walk() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}],
+        "workers": 1,
+        "retry_attempts": 1,
+        "retry_budget": 5
+    }));
+    install_prs(&fake, &[]);
+    // Run 1: complete — two comments land.
+    let mut a = Issue::new("I_1", 11, "2026-07-20T00:00:00Z");
+    a.comment_ids = vec!["IC_1".into(), "IC_2".into()];
+    install_issues(&fake, &[&a]);
+    fake.sync_ok();
+    let live: i64 = fake.query_one(
+        "SELECT count(*) FROM comments WHERE parent_kind='issue' AND deleted_at IS NULL",
+    );
+    assert_eq!(live, 2);
+
+    // Run 2: the remote claims another page but offers no cursor — the
+    // witness-withholding shape — and one comment is missing from the
+    // nodes. Truncation must not read as deletion.
+    let mut t = Issue::new("I_1", 11, "2026-07-21T00:00:00Z");
+    t.comment_ids = vec!["IC_1".into()];
+    t.comments_has_next = true;
+    install_issues(&fake, &[&t]);
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["truncated"], 1, "{s}");
+    let (truncated, verified_at): (i64, Option<String>) = fake
+        .db()
+        .query_row(
+            "SELECT truncated, verified_at FROM issues WHERE repo='o/n' AND number=11",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(truncated, 1);
+    assert!(
+        verified_at.is_some(),
+        "the run-1 stamp survives; only the witness gate withheld a new one"
+    );
+    let live: i64 = fake.query_one(
+        "SELECT count(*) FROM comments WHERE parent_kind='issue' AND deleted_at IS NULL",
+    );
+    assert_eq!(live, 2, "an incomplete connection sweeps nothing");
+
+    // Run 3: complete again, and IC_2 is genuinely gone upstream — the
+    // witnessed walk heals truncated and sweeps softly.
+    let mut h = Issue::new("I_1", 11, "2026-07-22T00:00:00Z");
+    h.comment_ids = vec!["IC_1".into()];
+    install_issues(&fake, &[&h]);
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["counts"]["soft_deleted"], 1, "{s}");
+    let truncated: i64 =
+        fake.query_one("SELECT truncated FROM issues WHERE repo='o/n' AND number=11");
+    assert_eq!(truncated, 0, "the complete refetch heals truncation");
+    let deleted: i64 = fake.query_one(
+        "SELECT count(*) FROM comments WHERE parent_kind='issue' AND deleted_at IS NOT NULL",
+    );
+    assert_eq!(deleted, 1, "soft delete: the row stays, dated");
+}
+
+// 17e. Issue quarantine round-trips through the stream column: a failed
+// issue hydration quarantines with stream='issue', and the retry
+// resurrects it through HYDRATE_ISSUE — never HYDRATE_PR, which would
+// parse-fail forever (the drain would also hit the wrong table).
+
+#[test]
+fn issue_quarantine_retries_through_the_issue_document() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}],
+        "workers": 1,
+        "retry_attempts": 1,
+        "retry_budget": 5
+    }));
+    install_prs(&fake, &[]);
+    let a = Issue::new("I_1", 11, "2026-07-20T00:00:00Z");
+    install_issues(&fake, &[&a]);
+    fake.write("stderr-I_1", "boom: transient trouble");
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["quarantined"], 1, "{s}");
+    let stream: String = fake.query_one("SELECT stream FROM quarantine WHERE id = 'I_1'");
+    assert_eq!(stream, "issue");
+
+    // Make the retry due, clear the fault, and re-run: the retry must
+    // dispatch through HYDRATE_ISSUE and the row must land whole.
+    fake.remove("stderr-I_1");
+    fake.db()
+        .execute(
+            "UPDATE quarantine SET next_retry_at = '2020-01-01T00:00:00Z' WHERE id = 'I_1'",
+            [],
+        )
+        .unwrap();
+    fake.sync_ok();
+    assert_eq!(
+        fake.issue_hydrations(2),
+        vec!["I_1"],
+        "the window walk skips quarantined ids (backoff dominates); the one \
+         hydration is the retry, through the issue document"
+    );
+    assert_eq!(fake.hydrations(2), Vec::<String>::new());
+    let quarantined: i64 = fake.query_one("SELECT count(*) FROM quarantine");
+    assert_eq!(quarantined, 0, "resolution deletes the record");
+    let landed: i64 = fake.query_one(
+        "SELECT count(*) FROM issues WHERE repo='o/n' AND number=11 \
+         AND hydration_source='stream' AND verified_at IS NOT NULL",
+    );
+    assert_eq!(landed, 1);
 }
 
 // ---------------------------------------------------------------------------

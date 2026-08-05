@@ -69,7 +69,7 @@
     "schema_version": 1
   },
   "stats": {
-    "archive_schema_version": 2,
+    "archive_schema_version": 3,
     "counts": {
       "comments": 14,
       "issues": 2,

@@ -255,10 +255,16 @@ CREATE TABLE IF NOT EXISTS sync_state (
 -- passes its id — the advance is licensed by the record that resurfaces the
 -- item, so no exit can turn "quarantined" into "forgotten". Retried under
 -- backoff by the scheduler (backoff dominates every hydration cause);
--- node:null after repeated attempts drains to prs.deleted_at.
+-- node:null after repeated attempts drains to the stream row's deleted_at.
+-- `stream` names the hydration document a retry must use: a node id is
+-- opaque (its format is data, never parsed), so without the column an issue
+-- id retried through HYDRATE_PR would parse-fail forever — the same
+-- stream-confusion the typed discovery terms exist to prevent (queries.rs,
+-- the B2 panel's S1) — and the drain would soft-delete in the wrong table.
 CREATE TABLE IF NOT EXISTS quarantine (
   id            TEXT PRIMARY KEY,              -- GraphQL node id
   repo          TEXT NOT NULL,
+  stream        TEXT NOT NULL DEFAULT 'pr',    -- 'pr' | 'issue': retry dispatch
   attempts      INTEGER NOT NULL DEFAULT 0,
   next_retry_at TEXT NOT NULL,
   error_class   TEXT NOT NULL

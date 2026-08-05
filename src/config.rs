@@ -145,8 +145,8 @@ pub struct RepoConfig {
     /// returns bare logins for bots — a literal bracket match would never
     /// fire). Sync applies it at discovery (excluded PRs are skipped
     /// before hydration, so they cost discovery only — StreamCtx::excluded)
-    /// and enforces it at ingest; the project-scope filter defaults around
-    /// it are PLANNED (milestone 4).
+    /// and enforces it at ingest, on both streams — the issue walk carries
+    /// discovery authors through the same judgment.
     /// Filters govern ingest, never deletion: excluding an author later
     /// does not touch their archived rows. Note bot-typed authors are
     /// already excluded by default at project scope — exclude_authors is

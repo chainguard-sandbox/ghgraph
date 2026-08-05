@@ -78,6 +78,9 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// but v1 never stored it: parse.rs validated the field and the upsert
 /// dropped it.
 ///
+/// v3: quarantine.stream — retry dispatch by hydration document (schema.sql
+/// records why an opaque node id cannot carry that fact itself).
+///
 /// MIGRATION POLICY, decided here so the machinery is not re-proposed every
 /// schema change: migrations begin at the first RELEASED binary — an
 /// archive someone cannot cheaply rebuild. Until then the archive is a
@@ -93,7 +96,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// TABLE migration existed briefly and was verified correct; it was deleted
 /// by this policy, not by a defect (the git history holds it if the first
 /// release ever needs the pattern back).
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 
