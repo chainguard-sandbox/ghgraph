@@ -37,20 +37,66 @@
 //! branch protection makes it read REVIEW_REQUIRED over a human approval, and
 //! it mislabels PRs that were reviewed and then pushed to.
 //!
-//! `attention` output buckets, in fixed order — PLANNED (milestone 3, the
-//! attention verb; this module currently carries the derivations it will
-//! share with the `pr` verb):
-//!   waiting_on_me   — review requested of viewer; or an unresolved thread on
-//!                     viewer's PR where the other party spoke last
-//!   they_replied    — activity since viewer's last comment/review on PRs
-//!                     viewer participates in
+//! `attention` output buckets, in fixed order ([`Bucket::ALL`]). The order
+//! IS the priority: [`bucket`] places a PR in the FIRST bucket it qualifies
+//! for and no other — one demand list, not four overlapping ones, and the
+//! ordering is why (a new comment on an approved PR must read as "look
+//! first", not "merge"). report.rs serializes the buckets as an ARRAY
+//! because its sorted-key objects cannot carry this order.
+//!   waiting_on_me   — review requested of viewer: a kind='user' request
+//!                     matching the viewer by login_eq, or a kind='team'
+//!                     request matching a declared config.teams name
+//!                     (membership is declared, not verified — config.rs
+//!                     records why the empty default surfaces no team
+//!                     requests rather than all of them). Or an unresolved
+//!                     thread on viewer's OWN PR whose last substantive
+//!                     speaker is the other party ([`waiting_on`] == Me);
+//!                     the same state on someone else's PR is a reply, not
+//!                     a request, and falls through to they_replied.
+//!   they_replied    — substantive activity by another party since the
+//!                     viewer's last, on PRs the viewer participates in.
+//!                     Authorship is participation (it counts as activity
+//!                     at the PR's created_at); minimized and deleted
+//!                     comments are neither activity nor participation.
+//!                     An APPROVED review verdict is NOT a reply: it
+//!                     demands nothing ready_to_merge doesn't already say,
+//!                     and counting it would shunt every freshly-approved
+//!                     PR into this bucket ahead of that one (priority
+//!                     order) — starving ready_to_merge structurally. A
+//!                     CHANGES_REQUESTED or COMMENTED review IS a reply:
+//!                     it carries words the viewer must act on. Two known
+//!                     narrowings, PR-level recency and push-is-not-
+//!                     activity (a head flip is an observation, not a
+//!                     comment, and its stamp is local time — cross-clock
+//!                     comparison is review_freshness's hard-won domain):
+//!                     promote either on the first real demand it misses.
 //!   ready_to_merge  — viewer's PRs, effectively approved, no unresolved
-//!                     threads
+//!                     threads. Fail-closed, mechanically: draft (cannot
+//!                     merge), truncated (threads may be missing — the
+//!                     "complete data" precondition), or a stored
+//!                     reviewDecision other than APPROVED (branch
+//!                     protection saying "not yet" is never overridden;
+//!                     the decision is distrusted alone, but distrust only
+//!                     ever degrades OUT of this bucket) each disqualify.
 //!   people_prs      — open PRs by config.people with no review from viewer
 //!                     yet. The collaboration demand only: monitoring tracked
 //!                     people is served by the archive (search, query,
 //!                     observations), never by attention — attention is for
-//!                     demands.
+//!                     demands. Not drafts (the demand starts when the PR
+//!                     asks for review — the milestone-4 needs_reviewer
+//!                     rule, applied early), and never the viewer's own row
+//!                     (a self-tracked viewer is config noise, not a
+//!                     collaboration demand).
+//!
+//! Bucket scope, all four: state OPEN and not upstream-deleted. A deleted
+//! PR's demands died with it; a reply on a merged/closed PR is excluded as
+//! out of the working set — the narrowing to reverse on the first real
+//! demand it hides (the evidence would be an operator missing a post-merge
+//! question). Drafts stay IN waiting_on_me and they_replied: a question on
+//! a draft is a live demand. Truncated rows stay IN the demand buckets too
+//! (fail-open — truncation flags a row, it never suppresses a demand) and
+//! OUT of ready_to_merge (fail-closed), which is the polarity rule made
+//! mechanical.
 
 use crate::identity::login_eq;
 use crate::time::Rfc3339Utc;
@@ -297,6 +343,122 @@ pub fn waiting_on(
         Some(WaitingOn::Me)
     } else {
         None
+    }
+}
+
+/// The four attention buckets, in output-and-priority order (module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bucket {
+    WaitingOnMe,
+    TheyReplied,
+    ReadyToMerge,
+    PeoplePrs,
+}
+
+impl Bucket {
+    /// The fixed order: serialization order AND classification priority —
+    /// one constant so the two cannot drift.
+    pub const ALL: [Bucket; 4] = [
+        Bucket::WaitingOnMe,
+        Bucket::TheyReplied,
+        Bucket::ReadyToMerge,
+        Bucket::PeoplePrs,
+    ];
+
+    /// The wire spelling (`attention` verb).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Bucket::WaitingOnMe => "waiting_on_me",
+            Bucket::TheyReplied => "they_replied",
+            Bucket::ReadyToMerge => "ready_to_merge",
+            Bucket::PeoplePrs => "people_prs",
+        }
+    }
+}
+
+/// One open, not-upstream-deleted PR, reduced to the structural signals the
+/// bucket judgment may see. The caller (report.rs) queries; this type is the
+/// fence that keeps the judgment here — every field is a structural fact,
+/// none is derived text.
+pub struct PrSignals<'a> {
+    /// PR author is the viewer ([`login_eq`]).
+    pub viewers_pr: bool,
+    /// PR author is in config.people ([`login_eq`]).
+    pub person_pr: bool,
+    pub draft: bool,
+    /// prs.truncated — hydration known incomplete.
+    pub truncated: bool,
+    /// Raw stored reviewDecision. Consumed ONLY as a negative gate on
+    /// ready_to_merge (module docs); never trusted toward readiness.
+    pub review_decision: Option<&'a str>,
+    /// Some review_requests row addresses the viewer: kind='user' matching
+    /// the viewer login, or kind='team' matching a declared team name.
+    pub requested_of_viewer: bool,
+    /// Some unresolved thread has [`waiting_on`] == Me from the viewer's
+    /// seat. Computed on any PR; [`bucket`] itself applies the own-PR
+    /// restriction, so the spec lives here and not in the caller's SQL.
+    pub thread_demands_viewer: bool,
+    /// The viewer's last substantive act on this PR: max created_at over
+    /// their unminimized, undeleted comments and reviews, and the PR's own
+    /// created_at when they authored it. None ⟺ the viewer neither
+    /// authored nor spoke — i.e. does not participate.
+    pub viewer_last_activity_at: Option<&'a str>,
+    /// The other parties' last substantive act: same definition over
+    /// comments whose author is not the viewer (a ghost author counts as
+    /// the other party, as in [`waiting_on`]), EXCLUDING APPROVED review
+    /// verdicts — module docs carry why an approval is not a reply.
+    pub last_other_activity_at: Option<&'a str>,
+    pub effective: EffectiveReviewState,
+    /// Any review_threads row with is_resolved = 0 (structural — comment
+    /// content never resolves a thread).
+    pub has_unresolved_threads: bool,
+    /// Any kind='review' row by the viewer, any verdict: a COMMENTED review
+    /// is still "a review from viewer" for people_prs.
+    pub viewer_reviewed: bool,
+}
+
+/// (signals) → at most one bucket, the first qualifying in [`Bucket::ALL`]
+/// order. Pure; report.rs only queries and serializes.
+pub fn bucket(s: &PrSignals<'_>) -> Option<Bucket> {
+    if s.requested_of_viewer || (s.viewers_pr && s.thread_demands_viewer) {
+        return Some(Bucket::WaitingOnMe);
+    }
+    if replied_since(s.viewer_last_activity_at, s.last_other_activity_at) {
+        return Some(Bucket::TheyReplied);
+    }
+    if s.viewers_pr
+        && !s.draft
+        && !s.truncated
+        && s.effective == EffectiveReviewState::Approved
+        && !s.has_unresolved_threads
+        && matches!(s.review_decision, None | Some("APPROVED"))
+    {
+        return Some(Bucket::ReadyToMerge);
+    }
+    if s.person_pr && !s.viewers_pr && !s.draft && !s.viewer_reviewed {
+        return Some(Bucket::PeoplePrs);
+    }
+    None
+}
+
+/// Did another party act after the viewer's last act? False without both
+/// timestamps (no participation, or no other activity — no demand either
+/// way); with both, strictly-after on parsed times. Unparseable input on
+/// either side reads TRUE: they_replied is a demand, demands fail open, and
+/// a timestamp this module cannot order is exactly the uncertainty that
+/// escalates (the inverse of [`review_freshness`], where the same doubt
+/// degrades OUT of ready_to_merge). Re-parsed here like every derivation
+/// input: `query` proves the archive is reachable by arbitrary SQL.
+fn replied_since(viewer_last: Option<&str>, other_last: Option<&str>) -> bool {
+    let (Some(viewer_last), Some(other_last)) = (viewer_last, other_last) else {
+        return false;
+    };
+    match (
+        Rfc3339Utc::parse(viewer_last),
+        Rfc3339Utc::parse(other_last),
+    ) {
+        (Ok(v), Ok(o)) => o.epoch() > v.epoch(),
+        _ => true,
     }
 }
 
@@ -693,5 +855,184 @@ mod tests {
             waiting_on("me", Some("me"), false, &[c(None, false, false)]),
             Some(WaitingOn::Me)
         );
+    }
+
+    // ---- bucket: the four-way classification -----------------------------
+
+    const B_V1: &str = "2026-03-01T00:00:00Z";
+    const B_BEFORE: &str = "2026-02-01T00:00:00Z";
+    const B_AFTER: &str = "2026-03-02T00:00:00Z";
+
+    #[test]
+    fn replied_since_pins_polarity_and_strictness() {
+        assert!(!replied_since(None, None));
+        assert!(
+            !replied_since(None, Some(B_AFTER)),
+            "no participation, no demand"
+        );
+        assert!(
+            !replied_since(Some(B_V1), None),
+            "no other activity, no demand"
+        );
+        assert!(replied_since(Some(B_V1), Some(B_AFTER)));
+        assert!(!replied_since(Some(B_V1), Some(B_BEFORE)));
+        assert!(
+            !replied_since(Some(B_V1), Some(B_V1)),
+            "strictly after: simultaneity is not a reply"
+        );
+        // Unparseable escalates (fail-open): a demand this module cannot
+        // order is surfaced, never dropped — the inverse of
+        // review_freshness, where the same doubt degrades out.
+        assert!(replied_since(Some("junk"), Some(B_AFTER)));
+        assert!(replied_since(Some(B_V1), Some("junk")));
+    }
+
+    /// ∀ by enumeration over the full signal cube: 8 bools × 4 effective
+    /// states × 4 decision values × 8 activity classes = 32,768 cases,
+    /// against an oracle that restates the per-bucket doc rules
+    /// order-INDEPENDENTLY (collect every qualifying bucket, take the first
+    /// in Bucket::ALL order) where the implementation short-circuits — a
+    /// priority-order bug is visible to exactly one of the two. The
+    /// polarity implications are asserted separately, independent of both
+    /// formulations.
+    #[test]
+    fn bucket_exhaustive_against_oracle() {
+        use EffectiveReviewState as E;
+        let effectives = [
+            E::Approved,
+            E::ChangesRequested,
+            E::StaleApproval,
+            E::Unreviewed,
+        ];
+        let decisions = [
+            None,
+            Some("APPROVED"),
+            Some("REVIEW_REQUIRED"),
+            Some("CHANGES_REQUESTED"),
+        ];
+        // (viewer_last, other_last, replied_since) — the classes pinned by
+        // replied_since_pins_polarity_and_strictness above.
+        let activity: &[(Option<&str>, Option<&str>, bool)] = &[
+            (None, None, false),
+            (None, Some(B_AFTER), false),
+            (Some(B_V1), None, false),
+            (Some(B_V1), Some(B_AFTER), true),
+            (Some(B_V1), Some(B_BEFORE), false),
+            (Some(B_V1), Some(B_V1), false),
+            (Some("junk"), Some(B_AFTER), true),
+            (Some(B_V1), Some("junk"), true),
+        ];
+        for bits in 0u32..256 {
+            let f = |i: u32| bits & (1 << i) != 0;
+            for effective in effectives {
+                for decision in decisions {
+                    for (viewer_last, other_last, replied) in activity {
+                        let s = PrSignals {
+                            viewers_pr: f(0),
+                            person_pr: f(1),
+                            draft: f(2),
+                            truncated: f(3),
+                            review_decision: decision,
+                            requested_of_viewer: f(4),
+                            thread_demands_viewer: f(5),
+                            viewer_last_activity_at: *viewer_last,
+                            last_other_activity_at: *other_last,
+                            effective,
+                            has_unresolved_threads: f(6),
+                            viewer_reviewed: f(7),
+                        };
+                        let got = bucket(&s);
+                        let waiting =
+                            s.requested_of_viewer || (s.viewers_pr && s.thread_demands_viewer);
+                        let ready = s.viewers_pr
+                            && !s.draft
+                            && !s.truncated
+                            && s.effective == E::Approved
+                            && !s.has_unresolved_threads
+                            && matches!(s.review_decision, None | Some("APPROVED"));
+                        let people = s.person_pr && !s.viewers_pr && !s.draft && !s.viewer_reviewed;
+                        let want = [
+                            (waiting, Bucket::WaitingOnMe),
+                            (*replied, Bucket::TheyReplied),
+                            (ready, Bucket::ReadyToMerge),
+                            (people, Bucket::PeoplePrs),
+                        ]
+                        .into_iter()
+                        .find(|(q, _)| *q)
+                        .map(|(_, b)| b);
+                        assert_eq!(
+                            got, want,
+                            "bits={bits:08b} effective={effective:?} decision={decision:?} \
+                             viewer_last={viewer_last:?} other_last={other_last:?}"
+                        );
+                        // Polarity, independent of either formulation:
+                        if s.requested_of_viewer {
+                            assert_eq!(
+                                got,
+                                Some(Bucket::WaitingOnMe),
+                                "a review request is never suppressed by any other signal"
+                            );
+                        }
+                        if got == Some(Bucket::ReadyToMerge) {
+                            assert!(
+                                s.viewers_pr
+                                    && !s.draft
+                                    && !s.truncated
+                                    && s.effective == E::Approved
+                                    && !s.has_unresolved_threads,
+                                "ready_to_merge admitted incomplete or unapproved state"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The named discriminating cases behind the priority order — each pair
+    /// is a real workflow moment, kept legible where the cube above is not.
+    #[test]
+    fn bucket_priority_named_cases() {
+        let base = |viewers_pr: bool| PrSignals {
+            viewers_pr,
+            person_pr: false,
+            draft: false,
+            truncated: false,
+            review_decision: None,
+            requested_of_viewer: false,
+            thread_demands_viewer: false,
+            viewer_last_activity_at: None,
+            last_other_activity_at: None,
+            effective: EffectiveReviewState::Unreviewed,
+            has_unresolved_threads: false,
+            viewer_reviewed: false,
+        };
+        // A request on a tracked person's PR is MY demand, not a people row.
+        let s = PrSignals {
+            person_pr: true,
+            requested_of_viewer: true,
+            ..base(false)
+        };
+        assert_eq!(bucket(&s), Some(Bucket::WaitingOnMe));
+        // A fresh reply on my approved PR reads "look first", never "merge".
+        let s = PrSignals {
+            effective: EffectiveReviewState::Approved,
+            review_decision: Some("APPROVED"),
+            viewer_last_activity_at: Some(B_V1),
+            last_other_activity_at: Some(B_AFTER),
+            ..base(true)
+        };
+        assert_eq!(bucket(&s), Some(Bucket::TheyReplied));
+        // A thread waiting on me on SOMEONE ELSE'S PR is a reply, not a
+        // request: it reaches they_replied by recency, never waiting_on_me.
+        let s = PrSignals {
+            thread_demands_viewer: true,
+            viewer_last_activity_at: Some(B_V1),
+            last_other_activity_at: Some(B_AFTER),
+            ..base(false)
+        };
+        assert_eq!(bucket(&s), Some(Bucket::TheyReplied));
+        // Third-party PR, no involvement: no bucket at all.
+        assert_eq!(bucket(&base(false)), None);
     }
 }

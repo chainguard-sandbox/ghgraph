@@ -2406,3 +2406,45 @@ fn skeleton_walk_pages_and_respects_the_floor() {
     // witness, not a demoted verdict (panel S2).
     assert_eq!(s["refresh"]["tail_hits"], 1, "{s}");
 }
+
+// ---------------------------------------------------------------------------
+// 12. sync --strict: the gate flag changes the exit code, never a byte.
+
+#[test]
+fn strict_gates_the_exit_code_on_disclosed_incompleteness() {
+    // Complete run: --strict exits 0 and the summary is the ordinary one.
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    install_prs(&fake, &[&a]);
+    let (code, doc, stderr) = fake.run(&["sync", "--strict"]);
+    assert_eq!(
+        code, 0,
+        "complete sync under --strict; stderr:\n{stderr}\ndoc: {doc:?}"
+    );
+    let doc = doc.expect("one JSON document");
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["quarantined"], 0);
+    assert!(!ghgraph::sync::incomplete(&doc));
+
+    // Incomplete run: a discovered PR whose hydration fixture is missing
+    // reads as a transport failure and quarantines (harness docs) — the
+    // summary discloses it, and --strict turns that disclosure into exit 1
+    // while stdout still carries the full document (a gate is not an
+    // error: the envelope path stays exit 2).
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    let b = Pr::new("PR_2", 2, "2026-07-20T11:00:00Z");
+    install_prs(&fake, &[&a]);
+    fake.write("disc-default.json", &discovery(&[&a, &b], None, 4000));
+    let (code, doc, stderr) = fake.run(&["sync", "--strict"]);
+    assert_eq!(
+        code, 1,
+        "quarantine under --strict is exit 1; stderr:\n{stderr}"
+    );
+    let doc = doc.expect("the gate still emits the full summary");
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["quarantined"], 1, "{s}");
+    assert!(ghgraph::sync::incomplete(&doc));
+}

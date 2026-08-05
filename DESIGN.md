@@ -266,7 +266,11 @@ Project scope adds maintainer buckets under the same rule: `needs_reviewer`
 labels, no assignee, no maintainer reply) are demands, so they fail open.
 Buckets derive from archive state at read time: `people_prs` membership is
 `author ∈ config.people` regardless of which scope or flavor ingested the
-row, and maintainer buckets are emitted only for repos configured at
+row, a team review request reaches `waiting_on_me` only through a declared
+`config.teams` name (membership is declared, not verified — team rosters
+are not local data, and without the declaration a team request provably
+addresses no particular viewer; config.rs records the argument), and
+maintainer buckets are emitted only for repos configured at
 project scope when read — archive contents never create a bucket. Limits
 (`--limit`, with disclosed totals, always) govern presentation; polarity
 governs derivation — a limit is never precedent for suppressing a demand.

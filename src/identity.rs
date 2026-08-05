@@ -49,6 +49,8 @@ pub enum IdentityError {
     Repo,
     /// Not a valid `exclude_authors` pattern (`login` or `login[bot]`).
     AuthorPattern,
+    /// Not a plausible GitHub team name.
+    Team,
 }
 
 impl fmt::Display for IdentityError {
@@ -60,6 +62,10 @@ impl fmt::Display for IdentityError {
             }
             IdentityError::Repo => "not of the form owner/name",
             IdentityError::AuthorPattern => "not a valid login (optionally with a [bot] suffix)",
+            IdentityError::Team => {
+                "not a plausible team name (non-empty, no control characters, \
+                 no leading/trailing whitespace; at most 255 bytes)"
+            }
         };
         f.write_str(s)
     }
@@ -224,6 +230,58 @@ impl<'de> Deserialize<'de> for AuthorPattern {
         let s = String::deserialize(deserializer)?;
         AuthorPattern::parse(&s)
             .map_err(|e| D::Error::custom(format!("exclude_authors entry {s:?} is {e}")))
+    }
+}
+
+/// A validated team NAME — the operator's declaration "I am on this team",
+/// matched against `review_requests` rows of kind='team' so a team request
+/// can reach `waiting_on_me` (schema.sql records why `kind` exists;
+/// attention.rs consumes this). It is the Team's display `name` because that
+/// is what hydration stores (queries.rs selects `... on Team { name }`), not
+/// the slug or the org-qualified mention form.
+///
+/// Unlike [`Login`]/[`RepoName`], this never reaches a search qualifier —
+/// teams are not a discovery input and stay out of the sync fingerprint —
+/// so the injection charset does not apply. GitHub allows team names the
+/// login charset forbids (spaces, unicode), so the gate here is
+/// plausibility, not identity: non-empty, no control characters, no
+/// leading/trailing whitespace (a paste artifact, never a real name), and a
+/// 255-byte bound. Stored as typed (display text, not an identifier — no
+/// canonical fold); comparison against API text is [`login_eq`], the one
+/// ASCII-case-insensitive equivalence, which compares non-ASCII bytes
+/// exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeamName(String);
+
+impl TeamName {
+    pub fn new(s: &str) -> Result<TeamName, IdentityError> {
+        let plausible =
+            !s.is_empty() && s.len() <= 255 && !s.chars().any(char::is_control) && s.trim() == s;
+        if plausible {
+            Ok(TeamName(s.to_string()))
+        } else {
+            Err(IdentityError::Team)
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TeamName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for TeamName {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        TeamName::new(&s).map_err(|e| D::Error::custom(format!("team {s:?} is {e}")))
     }
 }
 
@@ -500,6 +558,30 @@ mod tests {
             AuthorPattern::parse("alice[BOT]").is_err(),
             "[BOT] uppercase rejects"
         );
+    }
+
+    #[test]
+    fn team_name_gate_is_plausibility_not_identity() {
+        use super::TeamName;
+        // Admitted: what GitHub allows that the login charset forbids.
+        for ok in ["platform", "Platform & Infra", "équipe-sécurité", "a"] {
+            assert!(TeamName::new(ok).is_ok(), "should admit {ok:?}");
+        }
+        // Rejected: implausible as a team name, plausible as an accident.
+        for bad in [
+            "",
+            " padded",
+            "padded ",
+            "tab\there",
+            "line\nbreak",
+            &"x".repeat(256),
+        ] {
+            assert!(TeamName::new(bad).is_err(), "should reject {bad:?}");
+        }
+        // Stored as typed (display text, no canonical fold); the equivalence
+        // against API text is login_eq, applied where teams are matched.
+        assert_eq!(TeamName::new("Platform").unwrap().as_str(), "Platform");
+        assert!(login_eq("Platform", "platform"));
     }
 
     // Deserialize IS validation: serde paths cannot yield unvalidated values,

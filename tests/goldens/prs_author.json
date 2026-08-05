@@ -86,8 +86,44 @@
       "updated_at": "2026-01-06T00:00:00Z",
       "url": "https://github.com/octo/alpha/pull/2",
       "verified_at": "2026-01-06T00:00:00Z"
+    },
+    {
+      "author": "me",
+      "author_assoc": "OWNER",
+      "closed_at": null,
+      "created_at": "2026-01-03T00:00:00Z",
+      "deleted_at": null,
+      "draft": false,
+      "merged_at": null,
+      "number": 9,
+      "repo": "octo/alpha",
+      "review_decision": null,
+      "state": "OPEN",
+      "title": "Split the report module",
+      "truncated": false,
+      "updated_at": "2026-01-06T12:00:00Z",
+      "url": "https://github.com/octo/alpha/pull/9",
+      "verified_at": "2026-01-06T12:00:00Z"
+    },
+    {
+      "author": "me",
+      "author_assoc": "OWNER",
+      "closed_at": null,
+      "created_at": "2026-01-02T00:00:00Z",
+      "deleted_at": null,
+      "draft": false,
+      "merged_at": null,
+      "number": 10,
+      "repo": "octo/alpha",
+      "review_decision": "APPROVED",
+      "state": "OPEN",
+      "title": "Gate the fuzz harness",
+      "truncated": true,
+      "updated_at": "2026-01-06T18:00:00Z",
+      "url": "https://github.com/octo/alpha/pull/10",
+      "verified_at": null
     }
   ],
-  "returned": 1,
-  "total": 1
+  "returned": 3,
+  "total": 3
 }

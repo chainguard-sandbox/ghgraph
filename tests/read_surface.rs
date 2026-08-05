@@ -108,6 +108,21 @@ fn standard_config(s: &Scratch) {
     }));
 }
 
+/// The attention goldens' config: alice is a tracked person and the team
+/// list is the test's variable. `people` is a DISCOVERY input, so these
+/// goldens honestly show config_pending: true — the state after editing the
+/// config and before the next sync; people_prs derives from the CURRENT
+/// config regardless of what ingested the row (DESIGN.md). `teams` is
+/// read-side only and moves no fingerprint.
+fn attention_config(s: &Scratch, teams: &[&str]) {
+    s.write_config(&json!({
+        "viewer": "me",
+        "repos": ["octo/alpha", {"repo": "octo/beta", "scope": "project"}],
+        "people": ["alice"],
+        "teams": teams,
+    }));
+}
+
 /// Seed the archive every golden reads. One deliberate state per contract
 /// clause — the comments beside each block name the clause it exists for.
 fn seed(s: &Scratch) {
@@ -564,6 +579,182 @@ fn seed(s: &Scratch) {
          VALUES ('PR_bad', 'octo/beta', 2, '2026-01-05T00:00:00Z', 'transient')",
         &[],
     );
+
+    // ---- attention fixtures (milestone 3 / C2): one PR per bucket arm ----
+
+    // #7 — alice's PR with a user review request stored as 'Me' (API case;
+    // the match is login_eq) → waiting_on_me, request arm. The 'security'
+    // team request must NOT surface: no config declares that team.
+    exec(
+        insert_pr,
+        &[
+            &7i64,
+            &"PR_a7",
+            &"octo/alpha",
+            &7i64,
+            &"Wire the config loader",
+            &"",
+            &"OPEN",
+            &false,
+            &"alice",
+            &1001i64,
+            &"CONTRIBUTOR",
+            &"alice/loader",
+            &"main",
+            &"ffffffffffffffffffffffffffffffffffffffff",
+            &"REVIEW_REQUIRED",
+            &"2026-01-02T00:00:00Z",
+            &"2026-01-05T12:00:00Z",
+            &None::<String>,
+            &None::<String>,
+            &"https://github.com/octo/alpha/pull/7",
+            &false,
+            &"2026-01-05T12:00:00Z",
+            &None::<String>,
+            &"2026-01-02T12:00:00Z",
+        ],
+    );
+    exec(
+        "INSERT INTO review_requests (pr, reviewer, kind) VALUES (7, 'Me', 'user')",
+        &[],
+    );
+    exec(
+        "INSERT INTO review_requests (pr, reviewer, kind) VALUES (7, 'security', 'team')",
+        &[],
+    );
+
+    // #8 — alice's bare PR, no viewer involvement → people_prs when alice
+    // is a configured person.
+    exec(
+        insert_pr,
+        &[
+            &8i64,
+            &"PR_a8",
+            &"octo/alpha",
+            &8i64,
+            &"Document the archive layout",
+            &"",
+            &"OPEN",
+            &false,
+            &"alice",
+            &1001i64,
+            &"CONTRIBUTOR",
+            &"alice/docs",
+            &"main",
+            &"1111111111111111111111111111111111111111",
+            &None::<String>,
+            &"2026-01-03T00:00:00Z",
+            &"2026-01-04T12:00:00Z",
+            &None::<String>,
+            &None::<String>,
+            &"https://github.com/octo/alpha/pull/8",
+            &false,
+            &"2026-01-04T12:00:00Z",
+            &None::<String>,
+            &"2026-01-03T12:00:00Z",
+        ],
+    );
+
+    // #9 — the viewer's PR with an unresolved thread where alice spoke
+    // last → waiting_on_me, thread arm (threads_waiting 1).
+    exec(
+        insert_pr,
+        &[
+            &9i64,
+            &"PR_a9",
+            &"octo/alpha",
+            &9i64,
+            &"Split the report module",
+            &"",
+            &"OPEN",
+            &false,
+            &"me",
+            &1000i64,
+            &"OWNER",
+            &"me/split",
+            &"main",
+            &"2222222222222222222222222222222222222222",
+            &None::<String>,
+            &"2026-01-03T00:00:00Z",
+            &"2026-01-06T12:00:00Z",
+            &None::<String>,
+            &None::<String>,
+            &"https://github.com/octo/alpha/pull/9",
+            &false,
+            &"2026-01-06T12:00:00Z",
+            &None::<String>,
+            &"2026-01-03T12:00:00Z",
+        ],
+    );
+    exec(
+        "INSERT INTO review_threads (pk, id, pr, path, line, is_resolved, is_outdated) \
+         VALUES (91, 'TH_a9_1', 9, 'src/r.rs', 3, 0, 0)",
+        &[],
+    );
+    exec(
+        "INSERT INTO comments (id, parent_kind, parent, thread, kind, author, author_assoc, \
+                               body, created_at, url) \
+         VALUES ('C_t91_me', 'pr', 9, 91, 'review_comment', 'me', 'OWNER', \
+                 'should this live in the library crate?', '2026-01-04T00:00:00Z', \
+                 'https://github.com/octo/alpha/pull/9#c1')",
+        &[],
+    );
+    exec(
+        "INSERT INTO comments (id, parent_kind, parent, thread, kind, author, author_assoc, \
+                               body, created_at, url) \
+         VALUES ('C_t91_alice', 'pr', 9, 91, 'review_comment', 'alice', 'CONTRIBUTOR', \
+                 'either way — your call', '2026-01-04T01:00:00Z', \
+                 'https://github.com/octo/alpha/pull/9#c2')",
+        &[],
+    );
+
+    // #10 — the viewer's PR, freshly approved (decision agrees), but
+    // TRUNCATED: ready_to_merge is fail-closed, so this row appears in no
+    // bucket at all — its absence from the attention goldens is the pin.
+    // The approval is excluded from they_replied by the verdict rule
+    // (attention.rs: an approval is not a reply).
+    exec(
+        insert_pr,
+        &[
+            &10i64,
+            &"PR_a10",
+            &"octo/alpha",
+            &10i64,
+            &"Gate the fuzz harness",
+            &"",
+            &"OPEN",
+            &false,
+            &"me",
+            &1000i64,
+            &"OWNER",
+            &"me/gate",
+            &"main",
+            &"3333333333333333333333333333333333333333",
+            &"APPROVED",
+            &"2026-01-02T00:00:00Z",
+            &"2026-01-06T18:00:00Z",
+            &None::<String>,
+            &None::<String>,
+            &"https://github.com/octo/alpha/pull/10",
+            &true,
+            &None::<String>,
+            &None::<String>,
+            &"2026-01-02T12:00:00Z",
+        ],
+    );
+    exec(
+        "INSERT INTO observations (pr, observed_at, field, old, new) \
+         VALUES (10, '2026-01-03T00:00:00Z', 'head_sha', 'old', \
+                 '3333333333333333333333333333333333333333')",
+        &[],
+    );
+    exec(
+        "INSERT INTO comments (id, parent_kind, parent, kind, state, author, author_assoc, \
+                               body, created_at, url) \
+         VALUES ('RV_a10_bob', 'pr', 10, 'review', 'APPROVED', 'bob', 'MEMBER', '', \
+                 '2026-01-03T01:00:00Z', 'https://github.com/octo/alpha/pull/10#r1')",
+        &[],
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -700,6 +891,71 @@ fn golden_pr_elided() {
 }
 
 #[test]
+fn golden_attention_default() {
+    let s = Scratch::new();
+    seed(&s);
+    attention_config(&s, &[]);
+    // No teams declared: #9 (own PR, thread waits on me) and #7 (user
+    // request, case-flipped) fill waiting_on_me; #1 falls through to
+    // they_replied (alice's PR, viewer participated, others spoke since —
+    // and it therefore never reaches people_prs: priority dedup); #2 is
+    // ready_to_merge; #8 is alice's untouched PR → people_prs. #10 (own,
+    // freshly approved, TRUNCATED) appears nowhere: fail-closed out of
+    // ready_to_merge, and its approval is not a reply.
+    golden_verb(&s, "attention.json", &["attention"]);
+}
+
+#[test]
+fn golden_attention_teams() {
+    let s = Scratch::new();
+    seed(&s);
+    attention_config(&s, &["platform"]);
+    // Declaring the team moves #1 up into waiting_on_me via its 'platform'
+    // team request; the undeclared 'security' request on #7 still surfaces
+    // nothing. they_replied empties — same archive, config-only change.
+    golden_verb(&s, "attention_teams.json", &["attention"]);
+}
+
+#[test]
+fn golden_attention_limited() {
+    let s = Scratch::new();
+    seed(&s);
+    attention_config(&s, &[]);
+    // --limit 1 caps each bucket's rows; totals stay disclosed.
+    golden_verb(&s, "attention_limited.json", &["attention", "--limit", "1"]);
+}
+
+#[test]
+fn attention_fail_if_any_gates_exit_never_bytes() {
+    let s = Scratch::new();
+    seed(&s);
+    attention_config(&s, &[]);
+    let (code, doc, stderr) = s.run(&["attention"]);
+    assert_eq!(code, 0, "no flag, no gate; stderr:\n{stderr}");
+    let (gated_code, gated_doc, stderr) = s.run(&["attention", "--fail-if-any"]);
+    assert_eq!(gated_code, 1, "demands trip the gate; stderr:\n{stderr}");
+    let (mut a, mut b) = (doc.unwrap(), gated_doc.unwrap());
+    mask(&mut a);
+    mask(&mut b);
+    assert_eq!(a, b, "the gate flag must never change a byte of JSON");
+
+    // All clear: a viewer with no demands and no people exits 0 under the
+    // flag, with every bucket disclosed empty.
+    s.write_config(&json!({
+        "viewer": "hermit",
+        "repos": ["octo/alpha", {"repo": "octo/beta", "scope": "project"}],
+    }));
+    let (code, doc, stderr) = s.run(&["attention", "--fail-if-any"]);
+    assert_eq!(code, 0, "all-clear exits 0; stderr:\n{stderr}");
+    let buckets = doc.unwrap()["attention"].as_array().unwrap().clone();
+    assert_eq!(buckets.len(), 4, "every bucket appears even when empty");
+    for b in &buckets {
+        assert_eq!(b["total"], json!(0), "{b}");
+        assert_eq!(b["prs"], json!([]));
+    }
+}
+
+#[test]
 fn golden_search() {
     let s = Scratch::new();
     seed(&s);
@@ -812,7 +1068,7 @@ fn query_cannot_write_and_says_so_as_user_input() {
     assert_eq!(err["error"]["code"], json!("USER_INPUT"), "{err}");
     // And nothing was deleted — the read-only pair held.
     let doc = s.run_ok(&["query", "SELECT COUNT(*) FROM prs"]);
-    assert_eq!(doc["rows"][0][0], json!(6));
+    assert_eq!(doc["rows"][0][0], json!(10));
 }
 
 #[test]
@@ -916,7 +1172,7 @@ fn query_reads_stdin_when_piped_without_argument() {
     };
     assert_eq!(out.status.code(), Some(0));
     let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(doc["rows"], json!([[6]]));
+    assert_eq!(doc["rows"], json!([[10]]));
 }
 
 #[test]

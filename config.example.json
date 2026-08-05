@@ -13,6 +13,9 @@
     "alice",
     "bob"
   ],
+  "teams": [
+    "a-team-you-are-on"
+  ],
   "lookback_days": 90,
   "reverify_open_days": 7,
   "reverify_closed_days": 30,

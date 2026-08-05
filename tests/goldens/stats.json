@@ -71,14 +71,14 @@
   "stats": {
     "archive_schema_version": 2,
     "counts": {
-      "comments": 11,
+      "comments": 14,
       "issues": 2,
-      "observations": 2,
-      "prs": 6,
+      "observations": 3,
+      "prs": 10,
       "quarantine": 1,
       "refs": 4,
-      "review_requests": 2,
-      "review_threads": 3
+      "review_requests": 4,
+      "review_threads": 4
     },
     "db_bytes": 188416,
     "quarantine": [

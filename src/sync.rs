@@ -3550,6 +3550,46 @@ fn summary(tallies: &BTreeMap<String, RepoTally>) -> Value {
     })
 }
 
+/// Did this run leave the archive incomplete? The `sync --strict` gate
+/// predicate: main.rs derives the exit code from this over the summary that
+/// was emitted, with no flag in scope on the writing path — gate flags
+/// change the exit code, never a byte of JSON, and reading the DISCLOSED
+/// document means the gate and a consumer parsing stdout cannot disagree.
+///
+/// Gating health tallies: `truncated`, `quarantined`, `discovery_truncated`,
+/// `deferred_at_floor`, and a non-empty `errors` — each names data the
+/// archive is known to be missing after the run. Excluded on purpose:
+/// `watchdog_kills` and `rate_limit_unknown` (an event retried to success
+/// leaves the archive complete — if it wasn't, one of the gating tallies
+/// already fired) and `masked_hits` (masking is the discovery mechanism
+/// working, not data missing). The targeted form (`sync --pr`) is incomplete
+/// iff its one hydration reports truncated. A document this function cannot
+/// read counts as incomplete — fail-open, the report::attention_has_demands
+/// posture; unreachable from [`run`]'s output by construction, pinned by
+/// test against drift.
+pub fn incomplete(doc: &Value) -> bool {
+    if let Some(pr) = doc.pointer("/sync/pr") {
+        return pr.get("truncated").and_then(Value::as_bool) != Some(false);
+    }
+    match doc.pointer("/sync/repos").and_then(Value::as_array) {
+        None => true,
+        Some(repos) => repos.iter().any(|r| {
+            let health = &r["health"];
+            // Tally counts; deferred_at_floor is the per-repo FLAG (the
+            // floor is run-wide, so the summary carries a bool, not an
+            // event count).
+            ["truncated", "quarantined", "discovery_truncated"]
+                .iter()
+                .any(|k| health.get(*k).and_then(Value::as_u64) != Some(0))
+                || health.get("deferred_at_floor").and_then(Value::as_bool) != Some(false)
+                || health
+                    .get("errors")
+                    .and_then(Value::as_array)
+                    .is_none_or(|e| !e.is_empty())
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // sync --pr: the targeted path (doc on `run`)
 
@@ -4298,5 +4338,65 @@ mod tests {
             tail_conservation(&arch, 0, &[], true),
             TailVerdict::Escalate("count imbalance")
         );
+    }
+
+    /// The --strict classification table: which disclosed fields gate and
+    /// which deliberately do not (the doc on `incomplete` argues each).
+    #[test]
+    fn strict_incompleteness_reads_the_disclosed_summary() {
+        let full_run = |health: Value| {
+            json!({"sync": {"repos": [
+                {"repo": "o/n", "health": health},
+            ], "rate_remaining": 4000}})
+        };
+        let clean = json!({
+            "truncated": 0, "quarantined": 0, "discovery_truncated": 0,
+            "deferred_at_floor": false, "watchdog_kills": 0, "masked_hits": 0,
+            "rate_limit_unknown": 0, "errors": [],
+        });
+        assert!(!incomplete(&full_run(clean.clone())));
+        // Each gating field fires alone; the floor is the summary's one
+        // BOOLEAN health field (run-wide flag, not an event count), so it
+        // gets its own arm — and the type mismatch either way must read
+        // incomplete, not clean (the shape-drift pin).
+        for k in ["truncated", "quarantined", "discovery_truncated"] {
+            let mut h = clean.clone();
+            h[k] = json!(1);
+            assert!(incomplete(&full_run(h)), "{k} must gate");
+        }
+        let mut h = clean.clone();
+        h["deferred_at_floor"] = json!(true);
+        assert!(incomplete(&full_run(h)), "deferred_at_floor must gate");
+        let mut h = clean.clone();
+        h["deferred_at_floor"] = json!(0);
+        assert!(
+            incomplete(&full_run(h)),
+            "a number where the flag belongs is shape drift, never all-clear"
+        );
+        let mut h = clean.clone();
+        h["errors"] = json!(["boom"]);
+        assert!(incomplete(&full_run(h)), "errors must gate");
+        // The deliberate exclusions: disclosed, never gating alone.
+        for k in ["watchdog_kills", "masked_hits", "rate_limit_unknown"] {
+            let mut h = clean.clone();
+            h[k] = json!(3);
+            assert!(!incomplete(&full_run(h)), "{k} must not gate");
+        }
+        // The targeted form gates on its one hydration's completeness.
+        let targeted = |truncated: bool| {
+            json!({"sync": {"pr": {
+                "repo": "o/n", "number": 1, "outcome": "hydrated",
+                "verified": !truncated, "truncated": truncated,
+            }}})
+        };
+        assert!(!incomplete(&targeted(false)));
+        assert!(incomplete(&targeted(true)));
+        // Unreadable documents fail open (drift pin: reachable only if
+        // run()'s output shape moves without this predicate moving).
+        assert!(incomplete(&json!({})));
+        assert!(incomplete(&json!({"sync": {"repos": "not an array"}})));
+        assert!(incomplete(&full_run(
+            json!({"truncated": "NaN", "errors": []})
+        )));
     }
 }

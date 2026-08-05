@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
-use crate::identity::{AuthorPattern, Login, RepoName};
+use crate::identity::{AuthorPattern, Login, RepoName, TeamName};
 
 fn default_lookback_days() -> u32 {
     90
@@ -208,6 +208,19 @@ pub struct Config {
     /// Project-scope repos subsume this — everyone is already in.
     #[serde(default)]
     pub people: Vec<Login>,
+    /// Team names the operator belongs to (the Team's display `name`, as
+    /// hydration stores it — queries.rs). Read-side only: `attention`
+    /// matches these against kind='team' review requests so a team request
+    /// can reach `waiting_on_me` "by team name" (schema.sql). NOT a
+    /// discovery input — it never enters a search qualifier or the sync
+    /// fingerprint, so editing it re-derives buckets instantly and
+    /// cold-starts nothing. Membership is declared, not verified: GitHub
+    /// team rosters are not local data, and without this list a team
+    /// request is a demand on SOMEONE, provably not on any particular
+    /// viewer — which is why the default (empty) surfaces none, rather
+    /// than fail-open flooding every operator with every team's queue.
+    #[serde(default)]
+    pub teams: Vec<TeamName>,
     /// Archive path. Default: $XDG_DATA_HOME/ghgraph/ghgraph.db.
     #[serde(default)]
     pub db_path: Option<PathBuf>,
