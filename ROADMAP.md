@@ -173,4 +173,10 @@ interaction as a named design input at that point.
   materializes; the extension point is the reference parser.
 - Repo-rename row migration — detection ships in milestone 2; whether to
   rewrite `prs.repo` on a confirmed rename waits for what the first real
-  rename does to `refs` integrity.
+  rename does to `refs` integrity. One concrete failure the migration must
+  fix, observed by review (milestone 4): after the operator follows the
+  rename remedy ("update the config entry"), the old rows keep the old repo
+  key under the same node ids, so the first upsert of a renamed item hits
+  the `UNIQUE(id)` constraint — classified INTERNAL (a lie; the actor is
+  the operator) and aborting every run until the archive is rebuilt. The
+  disposable-cache remedy covers it today; the migration retires it.

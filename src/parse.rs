@@ -727,10 +727,16 @@ pub struct IssueNode {
     pub repository: RepoRef,
     pub created_at: Rfc3339Utc,
     pub updated_at: Rfc3339Utc,
-    /// Both non-null in the schema (unlike the PR's three error-masking
-    /// connections): a missing connection fails the parse loudly instead
-    /// of masquerading as empty.
-    pub labels: Counted<LabelNode>,
+    /// Nullable in the introspected schema (Labelable's LabelConnection),
+    /// which is GraphQL's error-masking — `None` is a failed sub-resolver,
+    /// treated as a withheld witness (truncation), never as "no labels".
+    /// The review panel's D1 finding; live introspection confirmed the
+    /// asymmetry with the two below.
+    #[serde(deserialize_with = "nullable")]
+    pub labels: Option<Counted<LabelNode>>,
+    /// Non-null in the schema (Assignable's UserConnection!), like
+    /// comments: a missing connection fails the parse loudly instead of
+    /// masquerading as empty.
     pub assignees: Counted<AssigneeNode>,
     pub comments: Paged<CommentNode>,
 }
@@ -1462,9 +1468,10 @@ mod tests {
         assert!(author.database_id.is_some(), "User fragment carries the id");
         // The two counted connections, populated: nodes cover totalCount —
         // the shape whose coverage IS the witness (no follow-up document).
-        assert_eq!(issue.labels.total_count, 3);
-        assert_eq!(issue.labels.nodes.len(), 3);
-        assert!(issue.labels.nodes.iter().any(|l| l.name == "tech-debt"));
+        let labels = issue.labels.as_ref().expect("present in the capture");
+        assert_eq!(labels.total_count, 3);
+        assert_eq!(labels.nodes.len(), 3);
+        assert!(labels.nodes.iter().any(|l| l.name == "tech-debt"));
         assert_eq!(issue.assignees.total_count, 2);
         assert!(
             issue
@@ -1511,6 +1518,40 @@ mod tests {
         let c = &node.comments.nodes[0];
         assert!(!c.id.is_empty());
         assert!(!c.body.is_empty());
+    }
+
+    #[test]
+    fn issue_labels_null_is_a_mask_not_an_empty_set() {
+        // Issue.labels is schema-nullable (Labelable's LabelConnection —
+        // live-introspected; the D1 panel's finding): GitHub error-masks a
+        // failed sub-resolver to null there, unlike assignees/comments
+        // (both NON_NULL). The mask must parse as None — the withheld
+        // witness the hydrator turns into truncation — never fail the
+        // whole issue into a parse-class quarantine, and never read as
+        // "no labels".
+        let mut issue: Value = {
+            let v: Value = serde_json::from_str(include_str!(
+                "../tests/fixtures/hydrate_issue_assigned.json"
+            ))
+            .unwrap();
+            v["data"]["node"].clone()
+        };
+        issue["labels"] = Value::Null;
+        let parsed = hydrate_issue(&json!({"node": issue}))
+            .unwrap()
+            .expect("node resolves");
+        assert_eq!(parsed.labels, None, "mask, not empty");
+        // The strict pair: assignees null IS a parse failure — NON_NULL in
+        // the schema, so a null there is drift, not masking.
+        let mut issue: Value = {
+            let v: Value = serde_json::from_str(include_str!(
+                "../tests/fixtures/hydrate_issue_assigned.json"
+            ))
+            .unwrap();
+            v["data"]["node"].clone()
+        };
+        issue["assignees"] = Value::Null;
+        assert!(hydrate_issue(&json!({"node": issue})).is_err());
     }
 
     #[test]

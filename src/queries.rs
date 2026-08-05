@@ -300,9 +300,17 @@ query($id: ID!, $after: String) {
 ///   * labels and assignees are small counted connections, first: 20 with
 ///     totalCount, like reviewRequests on the PR side: no follow-up
 ///     document — an overflow withholds the witness and the row lands
-///     truncated, disclosed, like every other incompleteness. Real issues
-///     carry a handful of each; a repo that routinely overflows 20 is the
-///     evidence that would add a page document.
+///     truncated, disclosed, like every other incompleteness. assignees
+///     cannot overflow (GitHub caps assignees at 10); labels can on a
+///     heavy-triage repo, and such a row is unhealable by design until a
+///     page document exists — never-verified, so the re-verify tier
+///     refetches it every run, one of the REVERIFY_CAP slots. That cost
+///     is the accepted interim (disclosed via health.truncated each run);
+///     a repo that routinely overflows 20 is the evidence that would add
+///     the page document. labels is also schema-nullable (error-masking,
+///     unlike assignees/comments — live-introspected): parse.rs carries
+///     it Option, and a masked connection withholds the witness while
+///     the writer carries the stored value forward (upsert_issue_stream).
 ///   * No refresh/tail layer: every issue hydration is a full walk. The
 ///     tail exists because PR hydration pays for review threads; an issue
 ///     is one comments connection, and a single-page issue costs exactly

@@ -316,9 +316,11 @@ BEGIN
   INSERT INTO comments_fts(rowid, body) VALUES (new.pk, new.body);
 END;
 
--- Issues share the PR FTS shape (schema is final); the stream writer
--- populates it under project scope. "Where did we discuss X" lands in issue
--- bodies for an active project — the query that earns the index.
+-- Issues share the PR FTS shape (schema is final). The triggers index every
+-- issues row — the project-scope stream's full rows and the working-scope
+-- linked cache's skinny ones alike (a cached title/body is still searchable
+-- context). "Where did we discuss X" lands in issue bodies for an active
+-- project — the query that earned the index.
 CREATE VIRTUAL TABLE IF NOT EXISTS issues_fts USING fts5(
   title, body,
   content='issues', content_rowid='pk',

@@ -27,11 +27,15 @@
 //!
 //! Invariants, in order of importance:
 //!
-//!   * The watermark is server-side time — max updatedAt actually ingested —
-//!     never the local clock (clock skew and search-index lag both lose
-//!     updates otherwise). Queries overlap the watermark by ~10 minutes;
-//!     upserts make the overlap free. The writer takes max(stored, offered),
-//!     so a targeted backfill over old windows can never regress it.
+//!   * The watermark is server-side time — max DISCOVERY-time updatedAt
+//!     over the window's resolved ids — never the local clock (clock skew
+//!     and search-index lag both lose updates otherwise), and never the
+//!     hydration-time value, which an item touched between the two calls
+//!     can carry past a closed window's right edge (the fold in
+//!     walk_window carries the full argument). Queries overlap the
+//!     watermark by ~10 minutes; upserts make the overlap free. The writer
+//!     takes max(stored, offered), so a targeted backfill over old windows
+//!     can never regress it.
 //!
 //!   * sync_state advances only on Done: state never leads data. This is also
 //!     the entire cancellation story — SIGINT kills the process group (gh
@@ -435,13 +439,6 @@ impl Bundle {
             Bundle::Issue(b) => &b.issue.id,
         }
     }
-
-    fn updated_at(&self) -> &Rfc3339Utc {
-        match self {
-            Bundle::Pr(b) => &b.pr.updated_at,
-            Bundle::Issue(b) => &b.issue.updated_at,
-        }
-    }
 }
 
 /// A hydration failure recorded durably. Committed only inside the Done (or
@@ -468,10 +465,7 @@ pub struct WindowComplete(());
 pub enum Msg {
     /// Intermediate rows, committed ahead of their window's watermark (data
     /// may lead state; replay idempotence makes the redo free).
-    Page {
-        repo: String,
-        rows: Vec<Bundle>,
-    },
+    Page { repo: String, rows: Vec<Bundle> },
     /// One completed discovery window: rows, quarantine records, and the
     /// watermark advance in a single transaction — both-or-neither, at
     /// window grain, so a mid-run floor deferral banks every window it
@@ -516,7 +510,14 @@ pub enum Msg {
         stream: Stream,
         reset_at: Option<String>,
     },
-    Failed(String, Error),
+    /// Repo-scoped failure. Carries the streams THIS RUN was configured to
+    /// walk: the starvation increment must not touch a residual row for a
+    /// stream the config no longer runs (issues flipped off leaves the
+    /// (repo,'issue') row behind, and only its own stream's completing
+    /// Done can ever reset it — an unconditional increment would read the
+    /// repo as permanently starved and bias starved-first ordering
+    /// forever).
+    Failed(String, Vec<Stream>, Error),
     /// Worker-side accounting, once per repo, after its last data message.
     Stats {
         repo: String,
@@ -660,6 +661,24 @@ struct RepoPlan {
     /// fingerprint row, so a scope flip cold-starts both while an
     /// unchanged config leaves both incremental.
     issue_since: Option<Rfc3339Utc>,
+    /// This walk restarts from the lookback floor (a relaxation ColdStart,
+    /// or --full): its intermediate windows commit the STORED fingerprint,
+    /// so a kill mid-walk reads "unequal → cold-start again" next run
+    /// instead of "equal → incremental", which would silently skip the
+    /// region the walk never reached — the F1 argument, generalized from
+    /// backfill to every restart-from-floor (D1 panel). The price,
+    /// recorded: an interrupted cold start banks no discovery progress
+    /// (the watermark stays pinned at the old high by max()) and redoes
+    /// its windows next run; it converges when any single run completes
+    /// the walk, and the redo is idempotent. Under --full with an
+    /// UNCHANGED config the stored and new fingerprints are byte-equal
+    /// (canonical serialization), so the hold degenerates to a no-op.
+    /// Per stream, like everything else here.
+    cold_start: bool,
+    issue_cold_start: bool,
+    /// The issue stream's own stored fingerprint (see stored_fingerprint;
+    /// the rows can disagree — e.g. a kill mid-cold-start of one stream).
+    issue_stored_fingerprint: Option<String>,
     /// People added since the stored fingerprint: targeted backfill of just
     /// their involves: flavors over the lookback. PR-stream only — people
     /// never shape project-scope discovery, and the issue stream exists
@@ -719,22 +738,31 @@ fn plan(cfg: &Config, archive: &RwArchive, now: &Rfc3339Utc, full: bool) -> Resu
         let fp_json = serde_json::to_string(&fp_new).expect("fingerprint is plain data");
 
         let lookback_start = lookback_start(now, &rc, cfg);
-        let (since, backfill) = if full {
+        let (since, backfill, cold_start) = if full {
             // --full ignores watermarks and refetches the whole lookback;
             // it subsumes any pending backfill (every flavor re-runs).
-            (lookback_start.clone(), Vec::new())
+            (lookback_start.clone(), Vec::new(), true)
         } else {
             match transition(state.as_ref(), &fp_new) {
-                Transition::ColdStart => (lookback_start.clone(), Vec::new()),
+                Transition::ColdStart => (lookback_start.clone(), Vec::new(), true),
                 Transition::Incremental => (
                     incremental_since(state.as_ref(), &lookback_start),
                     Vec::new(),
+                    false,
                 ),
-                Transition::Backfill(added) => {
-                    (incremental_since(state.as_ref(), &lookback_start), added)
-                }
+                Transition::Backfill(added) => (
+                    incremental_since(state.as_ref(), &lookback_start),
+                    added,
+                    false,
+                ),
             }
         };
+
+        // One gate, computed once: the issue-since decision and the
+        // issue-re-verify decision must agree (a divergence would re-verify
+        // a stream the walk never runs, or vice versa), so they read the
+        // same binding.
+        let issue_stream_on = rc.scope == Scope::Project && rc.issues();
 
         // The issue stream's own transition, against its own state row.
         // Backfill folds to Incremental by construction (project-scope
@@ -743,7 +771,7 @@ fn plan(cfg: &Config, archive: &RwArchive, now: &Rfc3339Utc, full: bool) -> Resu
         // failure mode — a people edit backfilling a stream whose search
         // never mentions them — is exactly what the pinned-empty rule
         // exists to prevent, and Incremental is that rule's meaning here.
-        let issue_since = if rc.scope == Scope::Project && rc.issues() {
+        let (issue_since, issue_cold_start, issue_stored_fingerprint) = if issue_stream_on {
             let issue_state: Option<(String, String)> = conn
                 .query_row(
                     "SELECT last_item_updated_at, fingerprint FROM sync_state \
@@ -754,18 +782,20 @@ fn plan(cfg: &Config, archive: &RwArchive, now: &Rfc3339Utc, full: bool) -> Resu
                 .map(Some)
                 .or_else(none_if_no_rows)
                 .map_err(|e| classify_sql(&e))?;
-            Some(if full {
-                lookback_start.clone()
+            let (issue_since, issue_cold) = if full {
+                (lookback_start.clone(), true)
             } else {
                 match transition(issue_state.as_ref(), &fp_new) {
-                    Transition::ColdStart => lookback_start.clone(),
-                    Transition::Incremental | Transition::Backfill(_) => {
-                        incremental_since(issue_state.as_ref(), &lookback_start)
-                    }
+                    Transition::ColdStart => (lookback_start.clone(), true),
+                    Transition::Incremental | Transition::Backfill(_) => (
+                        incremental_since(issue_state.as_ref(), &lookback_start),
+                        false,
+                    ),
                 }
-            })
+            };
+            (Some(issue_since), issue_cold, issue_state.map(|(_, fp)| fp))
         } else {
-            None
+            (None, false, None)
         };
 
         let mut quarantine_due = Vec::new();
@@ -803,7 +833,6 @@ fn plan(cfg: &Config, archive: &RwArchive, now: &Rfc3339Utc, full: bool) -> Resu
             }
         }
 
-        let issue_stream_on = rc.scope == Scope::Project && rc.issues();
         let reverify = reverify_due(conn, &repo, cfg, now, &quarantined, issue_stream_on)?;
 
         // Starvation is per stream in the schema but starved-FIRST ordering
@@ -831,6 +860,9 @@ fn plan(cfg: &Config, archive: &RwArchive, now: &Rfc3339Utc, full: bool) -> Resu
             repo,
             since,
             issue_since,
+            cold_start,
+            issue_cold_start,
+            issue_stored_fingerprint,
             backfill,
             fingerprint: fp_json,
             stored_fingerprint: state.as_ref().map(|(_, fp)| fp.clone()),
@@ -1238,7 +1270,10 @@ fn worker(
                 let _ = tx.send(stats);
             }
             Err(Stop::Repo(error)) => {
-                if tx.send(Msg::Failed(plan.repo.clone(), error)).is_err() {
+                if tx
+                    .send(Msg::Failed(plan.repo.clone(), streams(&plan), error))
+                    .is_err()
+                {
                     return;
                 }
                 let _ = tx.send(stats);
@@ -1425,7 +1460,20 @@ impl StreamCtx<'_> {
             };
             match hydrated {
                 Hydrated::Bundle(bundle) => {
-                    extend(&mut watermark, bundle.updated_at());
+                    // The fold takes the DISCOVERY-time updatedAt — the
+                    // value the `updated:` window bounded — not the
+                    // hydration-time one, which an item touched between
+                    // the two calls can carry past a closed window's right
+                    // edge. Unbounded, that overshoot commits a watermark
+                    // covering the sibling right window before it runs; a
+                    // floor stop then resumes PAST an item whose only home
+                    // was that window — the one shape "watermark never
+                    // leads data" did not cover (D1 panel). The drifted
+                    // item itself is safe either way: its new updatedAt
+                    // exceeds the folded one, so the next run's window
+                    // rediscovers it and the upsert dedups. Same rule as
+                    // the filtered arm below — one fold, one time base.
+                    extend(&mut watermark, &hit.updated_at);
                     self.fetched += 1;
                     rows.push(bundle);
                     if rows.len() >= PAGE_BATCH {
@@ -1452,15 +1500,33 @@ impl StreamCtx<'_> {
             // than everything seen (sort is updated-desc), so any advance
             // would pass it permanently.
             watermark: if halt { None } else { watermark },
-            fingerprint: match terms {
-                TermSource::Full => self.plan.fingerprint.clone(),
-                // See RepoPlan::stored_fingerprint. A backfill only exists
-                // when a stored row does.
-                TermSource::Backfill(_) => self
-                    .plan
-                    .stored_fingerprint
-                    .clone()
-                    .unwrap_or_else(|| self.plan.fingerprint.clone()),
+            fingerprint: {
+                let stored = match stream {
+                    Stream::Pr => &self.plan.stored_fingerprint,
+                    Stream::Issue => &self.plan.issue_stored_fingerprint,
+                };
+                let cold_start = match stream {
+                    Stream::Pr => self.plan.cold_start,
+                    Stream::Issue => self.plan.issue_cold_start,
+                };
+                let completes = until.is_none() && matches!(terms, TermSource::Full) && !halt;
+                match terms {
+                    // A cold start's intermediate windows commit the STORED
+                    // inputs; only the completing window claims the new ones
+                    // (RepoPlan::cold_start carries the argument). First
+                    // contact has nothing stored and writes the new
+                    // fingerprint from the first window — its convergence
+                    // is the banked watermark, which needs the row.
+                    TermSource::Full if cold_start && !completes => stored
+                        .clone()
+                        .unwrap_or_else(|| self.plan.fingerprint.clone()),
+                    TermSource::Full => self.plan.fingerprint.clone(),
+                    // See RepoPlan::stored_fingerprint. A backfill only
+                    // exists when a stored row does.
+                    TermSource::Backfill(_) => stored
+                        .clone()
+                        .unwrap_or_else(|| self.plan.fingerprint.clone()),
+                }
             },
             completes_stream: until.is_none() && matches!(terms, TermSource::Full) && !halt,
             discovery_truncated: u64::from(halt),
@@ -2151,8 +2217,10 @@ fn hydrate_issue_one(
         }
     }
 
-    let labels_complete =
-        i64::try_from(node.labels.nodes.len()).is_ok_and(|n| n >= node.labels.total_count);
+    // labels is schema-nullable (error-masked; parse.rs), so it takes the
+    // same judgment as the PR's three nullable connections; assignees is
+    // non-null and judges its own coverage.
+    let labels_complete = counted_complete(&node.labels);
     let assignees_complete =
         i64::try_from(node.assignees.nodes.len()).is_ok_and(|n| n >= node.assignees.total_count);
 
@@ -2816,21 +2884,25 @@ fn writer(
                 )
                 .map_err(|e| classify_sql(&e))?;
             }
-            Msg::Failed(repo, error) => {
+            Msg::Failed(repo, streams, error) => {
                 let t = tally(&mut tallies, &repo);
                 t.errors.push(error.to_string());
-                // A repo failure is a failed RUN for every stream the repo
-                // has rows for (the module docs' "increments on a deferred
-                // or failed run"); only existing rows move, as with
-                // Deferred — a never-synced stream has nothing to starve.
-                archive
-                    .conn()
-                    .execute(
-                        "UPDATE sync_state SET runs_since_advance = runs_since_advance + 1 \
-                         WHERE repo = ?1",
-                        rusqlite::params![repo],
-                    )
-                    .map_err(|e| classify_sql(&e))?;
+                // A repo failure is a failed RUN for every stream this run
+                // was configured to walk (the module docs' "increments on
+                // a deferred or failed run") — and only those (the message
+                // doc carries the residual-row argument). Only existing
+                // rows move, as with Deferred: a never-synced stream has
+                // nothing to starve.
+                for stream in streams {
+                    archive
+                        .conn()
+                        .execute(
+                            "UPDATE sync_state SET runs_since_advance = runs_since_advance + 1 \
+                             WHERE repo = ?1 AND stream = ?2",
+                            rusqlite::params![repo, stream.as_str()],
+                        )
+                        .map_err(|e| classify_sql(&e))?;
+                }
             }
             Msg::Stats {
                 repo,
@@ -3731,6 +3803,14 @@ impl<'a> CommentFields<'a> {
     }
 }
 
+/// Keyed on the upstream comment id, which GitHub guarantees globally
+/// unique — the one place this writer leans on an upstream invariant with
+/// no local witness: if an id ever named both a PR comment and an issue
+/// comment, the UPDATE would re-home it whole (parent_kind and parent move
+/// in the same statement — atomic, never a cross-table orphan) but
+/// silently, each hydration flipping it back. The milestone-5 stats
+/// consistency audit is the named place to add the oscillation detector if
+/// that invariant ever cracks.
 #[allow(clippy::too_many_arguments)]
 fn upsert_comment(
     tx: &rusqlite::Transaction,
@@ -3919,6 +3999,12 @@ fn sweep_threads(
 /// canonical form is what keeps the diff gate honest — an order shuffle
 /// upstream must not read as a change (replay idempotence) — and the
 /// stored value deterministic for golden output.
+///
+/// A masked labels connection (schema-nullable; parse.rs) is not up for
+/// recomputation — the same rule as the refs writer under a missing
+/// closing witness: the stored value carries through the diff and the
+/// UPDATE untouched, and only a fresh insert lands NULL (an unknown,
+/// disclosed by the truncated flag the withheld witness already set).
 fn upsert_issue_stream(
     tx: &rusqlite::Transaction,
     now: &Rfc3339Utc,
@@ -3929,10 +4015,12 @@ fn upsert_issue_stream(
     let author = issue.author.as_ref();
     let landed_truncated = !b.verified();
 
-    let mut labels: Vec<&str> = issue.labels.nodes.iter().map(|l| l.name.as_str()).collect();
-    labels.sort_unstable();
-    labels.dedup();
-    let labels = serde_json::to_string(&labels).expect("labels are plain data");
+    let labels: Option<String> = issue.labels.as_ref().map(|c| {
+        let mut names: Vec<&str> = c.nodes.iter().map(|l| l.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        serde_json::to_string(&names).expect("labels are plain data")
+    });
     let mut assignees: Vec<&str> = issue
         .assignees
         .nodes
@@ -3967,27 +4055,6 @@ fn upsert_issue_stream(
         .map(Some)
         .or_else(none_if_no_rows)
         .map_err(|e| classify_sql(&e))?;
-
-    let new: Vec<(&str, Option<String>)> = vec![
-        ("id", Some(issue.id.clone())),
-        ("title", Some(issue.title.clone())),
-        ("state", Some(issue.state.clone())),
-        ("body", Some(issue.body.clone())),
-        ("author", author.map(|a| a.login.as_str().to_string())),
-        (
-            "author_id",
-            author.and_then(|a| a.database_id).map(|i| i.to_string()),
-        ),
-        ("author_assoc", Some(issue.author_association.clone())),
-        ("labels", Some(labels.clone())),
-        ("assignees", Some(assignees.clone())),
-        ("url", Some(issue.url.clone())),
-        ("created_at", Some(issue.created_at.as_str().to_string())),
-        ("updated_at", Some(issue.updated_at.as_str().to_string())),
-        ("hydration_source", Some("stream".to_string())),
-        ("truncated", Some(i64::from(landed_truncated).to_string())),
-        ("deleted_at", None),
-    ];
 
     match existing {
         None => {
@@ -4047,6 +4114,29 @@ fn upsert_issue_stream(
             ];
             let old: HashMap<&str, &Option<String>> =
                 names.iter().copied().zip(old_cols.iter()).collect();
+            // The masked-labels carry (doc above): the stored value stands
+            // in for the unfetchable one, in the diff and the UPDATE both.
+            let labels_row = labels.clone().or_else(|| old["labels"].clone());
+            let new: Vec<(&str, Option<String>)> = vec![
+                ("id", Some(issue.id.clone())),
+                ("title", Some(issue.title.clone())),
+                ("state", Some(issue.state.clone())),
+                ("body", Some(issue.body.clone())),
+                ("author", author.map(|a| a.login.as_str().to_string())),
+                (
+                    "author_id",
+                    author.and_then(|a| a.database_id).map(|i| i.to_string()),
+                ),
+                ("author_assoc", Some(issue.author_association.clone())),
+                ("labels", labels_row.clone()),
+                ("assignees", Some(assignees.clone())),
+                ("url", Some(issue.url.clone())),
+                ("created_at", Some(issue.created_at.as_str().to_string())),
+                ("updated_at", Some(issue.updated_at.as_str().to_string())),
+                ("hydration_source", Some("stream".to_string())),
+                ("truncated", Some(i64::from(landed_truncated).to_string())),
+                ("deleted_at", None),
+            ];
             let mut field_changed = false;
             for (name, new_val) in &new {
                 if old[*name] != new_val {
@@ -4055,10 +4145,17 @@ fn upsert_issue_stream(
             }
             // verified_at moves only when it says something new — the
             // upsert_pr rule verbatim (module docs). The never-verified
-            // arm is live here, not defensive: a 'linked' row upgrades
-            // with verified_at NULL, and its first witnessed stream
-            // hydration must stamp even if every diffed field happens to
-            // match the linked cache's view.
+            // arm is defensive here exactly as it is there: this writer's
+            // own insert stamps or marks truncated, and the one other
+            // writer ('linked' fill) leaves verified_at NULL only on rows
+            // whose upgrade must flip hydration_source — which trips
+            // field_changed first. Its mutants are equivalent by that
+            // precondition, and stay; the arm itself stays because the
+            // precondition lives in ANOTHER function's SQL. Targeted is
+            // unreachable on the issue path today (--pr is PR-only by
+            // verb contract) — written for rule parity, so a future
+            // --issue lands on the decided policy instead of re-deriving
+            // it; its mutants are equivalent by the same argument.
             let stamp = b.verified()
                 && (field_changed
                     || old_verified_at.is_none()
@@ -4089,7 +4186,7 @@ fn upsert_issue_stream(
                         author.map(|a| a.login.as_str()),
                         author.and_then(|a| a.database_id),
                         issue.author_association,
-                        labels,
+                        labels_row,
                         assignees,
                         issue.url,
                         issue.created_at.as_str(),
@@ -4114,6 +4211,26 @@ fn upsert_linked_issue(
 ) -> Result<()> {
     let repo = issue.repository.name_with_owner.to_ascii_lowercase();
     let author = issue.author.as_ref();
+    // A linked reference is a live API sighting: GitHub just rendered this
+    // issue's node inside a PR's closingIssuesReferences, standing evidence
+    // the id resolves to something the viewer can see — exactly what a
+    // node:null drain concluded was gone. Presence is not content, so the
+    // resurrect deliberately crosses the hydration_source boundary (a
+    // drained STREAM row revives here too; its content refreshes on its
+    // next discovery or re-verify) while the content freshen below keeps
+    // its 'linked'-only gate. Conflicting evidence can alternate this
+    // across runs (direct lookup null, connection rendering it) — each
+    // flip is evidence-driven and counted (soft_deleted), never a guess.
+    // Diff-gated by the WHERE, like every write here.
+    let revived = exec(
+        tx,
+        "UPDATE issues SET deleted_at = NULL \
+         WHERE repo = ?1 AND number = ?2 AND deleted_at IS NOT NULL",
+        rusqlite::params![repo, issue.number],
+    )?;
+    if revived > 0 {
+        *changed = true;
+    }
     let inserted = exec(
         tx,
         "INSERT INTO issues (id, repo, number, title, state, body, author, author_id, \
