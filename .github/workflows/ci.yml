@@ -36,8 +36,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: toolchain
         run: rustup update --no-self-update stable && rustup default stable
-      - name: install audit tools (locked)
-        run: cargo install cargo-audit --locked && cargo install cargo-vet --locked
+      - name: install audit tools (version-pinned, locked)
+        # Pinned versions, bumped by diff like any dependency — an unpinned
+        # install would let a new tool release change vet/audit semantics
+        # with no reviewable change in this repo.
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-vet --version 0.10.2 --locked
       - name: advisory scan
         run: make audit
       - name: vet the dependency tree

@@ -235,7 +235,7 @@ pub struct Telemetry {
     pub subprocess_count: u64,
     pub subprocess_ms: u64,
     pub bytes_parsed: u64,
-    /// Per completed (non-killed) call: (stdout bytes, wall ms). Consumer:
+    /// Per data-bearing, un-killed call: (stdout bytes, wall ms). Consumer:
     /// the per-run overhead-intercept regression written to sync_runs
     /// (sync.rs) — per-call pairs, because a regression over per-repo
     /// aggregates would conflate spawn overhead with payload size. Intra-run
@@ -368,20 +368,28 @@ fn graphql_once(
     })?;
     let call_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     tel.subprocess_count += 1;
+    // Mutation note: the subprocess_ms accumulation has surviving
+    // arithmetic mutants (+= → *=) by design — wall-clock values are the
+    // contract's enumerated nondeterminism, masked in every deterministic
+    // test, so no test may assert them without asserting noise.
     tel.subprocess_ms += call_ms;
     tel.bytes_parsed += out.stdout.len() as u64;
     if out.killed {
         tel.watchdog_kills += 1;
-    } else {
-        // One (bytes, ms) pair per completed call — the raw material for
-        // sync_runs' per-run overhead-intercept regression (sync.rs).
-        // Killed calls are excluded: a watchdog deadline measures the
-        // stall, not the bytes-to-time relationship the regression models.
-        tel.samples.push((out.stdout.len() as u64, call_ms));
     }
     // Body first, unconditionally: a complete, data-bearing response is a
     // success even from a child the watchdog had to kill after it wrote one.
     if let Some(resp) = body_success(&out.stdout) {
+        if !out.killed {
+            // One (bytes, ms) pair per data-bearing, un-killed call — the
+            // raw material for sync_runs' per-run overhead-intercept
+            // regression (sync.rs). Failed attempts are excluded on the
+            // same argument as watchdog kills: a throttle wait or 5xx
+            // measures the failure, not the bytes-to-time relationship —
+            // and error points sit near x = 0, where they would steer the
+            // intercept directly rather than average out.
+            tel.samples.push((out.stdout.len() as u64, call_ms));
+        }
         match &resp.rate_limit {
             Some(rl) => {
                 tel.rate_cost += u64::from(rl.cost);

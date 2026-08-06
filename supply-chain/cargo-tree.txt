@@ -1,4 +1,4 @@
-ghgraph v0.1.0 (/Users/eslerm/code/eslerm/ghgraph)
+ghgraph v0.1.0
 ├── clap v4.6.4
 │   ├── clap_builder v4.6.2
 │   │   ├── anstyle v1.0.14

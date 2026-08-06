@@ -2830,7 +2830,10 @@ fn writer(
     }
     // Run-level, not per-repo: the overhead-intercept regression pools every
     // completed call's (bytes, ms) pair — spawn overhead is a property of
-    // the machine and the gh binary, not of any one repo.
+    // the machine and the gh binary, not of any one repo. Pool ORDER is
+    // Msg::Stats arrival order, nondeterministic across workers; licensed
+    // because only the rounded per-run intercept is stored, nothing ever
+    // compares it byte-identical, and its consumer is a 20-run median.
     let mut samples: Vec<(u64, u64)> = Vec::new();
     // A message can only name a configured repo, but stay total.
     fn tally<'a>(t: &'a mut BTreeMap<String, RepoTally>, repo: &str) -> &'a mut RepoTally {
@@ -3020,13 +3023,23 @@ fn record_run(
     tallies: &BTreeMap<String, RepoTally>,
     samples: &[(u64, u64)],
 ) -> Result<()> {
-    // u64 tallies land in i64 columns; saturate rather than wrap (the same
-    // posture as the summary's integer handling — a tally near i64::MAX is
-    // already nonsense, but it must not become a negative trend row).
+    // A zero-repo run records nothing: no discovery ran, and an all-zero
+    // row per cron tick of an empty config would dilute the trailing
+    // window (stats) without informing any consumer.
+    if tallies.is_empty() {
+        return Ok(());
+    }
+    // u64 tallies land in i64 columns; saturate rather than wrap — both
+    // the per-repo fold (saturating_add) and the final cast, so the stated
+    // posture is the whole path's, not just the last step's (a tally near
+    // i64::MAX is already nonsense, but it must not become a negative
+    // trend row).
     fn s(v: u64) -> i64 {
         i64::try_from(v).unwrap_or(i64::MAX)
     }
-    let sum = |f: fn(&RepoTally) -> u64| -> i64 { s(tallies.values().map(f).sum()) };
+    let sum = |f: fn(&RepoTally) -> u64| -> i64 {
+        s(tallies.values().fold(0u64, |a, t| a.saturating_add(f(t))))
+    };
     archive
         .conn()
         .execute(
@@ -3105,13 +3118,20 @@ fn overhead_intercept_ms(samples: &[(u64, u64)]) -> Option<i64> {
     if sxx == 0.0 {
         return None;
     }
+    // Mutation note: flipping either `-` inside this map to `+` is an
+    // equivalent mutant, by algebra rather than by luck — Σ(x+mx)(y−my) =
+    // Σ(x−mx)(y−my) + 2·mx·Σ(y−my), and Σ(y−my) is identically zero by the
+    // definition of the mean (symmetrically for the y side). Only float
+    // rounding distinguishes them; a test pinning that residue would
+    // assert noise. Documented per the triage rule, not chased.
     let sxy: f64 = samples
         .iter()
         .map(|&(x, y)| (x as f64 - mx) * (y as f64 - my))
         .sum();
     let intercept = my - (sxy / sxx) * mx;
-    // `as` saturates on overflow/NaN — with finite inputs the value is
-    // finite, and a pathological one lands on the i64 rails, not UB.
+    // `as` saturates on overflow — with finite inputs the value is finite,
+    // and a pathological one lands on the i64 rails, not UB. (NaN would
+    // cast to 0, but the sxx > 0 guard above blocks the only NaN route.)
     Some(intercept.round() as i64)
 }
 

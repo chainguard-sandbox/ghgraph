@@ -1272,6 +1272,22 @@ fn audits_fire_on_a_corrupted_archive() {
             [],
         )
         .unwrap();
+        // A break AFTER a NULL-new predecessor (review_decision reverting
+        // to null is a legitimate observation): LAG(new) is NULL here just
+        // like a first row's, so a prev-IS-NOT-NULL formulation would
+        // silently exempt this one — the ROW_NUMBER exemption must not.
+        conn.execute(
+            "INSERT INTO observations (pr, observed_at, field, old, new) \
+             VALUES (2, '2026-01-06T00:00:00Z', 'review_decision', 'APPROVED', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO observations (pr, observed_at, field, old, new) \
+             VALUES (2, '2026-01-07T00:00:00Z', 'review_decision', 'CHANGES_REQUESTED', NULL)",
+            [],
+        )
+        .unwrap();
         // FTS 'missing': remove PR #1's index entry through fts5's special
         // delete command, leaving the content row in place — the desync the
         // triggers exist to prevent, forged directly.
@@ -1309,7 +1325,10 @@ fn audits_fire_on_a_corrupted_archive() {
     assert_eq!(a["orphans"]["comments"], 1, "comment orphan: {a}");
     assert_eq!(a["orphans"]["observations"], 1, "observation orphan: {a}");
     assert_eq!(a["orphans"]["refs"], 0, "untouched tables stay clean: {a}");
-    assert_eq!(a["observation_chain_breaks"], 1, "chain break: {a}");
+    assert_eq!(
+        a["observation_chain_breaks"], 2,
+        "one plain break, one behind a NULL-new predecessor: {a}"
+    );
     assert_eq!(a["fts"]["prs"]["missing"], 1, "deindexed content row: {a}");
     assert_eq!(
         a["fts"]["prs"]["index_orphans"], 1,

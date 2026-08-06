@@ -284,8 +284,14 @@ CREATE TABLE IF NOT EXISTS quarantine (
 -- away without a telemetry store growing underneath. A run that dies before
 -- the writer finishes leaves NO row: sync_runs describes completed runs, and
 -- an aborted run's absence here is disclosed by its sync_state
--- runs_since_advance increment, not by a partial row. The targeted form
--- (`sync --pr`) writes no row either — it is one hydration, not a run.
+-- runs_since_advance increment, not by a partial row. One stated
+-- precondition: that holds for writer-side errors; a worker PANIC (a
+-- ghgraph bug by policy) drops its Sender, ends the recv loop normally,
+-- and can leave a row missing that worker's counters before the panic
+-- re-raises. The targeted form (`sync --pr`) writes no row either — it is
+-- one hydration, not a run. A zero-repo run writes none as well
+-- (sync.rs record_run): an all-zero row per cron tick of an empty config
+-- would dilute the trailing window without informing any consumer.
 --
 -- Every column names its consumer (the telemetry rule: a field with no
 -- consumer is deleted). Omitted on that rule, recorded so the cut is not
@@ -315,10 +321,12 @@ CREATE TABLE IF NOT EXISTS sync_runs (
   full_walks            INTEGER NOT NULL,
   -- Batching decision (ROADMAP, deferred `nodes(ids:)` hydration): batch
   -- only if spawn overhead dominates. The intercept is computed per run
-  -- from the run's real per-call (bytes_parsed, subprocess_ms) pairs;
-  -- the decision reads a MEDIAN over trailing rows, never one run. NULL
-  -- when the run had too few or degenerate samples for a regression —
-  -- unknown is disclosed, never zero-filled.
+  -- from the run's per-call (stdout bytes, wall ms) pairs (gh.rs
+  -- Telemetry::samples — intra-run only, so the intercept is NOT
+  -- recomputable from the stored totals); the decision reads a MEDIAN
+  -- over trailing rows, never one run. NULL when the run had too few or
+  -- degenerate samples for a regression — unknown is disclosed, never
+  -- zero-filled.
   subprocess_count      INTEGER NOT NULL,
   subprocess_ms         INTEGER NOT NULL,
   bytes_parsed          INTEGER NOT NULL,
@@ -330,8 +338,9 @@ CREATE TABLE IF NOT EXISTS sync_runs (
   sleep_ms              INTEGER NOT NULL,
   deferred_at_floor     INTEGER NOT NULL,      -- 0/1: the floor is run-wide
   rate_remaining        INTEGER,               -- NULL: envelope never seen
-  -- Health trend: `stats` surfaces these so starvation and incompleteness
-  -- are visible, not inferred; rate_limit_unknown nonzero detects the
+  -- Health trend: `stats` sums these over its trailing window
+  -- (report.rs sync_runs_trends "health") so incompleteness over recent
+  -- runs is visible, not inferred; rate_limit_unknown nonzero detects the
   -- rateLimit envelope regressing (gh.rs names that consumer).
   truncated             INTEGER NOT NULL,
   quarantined           INTEGER NOT NULL,

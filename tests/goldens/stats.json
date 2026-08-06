@@ -136,6 +136,14 @@
       "trailing": {
         "deferred_at_floor_runs": 0,
         "full_walks": 0,
+        "health": {
+          "discovery_truncated": 0,
+          "errors": 0,
+          "quarantined": 0,
+          "rate_limit_unknown": 0,
+          "truncated": 0,
+          "watchdog_kills": 0
+        },
         "overhead_intercept_ms_median": null,
         "runs": 0,
         "sleep_seconds": 0,

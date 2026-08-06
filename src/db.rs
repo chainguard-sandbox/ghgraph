@@ -33,11 +33,20 @@
 //! Two preconditions of the mode guarantee, and their enforcement:
 //!   * A pre-existing archive directory (an operator's custom `db_path`
 //!     pointed at a shared dir) keeps its own mode — but open_rw REFUSES a
-//!     group/other-WRITABLE parent unless its sticky bit is set: a writable
-//!     parent is exactly the access the symlink-swap defense assumes the
-//!     attacker lacks, while a sticky writable dir (the /tmp shape) denies
-//!     non-owners the unlink+replace a swap needs. Write bits only, decided:
-//!     a world-READABLE parent weakens the -wal/-shm confidentiality
+//!     group/other-WRITABLE parent unless it is root-owned AND sticky (the
+//!     /tmp shape): a writable parent is exactly the access the symlink-swap
+//!     defense assumes the attacker lacks; sticky denies NON-OWNERS the
+//!     unlink+replace a swap needs, and the root-owned narrowing keeps a
+//!     user-owned 1777 dir (whose owner retains both) refused. The residue
+//!     sticky cannot cover — planting a symlink at a not-yet-existing
+//!     archive path needs only create — is closed by an lstat refusal of a
+//!     symlink at the path itself (refuse_symlink_archive). Immediate
+//!     parent only, with the limit stated: a writable ANCESTOR can rename
+//!     the parent dir itself aside and substitute one that passes every
+//!     check here — the same unsafe-traversal exposure the module accepts
+//!     by rejecting NOFOLLOW/openat chains, and an operator's path choice,
+//!     not a mode this code can vet. Write bits only, decided: a
+//!     world-READABLE parent weakens the -wal/-shm confidentiality
 //!     boundary but forges nothing — refusing it would false-refuse every
 //!     home directory more open than 0700, so readability stays the
 //!     operator's call and integrity does not.
@@ -193,6 +202,7 @@ pub fn open_rw(path: &Path) -> Result<RwArchive> {
         refuse_writable_parent(parent)?;
     }
     create_0600_if_absent(path)?;
+    refuse_symlink_archive(path)?;
 
     // create_0600_if_absent already birthed the file at 0600, so in the normal
     // path SQLITE_OPEN_CREATE never sets a mode. It is kept only to survive the
@@ -268,17 +278,21 @@ pub fn open_ro(path: &Path) -> Result<RoArchive> {
 
 /// Open the archive for the `stats` audits: SQLITE_OPEN_READ_ONLY but NO
 /// PRAGMA query_only, because the FTS integrity audit introspects the index
-/// through `fts5vocab` TEMP virtual tables (the only read-only view of what
-/// the index actually holds — a plain fts5 full scan answers from the
-/// CONTENT table, so it cannot witness a desync), and query_only refuses
-/// even temp-schema writes. What this trades, precisely: archive
-/// write-immunity remains a mechanism (the VFS-level READ_ONLY flag), but
-/// the belt query_only adds — refusing ATTACH-based writes to OTHER files —
-/// is off. Admissible only because stats executes exclusively its own
-/// literal SQL; the `query` verb, which runs operator SQL, keeps the full
-/// pair and must never move to this open. Same existence and version gates
-/// as [`open_ro`]. Reversal evidence: an fts5 mechanism that lets a
-/// query_only connection see index rowids would retire this open.
+/// through `fts5vocab` TEMP virtual tables — the only read-only ENUMERATION
+/// of the index's per-rowid contents (a plain fts5 full scan answers from
+/// the CONTENT table so it cannot witness a desync, and a MATCH reads the
+/// index but only for terms you already know) — and query_only refuses even
+/// temp-schema writes. What this trades, precisely: archive write-immunity
+/// remains a mechanism (the VFS-level READ_ONLY flag), but the belt
+/// query_only adds — refusing ATTACH-based writes to OTHER files — is off.
+/// Admissible only because stats executes exclusively its own literal SQL;
+/// the `query` verb, which runs operator SQL, keeps the full pair and must
+/// never move to this open. The guard is at the OPEN, not at execute():
+/// RoAuditArchive::conn is a raw &Connection like every wrapper here, so
+/// the type prevents handing the weakened connection around, not misusing
+/// one already held. Same existence and version gates as [`open_ro`].
+/// Reversal evidence: an fts5 mechanism that lets a query_only connection
+/// enumerate index rowids would retire this open.
 pub fn open_ro_audit(path: &Path) -> Result<RoAuditArchive> {
     match path.try_exists() {
         Ok(true) => {}
@@ -295,6 +309,13 @@ pub fn open_ro_audit(path: &Path) -> Result<RoAuditArchive> {
             )));
         }
     }
+    // Mutation notes, shared with open_ro's identical lines: the flag `|`
+    // has an equivalent `^` mutant (the two flags are disjoint bit sets, so
+    // OR and XOR coincide); the hook's `== "1"` has an equivalent `!=`
+    // mutant under the test suite, because for contract-correct queries the
+    // reversal pragma is observably a no-op either way — the hook exists to
+    // catch INCORRECT queries, and a test that could see the flip would
+    // have to ship one. Documented per the triage rule, not chased.
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)
         .map_err(|e| sqlite_err(path, "cannot open archive", e))?;
@@ -349,17 +370,53 @@ fn ensure_dir_0700(dir: &Path) -> Result<()> {
 /// directory the writer already vetted; refusing reads of an archive that
 /// synced fine yesterday would punish the reader for the writer's problem.
 fn refuse_writable_parent(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // A bare-filename db_path ("ghgraph.db") has parent Some("") — that is
+    // the current directory, so check it as such rather than ENOENT-ing on
+    // the empty path (ensure_dir_0700 early-returns on the same input).
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
     let meta = std::fs::metadata(dir)
         .map_err(|e| Error::config(format!("cannot access archive dir {}: {e}", dir.display())))?;
     let mode = meta.permissions().mode();
-    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+    // The sticky exemption is narrowed to ROOT-owned dirs (the actual /tmp
+    // shape): sticky denies non-owners the unlink+rename a swap needs, but
+    // the directory's OWNER keeps both — so a user-owned 1777 dir is still
+    // a swap venue for its owner and is refused (its owner can chmod go-w;
+    // the remedy applies). The plant-before-create residue a sticky dir
+    // still permits (anyone may CREATE a symlink at a path that does not
+    // exist yet) is closed by refuse_symlink_archive, not here.
+    if mode & 0o022 != 0 && !(mode & 0o1000 != 0 && meta.uid() == 0) {
         return Err(Error::config(format!(
             "archive dir {} is group/other-writable (mode {:03o}) — anyone with write \
              access could swap the archive through a symlink; chmod go-w the directory \
              or point db_path somewhere private",
             dir.display(),
             mode & 0o7777
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a symlink at the archive path itself, checked with lstat AFTER
+/// `create_0600_if_absent` and immediately before the SQLite open. This is
+/// the plant-before-create defense for shared sticky dirs (/tmp): anyone
+/// may create a symlink at a not-yet-existing path — no unlink needed, so
+/// the sticky bit does not help — and the open (deliberately NOFOLLOW-less,
+/// module docs) would follow it. Post-create ordering bounds the race: if
+/// WE created the file, a non-owner cannot replace it under sticky; if it
+/// pre-existed, whatever is there is what lstat sees.
+fn refuse_symlink_archive(path: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| Error::config(format!("cannot stat archive {}: {e}", path.display())))?;
+    if meta.file_type().is_symlink() {
+        return Err(Error::config(format!(
+            "archive path {} is a symlink — ghgraph does not follow one where the \
+             archive should be; remove it and resync",
+            path.display()
         )));
     }
     Ok(())
@@ -375,7 +432,11 @@ fn refuse_writable_parent(dir: &Path) -> Result<()> {
 /// silent chmod here would paper over whoever loosened it. Path re-stat, not
 /// literally the fd (rusqlite does not expose it): a swap between open and
 /// stat requires writing the parent, which `refuse_writable_parent` already
-/// bounds.
+/// bounds. One known benign trigger: a Linux directory with a default POSIX
+/// ACL can surface ACL-mask bits in st_mode group bits at creation despite
+/// our 0600 request — the refusal and its remedy still apply (the archive
+/// really is group-accessible there), it is just the operator's ACL rather
+/// than a chmod that loosened it.
 fn refuse_loose_archive_mode(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let meta = std::fs::metadata(path)
@@ -694,14 +755,65 @@ mod tests {
     }
 
     #[test]
-    fn sticky_writable_parent_is_allowed() {
-        // The /tmp shape: world-writable but sticky — non-owners cannot
-        // unlink or rename our entries, which is the operation a symlink
-        // swap needs, so this is not the state the refusal exists for.
+    fn user_owned_sticky_writable_parent_is_refused() {
+        // Sticky alone is not the exemption: the directory's OWNER keeps
+        // unlink+rename, so a user-owned 1777 dir is still a swap venue
+        // for its owner. Only root-owned sticky (the real /tmp) is exempt.
         let s = Scratch::new();
         std::fs::create_dir_all(&s.dir).unwrap();
         std::fs::set_permissions(&s.dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
-        open_rw(&s.join("ghgraph.db")).expect("sticky writable dir must open");
+        let err = open_rw(&s.join("ghgraph.db"))
+            .err()
+            .expect("a user-owned sticky writable dir must be refused");
+        assert_eq!(err.code, crate::error::Code::Configuration);
+    }
+
+    #[test]
+    fn root_owned_sticky_dir_is_allowed() {
+        // The exemption itself, exercised against the real thing: /tmp is
+        // root-owned 1777 on every supported platform. Skip (not fail) if
+        // some exotic host shapes /tmp differently — the exemption is then
+        // simply untested here, and the refusal tests above still hold.
+        use std::os::unix::fs::MetadataExt;
+        let tmp = Path::new("/tmp");
+        let meta = std::fs::metadata(tmp).unwrap();
+        if meta.uid() != 0 || meta.permissions().mode() & 0o1000 == 0 {
+            eprintln!("skipping: /tmp is not root-owned sticky on this host");
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "ghgraph-sticky-{}-{}.db",
+            std::process::id(),
+            line!()
+        ));
+        // temp_dir may not be /tmp (macOS): target /tmp explicitly.
+        let path = tmp.join(path.file_name().unwrap());
+        let _ = std::fs::remove_file(&path);
+        open_rw(&path).expect("root-owned sticky /tmp must open");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.lock"));
+    }
+
+    #[test]
+    fn refuses_symlink_at_archive_path() {
+        // The plant-before-create vector: a symlink waiting at the archive
+        // path (create needs no unlink, so sticky dirs permit it) must be
+        // refused by the lstat check, never followed by the open.
+        let s = Scratch::new();
+        std::fs::create_dir_all(&s.dir).unwrap();
+        let target = s.join("elsewhere.db");
+        let path = s.join("ghgraph.db");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let err = open_rw(&path)
+            .err()
+            .expect("a symlink at the archive path must be refused");
+        assert_eq!(err.code, crate::error::Code::Configuration);
+        assert!(
+            err.message.contains("symlink"),
+            "message must name the finding, got: {}",
+            err.message
+        );
+        assert!(!target.exists(), "the symlink target must never be created");
     }
 
     #[test]
@@ -728,13 +840,18 @@ mod tests {
 
     #[test]
     fn wal_truncates_at_writer_close() {
-        // Write enough to grow a WAL, then drop the writer: the Drop-side
-        // checkpoint must leave the -wal empty (this single-connection case
-        // has no reader to make it busy, so best-effort succeeds fully).
+        // The discriminating setup is the SECOND, idle connection held open
+        // across the writer's drop: with it, SQLite's own last-connection
+        // close checkpoint never runs (it needs exclusive access), so an
+        // empty -wal afterward can only be OUR Drop-side TRUNCATE — the
+        // very case the mechanism exists for (an MCP reader keeping the
+        // archive open between syncs). Without the reader, a no-op Drop
+        // passes this test by riding SQLite's close behavior.
         let s = Scratch::new();
         let path = s.join("ghgraph.db");
-        {
+        let reader = {
             let arc = open_rw(&path).unwrap();
+            let reader = open_ro(&path).unwrap();
             arc.conn()
                 .execute_batch(
                     "CREATE TABLE _bulk(x); \
@@ -746,11 +863,16 @@ mod tests {
             let wal = std::fs::metadata(path.with_extension("db-wal"))
                 .expect("-wal exists while the writer is open");
             assert!(wal.len() > 0, "WAL must be non-empty before close");
-        }
+            reader
+        };
+        // The reader outlives the writer, so the -wal file must still
+        // exist — expect() rather than a defaulted 0, or a deleted file
+        // would pass as truncated.
         let wal_len = std::fs::metadata(path.with_extension("db-wal"))
-            .map(|m| m.len())
-            .unwrap_or(0);
+            .expect("-wal persists while a reader holds the archive")
+            .len();
         assert_eq!(wal_len, 0, "writer close must truncate the WAL");
+        drop(reader);
     }
 
     #[test]

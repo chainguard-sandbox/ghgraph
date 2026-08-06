@@ -1262,8 +1262,8 @@ pub fn query(cfg: &Config, sql: Option<&str>, limit: usize) -> Result<Value> {
 pub fn stats(cfg: &Config) -> Result<Value> {
     // stats alone opens through db::open_ro_audit (READ_ONLY, no
     // query_only — db.rs owns that argument and its bounds): the FTS
-    // integrity audit must see the INDEX, and the only read-only window
-    // onto it is a set of fts5vocab TEMP virtual tables. They are created
+    // integrity audit must ENUMERATE the index, and the only read-only
+    // enumeration of it is a set of fts5vocab TEMP virtual tables. They are created
     // BEFORE the snapshot transaction — temp schema, not main-db data — so
     // the transaction below stays the same one-snapshot read every other
     // verb runs (read_snapshot's argument applies unchanged).
@@ -1417,7 +1417,7 @@ fn sync_runs_trends(conn: &Connection) -> Result<Value> {
                (SELECT seq, overhead_intercept_ms FROM sync_runs \
                 ORDER BY seq DESC LIMIT ?1) \
              WHERE overhead_intercept_ms IS NOT NULL \
-             ORDER BY overhead_intercept_ms",
+             ORDER BY overhead_intercept_ms, seq",
         )
         .map_err(classify_ours)?;
     let intercepts: Vec<i64> = stmt
@@ -1425,34 +1425,19 @@ fn sync_runs_trends(conn: &Connection) -> Result<Value> {
         .map_err(classify_ours)?
         .collect::<std::result::Result<_, _>>()
         .map_err(classify_ours)?;
-    let median = intercepts
-        .get((intercepts.len().saturating_sub(1)) / 2)
-        .copied();
+    let median = lower_median(&intercepts);
 
-    let (window_runs, tail_hits, full_walks, floor_runs, sleeps, sleep_ms): (
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-    ) = conn
+    let row: Vec<i64> = conn
         .query_row(
             "SELECT COUNT(*), COALESCE(SUM(tail_hits), 0), COALESCE(SUM(full_walks), 0), \
                     COALESCE(SUM(deferred_at_floor), 0), COALESCE(SUM(sleeps), 0), \
-                    COALESCE(SUM(sleep_ms), 0) \
+                    COALESCE(SUM(sleep_ms), 0), COALESCE(SUM(truncated), 0), \
+                    COALESCE(SUM(quarantined), 0), COALESCE(SUM(discovery_truncated), 0), \
+                    COALESCE(SUM(watchdog_kills), 0), COALESCE(SUM(rate_limit_unknown), 0), \
+                    COALESCE(SUM(errors), 0) \
              FROM (SELECT * FROM sync_runs ORDER BY seq DESC LIMIT ?1)",
             [TRAILING_RUNS],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
-            },
+            |r| (0..12).map(|i| r.get(i)).collect(),
         )
         .map_err(classify_ours)?;
 
@@ -1460,19 +1445,39 @@ fn sync_runs_trends(conn: &Connection) -> Result<Value> {
         "runs": runs,
         "trailing": {
             "window": TRAILING_RUNS,
-            "runs": window_runs,
+            "runs": row[0],
             // The deferred nodes(ids:) batching decision reads this — a
             // median, never one run (sync.rs module docs).
             "overhead_intercept_ms_median": median,
             // The TAIL_K sizing ratio, as its two integer terms.
-            "tail_hits": tail_hits,
-            "full_walks": full_walks,
+            "tail_hits": row[1],
+            "full_walks": row[2],
             // The floor/retry tuning counters (ROADMAP, deferred tuning).
-            "deferred_at_floor_runs": floor_runs,
-            "sleeps": sleeps,
-            "sleep_seconds": sleep_ms / 1_000,
+            "deferred_at_floor_runs": row[3],
+            "sleeps": row[4],
+            "sleep_seconds": row[5] / 1_000,
+            // The health trend — the consumer schema.sql names for the
+            // run rows' health block, so incompleteness over recent runs
+            // is a stats read, not an archaeology session.
+            "health": {
+                "truncated": row[6],
+                "quarantined": row[7],
+                "discovery_truncated": row[8],
+                "watchdog_kills": row[9],
+                "rate_limit_unknown": row[10],
+                "errors": row[11],
+            },
         },
     }))
+}
+
+/// The LOWER median of an ascending-sorted list: element (n-1)/2, an
+/// integer no averaging (hence no float) can produce. None on empty —
+/// unknown discloses as null, never as a zero-filled guess.
+fn lower_median(sorted_asc: &[i64]) -> Option<i64> {
+    sorted_asc
+        .get((sorted_asc.len().saturating_sub(1)) / 2)
+        .copied()
 }
 
 /// The archive integrity audits (DESIGN.md Verification: orphans,
@@ -1519,12 +1524,17 @@ fn audits(conn: &Connection) -> Result<Value> {
     // Observation chain: within one (pr, field), each row's `old` must be
     // the previous row's `new` — the upsert diffs stored-vs-incoming inside
     // the writing transaction, so a break means an observation was written
-    // against a value the archive never held. First observations (no
-    // predecessor) assert nothing.
+    // against a value the archive never held. First rows are exempted by
+    // ROW_NUMBER, not by LAG's nullness: LAG(new) is also NULL when the
+    // predecessor legitimately recorded new = NULL (review_decision and
+    // author are nullable observed fields — sync.rs OBSERVED), and a
+    // prev-IS-NOT-NULL filter would silently exempt every break that
+    // follows such a row. `old IS NOT prev` itself is null-safe.
     let chain_breaks = one("SELECT COUNT(*) FROM ( \
-           SELECT old, LAG(new) OVER (PARTITION BY pr, field ORDER BY seq) AS prev \
-           FROM observations) \
-         WHERE prev IS NOT NULL AND old IS NOT prev")?;
+           SELECT old, LAG(new) OVER w AS prev, ROW_NUMBER() OVER w AS rn \
+           FROM observations \
+           WINDOW w AS (PARTITION BY pr, field ORDER BY seq)) \
+         WHERE rn > 1 AND old IS NOT prev")?;
 
     // FTS integrity, via the fts5vocab tables created at open (stats()):
     // `index_orphans` = rowids the INDEX holds terms for that no longer
@@ -2078,6 +2088,25 @@ fn classify_user_query(e: rusqlite::Error) -> Error {
 mod tests {
     use super::*;
 
+    // ---- lower_median: the batching consumer's fold -----------------------
+
+    #[test]
+    fn lower_median_is_element_not_average() {
+        assert_eq!(lower_median(&[]), None, "empty discloses as unknown");
+        assert_eq!(lower_median(&[7]), Some(7));
+        assert_eq!(
+            lower_median(&[1, 5]),
+            Some(1),
+            "even length takes the LOWER"
+        );
+        // Odd length 3 is the discriminating input for the index
+        // arithmetic: (3-1)/2 = 1 picks 5; the %-mutant picks index 0 and
+        // the *-mutant walks off the slice.
+        assert_eq!(lower_median(&[1, 5, 9]), Some(5));
+        assert_eq!(lower_median(&[1, 5, 9, 100]), Some(5));
+        assert_eq!(lower_median(&[-10, -3, 4]), Some(-3), "negatives vote too");
+    }
+
     // ---- elide: the byte budget never splits a code point ----------------
 
     /// Exhaustive over a multibyte-dense string × every budget: the domain
@@ -2323,7 +2352,11 @@ mod tests {
 /// index cannot silently half-serve them. Plans are stable in CI because
 /// bundled SQLite pins the planner version to the lockfile, and the gate
 /// runs against an empty schema-true archive: with no ANALYZE statistics,
-/// plan choice is structural, not data-dependent.
+/// plan choice is structural, not data-dependent. Precondition, stated:
+/// the structural claim extends to LIVE archives only while they carry no
+/// sqlite_stat1 — ghgraph never runs ANALYZE, so only an operator running
+/// it through an external sqlite3 could give live verbs stat-driven plans
+/// the gate never proved.
 #[cfg(test)]
 mod explain_gates {
     use super::*;
