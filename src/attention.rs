@@ -983,7 +983,7 @@ mod tests {
         );
     }
 
-    // ---- bucket: the four-way classification -----------------------------
+    // ---- bucket: the PR-side classification -------------------------------
 
     const B_V1: &str = "2026-03-01T00:00:00Z";
     const B_BEFORE: &str = "2026-02-01T00:00:00Z";

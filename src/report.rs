@@ -93,7 +93,8 @@
 //!                               author_assoc, updated_at, url, truncated,
 //!                               verified_at,
 //!                               requested_via? threads_waiting?      (waiting_on_me)
-//!                               last_other_activity_at? } ] } ] }    (they_replied)
+//!                               last_other_activity_at? } ]          (they_replied)
+//!                    "issues": [ { same minus draft } ] } ] }        (untriaged only)
 //! ```
 //!
 //!   Rows are locators (search's argument), recency-ordered (updated_at
@@ -496,12 +497,14 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
         // Association values of everyone who substantively spoke; the
         // maintainer judgment over them is attention.rs's
         // (is_maintainer_assoc), so the WHERE stays structural — deleted
-        // and minimized rows are not speech, everything else is.
+        // and minimized rows are not speech, everything else is. No ORDER
+        // BY: the set is consumed by any(), so row order cannot reach
+        // output (held under reverse_unordered_selects like every read).
         let mut assoc_stmt = conn
             .prepare(
                 "SELECT DISTINCT author_assoc FROM comments \
                  WHERE parent_kind = 'issue' AND parent = ?1 AND deleted_at IS NULL \
-                   AND is_minimized = 0 ORDER BY author_assoc",
+                   AND is_minimized = 0",
             )
             .map_err(classify_ours)?;
         struct IssueCand {
@@ -1997,17 +2000,23 @@ mod tests {
     /// this predicate moving.
     #[test]
     fn fail_if_any_reads_the_disclosed_totals() {
-        let doc = |totals: [u64; 4]| {
+        // The six-bucket project-scope shape, untriaged under its "issues"
+        // key: the gate reads totals and must be bucket-name- and
+        // rows-key-agnostic — a maintainer demand gates exactly like an
+        // operator demand.
+        let doc = |totals: [u64; 6]| {
             json!({"attention": [
                 {"bucket": "waiting_on_me", "total": totals[0], "returned": 0, "prs": []},
                 {"bucket": "they_replied", "total": totals[1], "returned": 0, "prs": []},
                 {"bucket": "ready_to_merge", "total": totals[2], "returned": 0, "prs": []},
                 {"bucket": "people_prs", "total": totals[3], "returned": 0, "prs": []},
+                {"bucket": "needs_reviewer", "total": totals[4], "returned": 0, "prs": []},
+                {"bucket": "untriaged", "total": totals[5], "returned": 0, "issues": []},
             ]})
         };
-        assert!(!attention_has_demands(&doc([0, 0, 0, 0])));
-        for i in 0..4 {
-            let mut t = [0u64; 4];
+        assert!(!attention_has_demands(&doc([0, 0, 0, 0, 0, 0])));
+        for i in 0..6 {
+            let mut t = [0u64; 6];
             t[i] = 1;
             assert!(attention_has_demands(&doc(t)), "bucket {i} must trip");
         }
