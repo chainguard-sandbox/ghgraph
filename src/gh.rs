@@ -589,10 +589,10 @@ fn token_at(rest: &[u8]) -> Option<NonZeroUsize> {
         .and_then(NonZeroUsize::new)
 }
 
-/// The minimum-version gate, run once at sync start (PLANNED: milestone 2
-/// wires the call when sync::run lands). Below MIN_GH_VERSION the stderr
-/// heuristic and exit-code taxonomy are unverified claims, so the run
-/// refuses with the remedy instead of degrading silently.
+/// The minimum-version gate, run once at sync start (sync::run wires the
+/// call). Below MIN_GH_VERSION the stderr heuristic and exit-code taxonomy
+/// are unverified claims, so the run refuses with the remedy instead of
+/// degrading silently.
 ///
 /// Known-equivalent mutant: replacing this body with `Ok(())` survives
 /// mutation testing, and stays. The wrapper's only content is the real
