@@ -323,6 +323,32 @@ impl Stream {
     }
 }
 
+/// The issues table's two writers, as data (issues.hydration_source). The
+/// ownership gate between them lives in SQL predicates, and a typo'd
+/// inline literal would silently turn the boundary into a no-match — so
+/// the tag is a bound parameter from this enum at every site, never a
+/// string in the SQL text (the D1 panel's S3; the same argument as
+/// Stream::as_str for quarantine rows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HydrationSource {
+    /// The project-scope issue stream's full-row writer
+    /// (upsert_issue_stream) — owns every column once it has written.
+    Stream,
+    /// The working-scope fill-only writer (upsert_linked_issue, fed by a
+    /// PR's closingIssuesReferences) — inserts missing rows, freshens
+    /// only rows it owns, never takes ownership back.
+    Linked,
+}
+
+impl HydrationSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            HydrationSource::Stream => "stream",
+            HydrationSource::Linked => "linked",
+        }
+    }
+}
+
 /// What caused a hydration — the writer attributes refresh counters and
 /// verified_at policy by it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -833,7 +859,7 @@ fn plan(cfg: &Config, archive: &RwArchive, now: &Rfc3339Utc, full: bool) -> Resu
             }
         }
 
-        let reverify = reverify_due(conn, &repo, cfg, now, &quarantined, issue_stream_on)?;
+        let reverify = reverify_due(conn, &repo, &rc, cfg, now, &quarantined, issue_stream_on)?;
 
         // Starvation is per stream in the schema but starved-FIRST ordering
         // is per repo (a repo is the unit a worker takes): the max over its
@@ -1027,15 +1053,23 @@ fn subset(a: &Value, b: &Value) -> bool {
 ///
 /// The cap applies per stream, not shared: a PR backlog must not starve
 /// issue re-verify or vice versa, and two bounded lists stay bounded.
+/// Each tier's SQL carries the cap as a bound LIMIT — it bounds
+/// CANDIDATES, not dues (the jitter filter runs in Rust), so a mixed
+/// window can under-fill the cap; that self-heals because due-ness is
+/// monotone in time and the verified_at ASC order moves re-verified rows
+/// behind the pending ones, while the LIMIT keeps plan-time cost bounded
+/// by the cap instead of the archive (D1 panel, S1).
 fn reverify_due(
     conn: &rusqlite::Connection,
     repo: &str,
+    rc: &RepoConfig,
     cfg: &Config,
     now: &Rfc3339Utc,
     quarantined: &HashSet<String>,
     issue_stream_on: bool,
 ) -> Result<Vec<(String, i64, Stream)>> {
-    let closed_floor = lookback_floor_str(now, cfg);
+    let closed_floor = lookback_floor_str(now, rc, cfg);
+    let cap = i64::try_from(REVERIFY_CAP).unwrap_or(i64::MAX);
 
     // NULL verified_at leads (never witnessed), then oldest; number breaks
     // ties for a total order.
@@ -1047,8 +1081,8 @@ fn reverify_due(
         quarantined,
         "SELECT id, number, verified_at FROM prs \
          WHERE repo = ?1 AND deleted_at IS NULL AND state = 'OPEN' \
-         ORDER BY verified_at IS NOT NULL, verified_at ASC, number ASC",
-        &[&repo],
+         ORDER BY verified_at IS NOT NULL, verified_at ASC, number ASC LIMIT ?2",
+        &[&repo, &cap],
         cfg.reverify_open_days,
         &mut pr_due,
     )?;
@@ -1060,8 +1094,8 @@ fn reverify_due(
         "SELECT id, number, verified_at FROM prs \
          WHERE repo = ?1 AND deleted_at IS NULL AND state != 'OPEN' \
            AND coalesce(merged_at, closed_at, '') >= ?2 \
-         ORDER BY verified_at IS NOT NULL, verified_at ASC, number ASC",
-        &[&repo, &closed_floor],
+         ORDER BY verified_at IS NOT NULL, verified_at ASC, number ASC LIMIT ?3",
+        &[&repo, &closed_floor, &cap],
         cfg.reverify_closed_days,
         &mut pr_due,
     )?;
@@ -1080,9 +1114,9 @@ fn reverify_due(
             quarantined,
             "SELECT id, number, verified_at FROM issues \
              WHERE repo = ?1 AND deleted_at IS NULL AND state = 'OPEN' \
-               AND hydration_source = 'stream' \
-             ORDER BY verified_at IS NOT NULL, verified_at ASC, number ASC",
-            &[&repo],
+               AND hydration_source = ?2 \
+             ORDER BY verified_at IS NOT NULL, verified_at ASC, number ASC LIMIT ?3",
+            &[&repo, &HydrationSource::Stream.as_str(), &cap],
             cfg.reverify_open_days,
             &mut issue_due,
         )?;
@@ -1093,9 +1127,14 @@ fn reverify_due(
             quarantined,
             "SELECT id, number, verified_at FROM issues \
              WHERE repo = ?1 AND deleted_at IS NULL AND state != 'OPEN' \
-               AND hydration_source = 'stream' AND updated_at >= ?2 \
-             ORDER BY verified_at IS NOT NULL, verified_at ASC, number ASC",
-            &[&repo, &closed_floor],
+               AND hydration_source = ?2 AND updated_at >= ?3 \
+             ORDER BY verified_at IS NOT NULL, verified_at ASC, number ASC LIMIT ?4",
+            &[
+                &repo,
+                &HydrationSource::Stream.as_str(),
+                &closed_floor,
+                &cap,
+            ],
             cfg.reverify_closed_days,
             &mut issue_due,
         )?;
@@ -1152,8 +1191,14 @@ fn reverify_tier(
     Ok(())
 }
 
-fn lookback_floor_str(now: &Rfc3339Utc, cfg: &Config) -> String {
-    now.checked_sub_days(cfg.lookback_days)
+/// The closed re-verify tiers' reach, from the repo's EFFECTIVE lookback
+/// (the per-repo override, then the global) — the same resolution
+/// discovery uses (lookback_start). The D1 panel caught the old form
+/// reading only the global: a repo with a wider per-repo lookback
+/// discovered closed items its re-verify tier then never scheduled, so
+/// quiet mutations on items closed in the gap went permanently uncaught.
+fn lookback_floor_str(now: &Rfc3339Utc, rc: &RepoConfig, cfg: &Config) -> String {
+    now.checked_sub_days(rc.lookback_days.unwrap_or(cfg.lookback_days))
         .map(|t| t.as_str().to_string())
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
 }
@@ -3039,7 +3084,13 @@ fn advance_state(
 fn upsert_quarantine(tx: &rusqlite::Transaction, repo: &str, q: &QuarantineRecord) -> Result<()> {
     // `stream` updates on conflict for completeness, but it cannot actually
     // flip: node ids are globally unique, so an id re-quarantined by the
-    // other stream would mean discovery itself mislabeled it.
+    // other stream would mean discovery itself mislabeled it. Detecting
+    // that cannot-happen here was considered and declined (D1 panel, S5):
+    // a WHERE on the conflict arm turns a mismatch into a silent no-op
+    // (worse), and a SELECT-and-compare per quarantine write prices every
+    // real failure for a bug no flow constructs — the milestone-5 stats
+    // consistency audit is the named detector home, as for comment-id
+    // reuse (upsert_comment).
     exec(
         tx,
         "INSERT INTO quarantine (id, repo, stream, attempts, next_retry_at, error_class) \
@@ -3146,7 +3197,11 @@ fn apply_issue_bundle(
         )?;
     }
     // The sweep is witness-gated, as everywhere: truncation must never
-    // read as deletion.
+    // read as deletion. The gate is the COMMENTS witness alone, not
+    // verified(): witnesses are per connection, and masked labels have no
+    // child rows to sweep — "fixing" this to verified() would silently
+    // skip sweeps on rows with masked labels but fully-paginated
+    // comments (the PR path makes the same per-connection choice).
     if b.comments_complete {
         t.soft_deleted += sweep(
             tx,
@@ -4078,7 +4133,7 @@ fn upsert_issue_stream(
                                      updated_at, hydration_source, truncated, verified_at, \
                                      synced_at, deleted_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
-                         'stream', ?15, ?16, ?17, NULL)",
+                         ?15, ?16, ?17, ?18, NULL)",
                 rusqlite::params![
                     issue.id,
                     b.repo,
@@ -4094,6 +4149,7 @@ fn upsert_issue_stream(
                     issue.url,
                     issue.created_at.as_str(),
                     issue.updated_at.as_str(),
+                    HydrationSource::Stream.as_str(),
                     landed_truncated,
                     verified_at,
                     now.as_str(),
@@ -4140,7 +4196,10 @@ fn upsert_issue_stream(
                 ("url", Some(issue.url.clone())),
                 ("created_at", Some(issue.created_at.as_str().to_string())),
                 ("updated_at", Some(issue.updated_at.as_str().to_string())),
-                ("hydration_source", Some("stream".to_string())),
+                (
+                    "hydration_source",
+                    Some(HydrationSource::Stream.as_str().to_string()),
+                ),
                 ("truncated", Some(i64::from(landed_truncated).to_string())),
                 ("deleted_at", None),
             ];
@@ -4187,9 +4246,9 @@ fn upsert_issue_stream(
                     tx,
                     "UPDATE issues SET id=?1, title=?2, state=?3, body=?4, author=?5, \
                        author_id=?6, author_assoc=?7, labels=?8, assignees=?9, url=?10, \
-                       created_at=?11, updated_at=?12, hydration_source='stream', \
-                       truncated=?13, verified_at=?14, synced_at=?15, deleted_at=NULL \
-                     WHERE pk = ?16",
+                       created_at=?11, updated_at=?12, hydration_source=?13, \
+                       truncated=?14, verified_at=?15, synced_at=?16, deleted_at=NULL \
+                     WHERE pk = ?17",
                     rusqlite::params![
                         issue.id,
                         issue.title,
@@ -4203,6 +4262,7 @@ fn upsert_issue_stream(
                         issue.url,
                         issue.created_at.as_str(),
                         issue.updated_at.as_str(),
+                        HydrationSource::Stream.as_str(),
                         landed_truncated,
                         verified_at,
                         now.as_str(),
@@ -4248,8 +4308,8 @@ fn upsert_linked_issue(
         "INSERT INTO issues (id, repo, number, title, state, body, author, author_id, \
                              author_assoc, labels, assignees, url, created_at, updated_at, \
                              hydration_source, truncated, verified_at, synced_at, deleted_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, NULL, ?11, 'linked', \
-                 0, NULL, ?12, NULL) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, NULL, ?11, ?12, \
+                 0, NULL, ?13, NULL) \
          ON CONFLICT(repo, number) DO NOTHING",
         rusqlite::params![
             issue.id,
@@ -4263,6 +4323,7 @@ fn upsert_linked_issue(
             issue.author_association,
             issue.url,
             issue.updated_at.as_str(),
+            HydrationSource::Linked.as_str(),
             now.as_str()
         ],
     )?;
@@ -4280,7 +4341,7 @@ fn upsert_linked_issue(
     let n = exec(
         tx,
         "UPDATE issues SET title=?1, state=?2, body=?3, updated_at=?4, synced_at=?5 \
-         WHERE repo=?6 AND number=?7 AND hydration_source='linked' \
+         WHERE repo=?6 AND number=?7 AND hydration_source=?8 \
            AND (title IS NOT ?1 OR state IS NOT ?2 OR body IS NOT ?3 OR updated_at IS NOT ?4)",
         rusqlite::params![
             issue.title,
@@ -4289,7 +4350,8 @@ fn upsert_linked_issue(
             issue.updated_at.as_str(),
             now.as_str(),
             repo,
-            issue.number
+            issue.number,
+            HydrationSource::Linked.as_str()
         ],
     )?;
     if n > 0 {
@@ -4875,7 +4937,8 @@ mod tests {
         let boundary = 1_782_864_000 + 7 * 86_400 + 457_686;
 
         let before = Rfc3339Utc::from_epoch(boundary - 1).unwrap();
-        let due = reverify_due(conn, "o/n", &cfg, &before, &quarantined, false).unwrap();
+        let rc = cfg.repos[0].resolved();
+        let due = reverify_due(conn, "o/n", &rc, &cfg, &before, &quarantined, false).unwrap();
         assert_eq!(
             due,
             vec![("PR_2".to_string(), 2, Stream::Pr)],
@@ -4883,7 +4946,7 @@ mod tests {
         );
 
         let at = Rfc3339Utc::from_epoch(boundary).unwrap();
-        let due = reverify_due(conn, "o/n", &cfg, &at, &quarantined, false).unwrap();
+        let due = reverify_due(conn, "o/n", &rc, &cfg, &at, &quarantined, false).unwrap();
         assert_eq!(
             due,
             vec![
@@ -4922,21 +4985,30 @@ mod tests {
         insert("I_3", 3, "OPEN", "stream", "2026-06-01T00:00:00Z"); // quarantined
         insert("I_4", 4, "CLOSED", "stream", "2026-07-01T00:00:00Z"); // in lookback
         insert("I_5", 5, "CLOSED", "stream", "2020-01-01T00:00:00Z"); // beyond it
+        // In the PER-REPO lookback (90d) but outside the global (30d):
+        // the closed tier's floor must resolve the repo's own override,
+        // exactly as discovery does (the D1 panel's out-of-scope catch,
+        // pulled in because the issue tier was born with it).
+        insert("I_6", 6, "CLOSED", "stream", "2026-05-01T00:00:00Z");
 
-        let cfg = cfg(r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"project"}]}"#);
+        let cfg = cfg(r#"{"viewer":"v","lookback_days":30,
+                "repos":[{"repo":"o/n","scope":"project","lookback_days":90}]}"#);
         let quarantined: HashSet<String> = [String::from("I_3")].into();
         let now = Rfc3339Utc::parse("2026-07-10T00:00:00Z").unwrap();
 
-        let due = reverify_due(conn, "o/n", &cfg, &now, &quarantined, true).unwrap();
+        let rc = cfg.repos[0].resolved();
+        let due = reverify_due(conn, "o/n", &rc, &cfg, &now, &quarantined, true).unwrap();
         assert_eq!(
             due,
             vec![
                 ("I_1".to_string(), 1, Stream::Issue),
-                ("I_4".to_string(), 4, Stream::Issue)
+                ("I_4".to_string(), 4, Stream::Issue),
+                ("I_6".to_string(), 6, Stream::Issue)
             ],
-            "stream-owned, unquarantined, and (for CLOSED) within lookback only"
+            "stream-owned, unquarantined, and (for CLOSED) within the \
+             repo's EFFECTIVE lookback only"
         );
-        let due = reverify_due(conn, "o/n", &cfg, &now, &quarantined, false).unwrap();
+        let due = reverify_due(conn, "o/n", &rc, &cfg, &now, &quarantined, false).unwrap();
         assert_eq!(due, Vec::new(), "issue stream off: no issue re-verify");
         drop(archive);
         let _ = std::fs::remove_dir_all(&dir);
