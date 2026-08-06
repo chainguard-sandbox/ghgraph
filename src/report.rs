@@ -194,6 +194,10 @@ const HOT_ATTENTION_ISSUE_CANDIDATES: &str = "SELECT pk, repo, number, title, au
 /// Per-candidate and per-`pr`-view children: each runs once per PR (or per
 /// thread), so each must SEARCH its index, never scan — attention over N
 /// open PRs would otherwise be N full child-table scans.
+///
+/// The (kind, reviewer) order is total and stable, so emitted request
+/// arrays are deterministic — but it is alphabetical, not priority:
+/// consumers must treat the array as a set.
 const HOT_REVIEW_REQUESTS_BY_PR: &str =
     "SELECT reviewer, kind FROM review_requests WHERE pr = ?1 ORDER BY kind, reviewer";
 

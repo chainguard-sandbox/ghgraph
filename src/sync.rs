@@ -3115,6 +3115,10 @@ fn overhead_intercept_ms(samples: &[(u64, u64)]) -> Option<i64> {
             d * d
         })
         .sum();
+    // Exact compare on purpose, not an epsilon: all-equal integer inputs
+    // give exactly-0.0 deviations under IEEE 754 subtraction, and a small
+    // NONZERO sxx is a well-defined regression an epsilon would wrongly
+    // discard.
     if sxx == 0.0 {
         return None;
     }

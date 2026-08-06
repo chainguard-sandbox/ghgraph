@@ -117,7 +117,8 @@ vet: ## Vet the dependency tree against supply-chain/ (needs cargo-vet; make set
 TREE_CMD := cargo tree --locked --edges normal --target all
 
 tree: ## Regenerate the dependency-graph snapshot (run after any Cargo.toml/lock change)
-	@t=$$(mktemp); $(TREE_CMD) | sed -E '1s| \(.*\)$$||' > $$t && \
+	@t=$$(mktemp); $(TREE_CMD) > $$t || { rm -f $$t; echo "cargo tree failed (lockfile drift?)"; exit 1; }; \
+		sed -E -i.bak '1s| \(.*\)$$||' $$t && rm -f $$t.bak; \
 		mv $$t supply-chain/cargo-tree.txt && \
 		echo "wrote supply-chain/cargo-tree.txt — review the diff like code"
 
