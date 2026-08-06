@@ -96,26 +96,33 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// v3: quarantine.stream — retry dispatch by hydration document (schema.sql
 /// records why an opaque node id cannot carry that fact itself).
 ///
-/// v4: the sync_runs run-telemetry table (hardening milestone) — one flat
-/// row per completed run, so trends are a `query` away without a telemetry
-/// store growing underneath. An archive fact only; no emitted field changed
-/// shape (`stats` gained additive keys under the additive-only contract).
+/// v4: the sync_runs run-telemetry table and idx_observations_pr_field
+/// (hardening milestone) — one flat row per completed run, so trends are a
+/// `query` away without a telemetry store growing underneath. An archive
+/// fact only; no emitted field changed shape (`stats` gained additive keys
+/// under the additive-only contract). MIGRATES from v3 (see `migrate`):
+/// the bump is purely additive — no v3 object changes shape — so the
+/// idempotent schema batch IS the migration.
 ///
-/// MIGRATION POLICY, decided here so the machinery is not re-proposed every
-/// schema change: migrations begin at the first RELEASED binary — an
-/// archive someone cannot cheaply rebuild. Until then the archive is a
-/// disposable cache (that is already the corruption remedy's prose), so a
-/// pre-release schema change bumps this version and REFUSES older stamps
-/// with the remove-and-resync remedy, rather than carrying ALTER TABLE
-/// steps, their column-order constraints (an appended column must then stay
-/// last forever or `query` SELECT * forks by archive provenance), and the
-/// fixture archaeology their tests need. The bump itself is NOT optional:
-/// amending the schema in place under an unchanged version would let an
-/// old archive pass the version gate and then fail mid-verb with "no such
-/// column" classified INTERNAL — a lie about the actor. A v1→v2 ALTER
-/// TABLE migration existed briefly and was verified correct; it was deleted
-/// by this policy, not by a defect (the git history holds it if the first
-/// release ever needs the pattern back).
+/// MIGRATION POLICY, decided here so the machinery is not re-proposed
+/// every schema change, and NARROWED at v4: schema.sql is written as
+/// idempotent CREATE IF NOT EXISTS statements, so a PURELY ADDITIVE bump
+/// (new tables/indexes only, nothing existing reshaped) migrates by
+/// re-applying that batch — the same crash-safe transaction a fresh
+/// archive gets, no new machinery, each version's arm justified
+/// individually in `migrate`. SHAPE-CHANGING bumps remain refused with
+/// the remove-and-resync remedy until the first RELEASED binary — an
+/// archive someone cannot cheaply rebuild — because they would carry
+/// ALTER TABLE steps, their column-order constraints (an appended column
+/// must then stay last forever or `query` SELECT * forks by archive
+/// provenance), and the fixture archaeology their tests need. The bump
+/// itself is NOT optional either way: amending the schema in place under
+/// an unchanged version would let an old archive pass the version gate
+/// and then fail mid-verb with "no such column" classified INTERNAL — a
+/// lie about the actor. A v1→v2 ALTER TABLE migration existed briefly
+/// and was verified correct; it was deleted by this policy, not by a
+/// defect (the git history holds it if the first release ever needs the
+/// pattern back).
 pub const SCHEMA_VERSION: i64 = 4;
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
@@ -523,21 +530,30 @@ fn user_version(conn: &Connection, path: &Path) -> Result<i64> {
 fn migrate(conn: &mut Connection, path: &Path) -> Result<()> {
     match user_version(conn, path)? {
         0 => apply_full(conn, path),
+        // v3 → v4 is purely additive (sync_runs, idx_observations_pr_field;
+        // no v3 object changes shape), so re-applying the idempotent schema
+        // batch creates exactly the missing objects and stamps v4 — the
+        // additive-migration arm of the policy at SCHEMA_VERSION. This arm
+        // is valid for v3 SPECIFICALLY, argued there; a future bump must
+        // justify its own arm, because IF NOT EXISTS silently skips an
+        // object whose DEFINITION changed.
+        3 => apply_full(conn, path),
         v if v == SCHEMA_VERSION => Ok(()),
-        // Everything else — an older pre-release stamp (refused with the
-        // remove-and-resync remedy; migrations begin at the first release,
-        // see SCHEMA_VERSION), a newer archive, or a negative/foreign
-        // sentinel (SQLite accepts any i64 user_version) — is refused,
-        // never guessed.
+        // Everything else — an older shape-changing stamp (refused with the
+        // remove-and-resync remedy; see the policy at SCHEMA_VERSION), a
+        // newer archive, or a negative/foreign sentinel (SQLite accepts any
+        // i64 user_version) — is refused, never guessed.
         v => Err(wrong_version(path, v)),
     }
 }
 
 /// The CONFIGURATION error for an archive whose `user_version` is not the
-/// current [`SCHEMA_VERSION`] and cannot be migrated to it. Shared by `open_ro`
-/// (any non-current version) and `migrate` (its refusal arms) so the two never
-/// drift. `migrate` handles v == 0 by applying the schema, so the v == 0 message
-/// here is reached only from `open_ro`.
+/// current [`SCHEMA_VERSION`] and which THIS PATH cannot bring there. Shared
+/// by `open_ro` (any non-current version — the read path never writes, so
+/// even migratable versions land here with the run-sync remedy) and
+/// `migrate` (its refusal arms) so the two never drift. `migrate` consumes
+/// v == 0 and v == 3 by applying the schema, so those messages are reached
+/// only from `open_ro`.
 fn wrong_version(path: &Path, v: i64) -> Error {
     // Mutation note: the < and > below have equivalent mutants (<= / >=):
     // their boundary values are unreachable — v == 0 is consumed by the arm
@@ -555,8 +571,13 @@ fn wrong_version(path: &Path, v: i64) -> Error {
         "a negative sentinel — the archive is corrupt or not a ghgraph archive".to_string()
     } else if v > SCHEMA_VERSION {
         format!("newer than this ghgraph (v{SCHEMA_VERSION}); upgrade ghgraph")
+    } else if v == 3 {
+        // Reached only from open_ro: the read path cannot write, but the
+        // write path migrates v3 additively (see `migrate`), so the remedy
+        // is one sync, not a rebuild.
+        "one additive version behind — run `ghgraph sync` once to migrate".to_string()
     } else {
-        // 0 < v < SCHEMA_VERSION: a pre-release schema. Not migrated,
+        // 0 < v < 3: a shape-changing pre-release schema. Not migrated,
         // by policy (SCHEMA_VERSION) — the archive is a disposable cache.
         format!(
             "a pre-release schema this ghgraph (v{SCHEMA_VERSION}) does not migrate — \
@@ -569,14 +590,15 @@ fn wrong_version(path: &Path, v: i64) -> Error {
     ))
 }
 
-/// Apply the full current schema and stamp user_version=[`SCHEMA_VERSION`]
-/// atomically (schema.sql always describes the CURRENT shape; migrations exist
-/// for archives born under older ones). The schema apply and the version bump
-/// run inside ONE rusqlite-managed transaction (schema.sql carries no
-/// BEGIN/COMMIT of its own; the only BEGINs there are trigger bodies), and
-/// PRAGMA user_version is transactional — so a crash between the last CREATE
-/// and the stamp rolls back to user_version=0 and the next open retries from
-/// clean.
+/// Apply the current schema and stamp user_version=[`SCHEMA_VERSION`]
+/// atomically. Serves two arms of `migrate`: a fresh archive (v0 — every
+/// statement creates) and an additively-migratable one (v3 — the idempotent
+/// IF NOT EXISTS batch creates exactly the missing objects and touches
+/// nothing else). The schema apply and the version bump run inside ONE
+/// rusqlite-managed transaction (schema.sql carries no BEGIN/COMMIT of its
+/// own; the only BEGINs there are trigger bodies), and PRAGMA user_version
+/// is transactional — so a crash between the last CREATE and the stamp
+/// rolls back to the pre-open version and the next open retries from clean.
 fn apply_full(conn: &mut Connection, path: &Path) -> Result<()> {
     let cannot = |e: rusqlite::Error| sqlite_err(path, "cannot initialize archive", e);
     let tx = conn.transaction().map_err(cannot)?;
@@ -1014,6 +1036,80 @@ mod tests {
             .err()
             .expect("a version-0 foreign db must be refused");
         assert_eq!(err.code, crate::error::Code::Configuration);
+    }
+
+    /// A faithful v3 archive is the current schema minus exactly what v4
+    /// added (sync_runs, idx_observations_pr_field) under a v3 stamp —
+    /// that identity is what licenses building the fixture by subtraction.
+    fn make_v3_archive(path: &Path) {
+        {
+            let arc = open_rw(path).unwrap();
+            arc.conn()
+                .execute_batch(
+                    "INSERT INTO prs (id, repo, number, title, state, created_at, \
+                                      updated_at, url) \
+                     VALUES ('PR_m', 'o/n', 1, 'kept', 'OPEN', \
+                             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'u'); \
+                     DROP TABLE sync_runs; \
+                     DROP INDEX idx_observations_pr_field",
+                )
+                .unwrap();
+        }
+        set_raw_user_version(path, 3);
+    }
+
+    #[test]
+    fn migrates_v3_archive_additively() {
+        // The write path brings a v3 archive to v4 by re-applying the
+        // idempotent schema: the two missing objects appear, the stamp
+        // moves, and existing data (and its FTS index — the triggers must
+        // not re-fire) survives untouched.
+        let s = Scratch::new();
+        let path = s.join("ghgraph.db");
+        make_v3_archive(&path);
+        let arc = open_rw(&path).expect("v3 must migrate on the write path");
+        assert_eq!(user_version(arc.conn(), &path).unwrap(), SCHEMA_VERSION);
+        for (kind, name) in [
+            ("table", "sync_runs"),
+            ("index", "idx_observations_pr_field"),
+        ] {
+            let n: i64 = arc
+                .conn()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type=?1 AND name=?2",
+                    (kind, name),
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{kind} {name} must exist after migration");
+        }
+        let (title, fts_hits): (String, i64) = arc
+            .conn()
+            .query_row(
+                "SELECT title, (SELECT count(*) FROM prs_fts WHERE prs_fts MATCH 'kept') \
+                 FROM prs WHERE repo='o/n' AND number=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "kept", "data must survive migration");
+        assert_eq!(fts_hits, 1, "the FTS index must survive migration intact");
+    }
+
+    #[test]
+    fn ro_tells_v3_to_sync_not_rebuild() {
+        // The read path cannot migrate; its remedy for v3 is one sync, and
+        // saying "remove and resync" here would cost an operator hours.
+        let s = Scratch::new();
+        let path = s.join("ghgraph.db");
+        make_v3_archive(&path);
+        let err = open_ro(&path).err().expect("open_ro must refuse v3");
+        assert_eq!(err.code, crate::error::Code::Configuration);
+        assert!(
+            err.message.contains("run `ghgraph sync`") && !err.message.contains("remove"),
+            "v3's read-path remedy is a sync, not a rebuild, got: {}",
+            err.message
+        );
     }
 
     #[test]
