@@ -87,3 +87,9 @@ bench = false
 
 # Own workspace so the root `cargo build` never descends into the fuzz crate.
 [workspace]
+
+[[bin]]
+name = "attention_inputs"
+path = "fuzz_targets/attention_inputs.rs"
+test = false
+doc = false
