@@ -1,0 +1,76 @@
+{
+  "data": {
+    "node": {
+      "assignees": {
+        "nodes": [
+          {
+            "login": "babakks"
+          },
+          {
+            "login": "Copilot"
+          }
+        ],
+        "totalCount": 2
+      },
+      "author": {
+        "__typename": "User",
+        "databaseId": 36728931,
+        "login": "babakks"
+      },
+      "authorAssociation": "MEMBER",
+      "body": "As listed in #12438, we need to enable the linters that are marked as medium/low-effort:\n\n```\n## Medium/low effort (based on number of issues):\n    # - canonicalheader # checks whether net/http.Header uses canonical header\n    # - embeddedstructfieldcheck # checks embedded types in structs\n    # - errname # checks that sentinel errors are prefixed with the Err and error types are suffixed with the Error\n    # - exhaustive # checks exhaustiveness of enum switch statements\n    # - forbidigo # forbids identifiers\n    # - gochecknoinits # checks that no init functions are present in Go code\n    # - gocyclo # computes and checks the cyclomatic complexity of functions\n    # - iface # checks the incorrect use of interfaces, helping developers avoid interface pollution\n    # - intrange # finds places where for loops could make use of an integer range\n    # - iotamixing # checks if iotas are being used in const blocks with other non-iota declarations\n    # - makezero # finds slice declarations with non-zero initial length\n    # - mirror # reports wrong mirror patterns of bytes/strings usage\n    # - protogetter # reports direct reads from proto message fields when getters should be used\n    # - recvcheck # checks for receiver type consistency\n    # - testableexamples # checks if examples are testable (have an expected output)\n    # - tparallel # detects inappropriate usage of t.Parallel() method in your Go test codes\n    # - unconvert # removes unnecessary type conversions\n    # - usetesting # reports uses of functions with replacement inside the testing package\n    # - wastedassign # finds wasted assignment statements\n    # - whitespace # detects leading and trailing whitespace\n```",
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "databaseId": 41898282,
+              "login": "github-actions"
+            },
+            "authorAssociation": "CONTRIBUTOR",
+            "body": "Thank you for your issue! We have categorized it as an enhancement (feature or improvement) request, and it has been added to our backlog. In doing so, **we are not committing to implementing this feature at this time**, but, we will consider it for future releases based on community feedback and our own product roadmap. \n\nUnless you see the https://github.com/cli/cli/labels/help%20wanted label, we are not currently looking for external contributions for this feature.\n\n**If you come across this issue and would like to see it implemented, please add a thumbs up!** This will help us prioritize the feature. Please only comment if you have additional information or viewpoints to contribute.\n",
+            "createdAt": "2026-03-24T10:34:08Z",
+            "id": "IC_kwDODKw3uc71Zgoy",
+            "isMinimized": false,
+            "lastEditedAt": null,
+            "url": "https://github.com/cli/cli/issues/13016#issuecomment-4117105202"
+          }
+        ],
+        "pageInfo": {
+          "endCursor": "Y3Vyc29yOnYyOpHO9WYKMg==",
+          "hasNextPage": false
+        },
+        "totalCount": 1
+      },
+      "createdAt": "2026-03-24T10:33:16Z",
+      "id": "I_kwDODKw3uc71-pak",
+      "labels": {
+        "nodes": [
+          {
+            "name": "enhancement"
+          },
+          {
+            "name": "tech-debt"
+          },
+          {
+            "name": "core"
+          }
+        ],
+        "totalCount": 3
+      },
+      "number": 13016,
+      "repository": {
+        "nameWithOwner": "cli/cli"
+      },
+      "state": "OPEN",
+      "title": "Enable medium/low-effort linters",
+      "updatedAt": "2026-07-27T15:45:40Z",
+      "url": "https://github.com/cli/cli/issues/13016"
+    },
+    "rateLimit": {
+      "cost": 1,
+      "remaining": 4934,
+      "resetAt": "2026-08-05T22:30:04Z"
+    }
+  }
+}

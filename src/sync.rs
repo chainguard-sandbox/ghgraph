@@ -27,11 +27,15 @@
 //!
 //! Invariants, in order of importance:
 //!
-//!   * The watermark is server-side time — max updatedAt actually ingested —
-//!     never the local clock (clock skew and search-index lag both lose
-//!     updates otherwise). Queries overlap the watermark by ~10 minutes;
-//!     upserts make the overlap free. The writer takes max(stored, offered),
-//!     so a targeted backfill over old windows can never regress it.
+//!   * The watermark is server-side time — max DISCOVERY-time updatedAt
+//!     over the window's resolved ids — never the local clock (clock skew
+//!     and search-index lag both lose updates otherwise), and never the
+//!     hydration-time value, which an item touched between the two calls
+//!     can carry past a closed window's right edge (the fold in
+//!     walk_window carries the full argument). Queries overlap the
+//!     watermark by ~10 minutes; upserts make the overlap free. The writer
+//!     takes max(stored, offered), so a targeted backfill over old windows
+//!     can never regress it.
 //!
 //!   * sync_state advances only on Done: state never leads data. This is also
 //!     the entire cancellation story — SIGINT kills the process group (gh
@@ -287,9 +291,12 @@ const QUARANTINE_BACKOFF_CAP_SECS: u64 = 7 * 86_400;
 
 /// The two discovery streams. Closed on purpose: per-flavor watermarks were
 /// considered and rejected — flavor-set identity lives in the sync_state
-/// fingerprint, not the key. Milestone 2 syncs Pr only; Issue lands with
-/// project scope (milestone 4) on this machinery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// fingerprint, not the key. Both walk on the same machinery: per-stream
+/// watermarks (sync_state is keyed (repo, stream)), stream-typed discovery
+/// terms (queries.rs), and stream-typed hydration dispatch — the quarantine
+/// table's `stream` column carries the dispatch fact across runs, since a
+/// node id is opaque and cannot say which document resurrects it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Stream {
     Pr,
     Issue,
@@ -300,6 +307,44 @@ impl Stream {
         match self {
             Stream::Pr => "pr",
             Stream::Issue => "issue",
+        }
+    }
+
+    /// Parse a stored stream tag (quarantine.stream). `None` for anything
+    /// else — the caller classifies it INTERNAL, since only ghgraph writes
+    /// the column and an unknown tag means this code drifted from its own
+    /// archive.
+    fn parse(s: &str) -> Option<Stream> {
+        match s {
+            "pr" => Some(Stream::Pr),
+            "issue" => Some(Stream::Issue),
+            _ => None,
+        }
+    }
+}
+
+/// The issues table's two writers, as data (issues.hydration_source). The
+/// ownership gate between them lives in SQL predicates, and a typo'd
+/// inline literal would silently turn the boundary into a no-match — so
+/// the tag is a bound parameter from this enum at every site, never a
+/// string in the SQL text (the D1 panel's S3; the same argument as
+/// Stream::as_str for quarantine rows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HydrationSource {
+    /// The project-scope issue stream's full-row writer
+    /// (upsert_issue_stream) — owns every column once it has written.
+    Stream,
+    /// The working-scope fill-only writer (upsert_linked_issue, fed by a
+    /// PR's closingIssuesReferences) — inserts missing rows, freshens
+    /// only rows it owns, never takes ownership back.
+    Linked,
+}
+
+impl HydrationSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            HydrationSource::Stream => "stream",
+            HydrationSource::Linked => "linked",
         }
     }
 }
@@ -378,12 +423,59 @@ impl PrBundle {
     }
 }
 
+/// Rows for one writer transaction, issue-stream form: the issue node with
+/// its comments vector REPLACED by the merged all-pages set, plus the
+/// per-connection completeness verdicts. Constructed only by
+/// [`hydrate_issue_one`] — issues have no refresh/tail path (queries.rs
+/// HYDRATE_ISSUE records the cut), so completeness is two-state: witnessed
+/// or not.
+pub struct IssueBundle {
+    repo: String,
+    issue: parse::IssueNode,
+    origin: Origin,
+    /// Pagination of the comments connection's live id set terminated.
+    comments_complete: bool,
+    /// The two small counted connections: nodes cover totalCount.
+    labels_complete: bool,
+    assignees_complete: bool,
+}
+
+impl IssueBundle {
+    /// Witness-complete: the gate for issues.verified_at and the comments
+    /// sweep, same rule as [`PrBundle::verified`].
+    fn verified(&self) -> bool {
+        self.comments_complete && self.labels_complete && self.assignees_complete
+    }
+}
+
+/// One hydrated item, stream-typed: the walk, the channel messages, and the
+/// writer dispatch all carry this, so a PR row and an issue row cannot take
+/// each other's upsert path — the write-side mirror of the stream-typed
+/// discovery terms. Boxed variants: a PrBundle is ~750 bytes and rides in
+/// Vecs and channel messages; the box keeps those moves pointer-sized.
+pub enum Bundle {
+    Pr(Box<PrBundle>),
+    Issue(Box<IssueBundle>),
+}
+
+impl Bundle {
+    fn id(&self) -> &str {
+        match self {
+            Bundle::Pr(b) => &b.pr.id,
+            Bundle::Issue(b) => &b.issue.id,
+        }
+    }
+}
+
 /// A hydration failure recorded durably. Committed only inside the Done (or
 /// Retries) transaction that passes the id: the watermark's advance is
 /// licensed by the record that resurfaces the item, so no exit can turn
 /// "quarantined" into "forgotten".
 pub struct QuarantineRecord {
     pub id: String,
+    /// Which hydration document resurrects this id (schema.sql records why
+    /// the id itself cannot say).
+    pub stream: Stream,
     pub attempts: u32,
     pub next_retry_at: String,
     pub error_class: String,
@@ -399,10 +491,7 @@ pub struct WindowComplete(());
 pub enum Msg {
     /// Intermediate rows, committed ahead of their window's watermark (data
     /// may lead state; replay idempotence makes the redo free).
-    Page {
-        repo: String,
-        rows: Vec<PrBundle>,
-    },
+    Page { repo: String, rows: Vec<Bundle> },
     /// One completed discovery window: rows, quarantine records, and the
     /// watermark advance in a single transaction — both-or-neither, at
     /// window grain, so a mid-run floor deferral banks every window it
@@ -412,7 +501,7 @@ pub enum Msg {
         repo: String,
         stream: Stream,
         witness: WindowComplete,
-        rows: Vec<PrBundle>,
+        rows: Vec<Bundle>,
         quarantine: Vec<QuarantineRecord>,
         /// None: an empty window (nothing to advance over) or an
         /// unsplittable-truncated one (advancing would pass the lost tail).
@@ -428,10 +517,11 @@ pub enum Msg {
     /// already passed by the watermark that quarantined them.
     Retries {
         repo: String,
-        resolved: Vec<PrBundle>,
+        resolved: Vec<Bundle>,
         requeued: Vec<QuarantineRecord>,
         /// node:null reached the drain threshold: soft-delete + row removal.
-        drained: Vec<String>,
+        /// Stream-tagged — the drain writes the stream's own table.
+        drained: Vec<(String, Stream)>,
     },
     /// The rate-limit floor stopped this stream; typed so the summary and
     /// stats never string-sniff. The watermark holds at the last completed
@@ -446,7 +536,14 @@ pub enum Msg {
         stream: Stream,
         reset_at: Option<String>,
     },
-    Failed(String, Error),
+    /// Repo-scoped failure. Carries the streams THIS RUN was configured to
+    /// walk: the starvation increment must not touch a residual row for a
+    /// stream the config no longer runs (issues flipped off leaves the
+    /// (repo,'issue') row behind, and only its own stream's completing
+    /// Done can ever reset it — an unconditional increment would read the
+    /// repo as permanently starved and bias starved-first ordering
+    /// forever).
+    Failed(String, Vec<Stream>, Error),
     /// Worker-side accounting, once per repo, after its last data message.
     Stats {
         repo: String,
@@ -582,27 +679,66 @@ impl RunLock {
 struct RepoPlan {
     rc: RepoConfig,
     repo: String,
-    /// Main-walk discovery start, overlap already applied.
+    /// PR-stream main-walk discovery start, overlap already applied.
     since: Rfc3339Utc,
+    /// Issue-stream main-walk start; `Some` iff the repo runs the issue
+    /// stream (project scope with issues on — config.rs rejects every
+    /// other combination). Each stream transitions against its OWN stored
+    /// fingerprint row, so a scope flip cold-starts both while an
+    /// unchanged config leaves both incremental.
+    issue_since: Option<Rfc3339Utc>,
+    /// This walk restarts from the lookback floor (a relaxation ColdStart,
+    /// or --full): its intermediate windows commit the STORED fingerprint,
+    /// so a kill mid-walk reads "unequal → cold-start again" next run
+    /// instead of "equal → incremental", which would silently skip the
+    /// region the walk never reached — the F1 argument, generalized from
+    /// backfill to every restart-from-floor (D1 panel). The price,
+    /// recorded: an interrupted cold start banks no discovery progress
+    /// (the watermark stays pinned at the old high by max()) and redoes
+    /// its windows next run; it converges when any single run completes
+    /// the walk, and the redo is idempotent. Under --full with an
+    /// UNCHANGED config the stored and new fingerprints are byte-equal
+    /// (canonical serialization), so the hold degenerates to a no-op.
+    /// Per stream, like everything else here.
+    cold_start: bool,
+    issue_cold_start: bool,
+    /// The issue stream's own stored fingerprint (see stored_fingerprint;
+    /// the rows can disagree — e.g. a kill mid-cold-start of one stream).
+    issue_stored_fingerprint: Option<String>,
     /// People added since the stored fingerprint: targeted backfill of just
-    /// their involves: flavors over the lookback.
+    /// their involves: flavors over the lookback. PR-stream only — people
+    /// never shape project-scope discovery, and the issue stream exists
+    /// only at project scope, so an issue backfill is unconstructible.
     backfill: Vec<Login>,
     fingerprint: String,
-    /// The fingerprint currently in sync_state, verbatim. Backfill windows
-    /// commit THIS one: a kill mid-backfill must leave the stored inputs
-    /// unchanged, or the next run reads "equal → incremental" and the rest
-    /// of the backfill silently never happens (closure-pass F1). Only the
-    /// main walk's windows write the new fingerprint, and by then the
-    /// backfill has completed — a kill after that point redoes a completed
-    /// (idempotent) backfill, which converges.
+    /// The fingerprint currently in the PR stream's sync_state, verbatim.
+    /// Backfill windows commit THIS one: a kill mid-backfill must leave
+    /// the stored inputs unchanged, or the next run reads "equal →
+    /// incremental" and the rest of the backfill silently never happens
+    /// (closure-pass F1). Only the main walk's windows write the new
+    /// fingerprint, and by then the backfill has completed — a kill after
+    /// that point redoes a completed (idempotent) backfill, which
+    /// converges.
     stored_fingerprint: Option<String>,
-    /// Due quarantine retries: (id, prior attempts). Ordered by id.
-    quarantine_due: Vec<(String, u32)>,
+    /// Due quarantine retries: (id, prior attempts, stream). Ordered by id.
+    quarantine_due: Vec<(String, u32, Stream)>,
     /// Every quarantined id, due or not: backoff dominates every hydration
-    /// cause, so windows and re-verify skip these entirely.
+    /// cause, so windows and re-verify skip these entirely. One set for
+    /// both streams — node ids are globally unique.
     quarantined: HashSet<String>,
-    /// Capped, ordered re-verify list (never-verified first, then oldest).
-    reverify: Vec<(String, i64)>,
+    /// Capped, ordered re-verify list (never-verified first, then oldest),
+    /// stream-tagged for hydration dispatch.
+    reverify: Vec<(String, i64, Stream)>,
+}
+
+/// The streams a repo's config runs, in walk order (PR first: the demand
+/// surface's stream; deterministic either way).
+fn streams(plan: &RepoPlan) -> Vec<Stream> {
+    if plan.issue_since.is_some() {
+        vec![Stream::Pr, Stream::Issue]
+    } else {
+        vec![Stream::Pr]
+    }
 }
 
 /// Build every repo's plan and order them starved-first. The only reader of
@@ -628,61 +764,120 @@ fn plan(cfg: &Config, archive: &RwArchive, now: &Rfc3339Utc, full: bool) -> Resu
         let fp_json = serde_json::to_string(&fp_new).expect("fingerprint is plain data");
 
         let lookback_start = lookback_start(now, &rc, cfg);
-        let (since, backfill) = if full {
+        let (since, backfill, cold_start) = if full {
             // --full ignores watermarks and refetches the whole lookback;
             // it subsumes any pending backfill (every flavor re-runs).
-            (lookback_start.clone(), Vec::new())
+            (lookback_start.clone(), Vec::new(), true)
         } else {
             match transition(state.as_ref(), &fp_new) {
-                Transition::ColdStart => (lookback_start.clone(), Vec::new()),
+                Transition::ColdStart => (lookback_start.clone(), Vec::new(), true),
                 Transition::Incremental => (
                     incremental_since(state.as_ref(), &lookback_start),
                     Vec::new(),
+                    false,
                 ),
-                Transition::Backfill(added) => {
-                    (incremental_since(state.as_ref(), &lookback_start), added)
-                }
+                Transition::Backfill(added) => (
+                    incremental_since(state.as_ref(), &lookback_start),
+                    added,
+                    false,
+                ),
             }
+        };
+
+        // One gate, computed once: the issue-since decision and the
+        // issue-re-verify decision must agree (a divergence would re-verify
+        // a stream the walk never runs, or vice versa), so they read the
+        // same binding.
+        let issue_stream_on = rc.scope == Scope::Project && rc.issues();
+
+        // The issue stream's own transition, against its own state row.
+        // Backfill folds to Incremental by construction (project-scope
+        // fingerprints pin people empty, so `added` cannot be non-empty);
+        // the arm is written rather than unreachable-marked because its
+        // failure mode — a people edit backfilling a stream whose search
+        // never mentions them — is exactly what the pinned-empty rule
+        // exists to prevent, and Incremental is that rule's meaning here.
+        let (issue_since, issue_cold_start, issue_stored_fingerprint) = if issue_stream_on {
+            let issue_state: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT last_item_updated_at, fingerprint FROM sync_state \
+                     WHERE repo = ?1 AND stream = 'issue'",
+                    [&repo],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map(Some)
+                .or_else(none_if_no_rows)
+                .map_err(|e| classify_sql(&e))?;
+            let (issue_since, issue_cold) = if full {
+                (lookback_start.clone(), true)
+            } else {
+                match transition(issue_state.as_ref(), &fp_new) {
+                    Transition::ColdStart => (lookback_start.clone(), true),
+                    Transition::Incremental | Transition::Backfill(_) => (
+                        incremental_since(issue_state.as_ref(), &lookback_start),
+                        false,
+                    ),
+                }
+            };
+            (Some(issue_since), issue_cold, issue_state.map(|(_, fp)| fp))
+        } else {
+            (None, false, None)
         };
 
         let mut quarantine_due = Vec::new();
         let mut quarantined = HashSet::new();
         {
             let mut stmt = conn
-                .prepare("SELECT id, attempts, next_retry_at FROM quarantine WHERE repo = ?1 ORDER BY id")
+                .prepare(
+                    "SELECT id, stream, attempts, next_retry_at FROM quarantine \
+                     WHERE repo = ?1 ORDER BY id",
+                )
                 .map_err(|e| classify_sql(&e))?;
             let rows = stmt
                 .query_map([&repo], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
                     ))
                 })
                 .map_err(|e| classify_sql(&e))?;
             for row in rows {
-                let (id, attempts, next_retry_at) = row.map_err(|e| classify_sql(&e))?;
+                let (id, stream, attempts, next_retry_at) = row.map_err(|e| classify_sql(&e))?;
+                let Some(stream) = Stream::parse(&stream) else {
+                    // Only ghgraph writes this column; an unknown tag is
+                    // this code drifting from its own archive.
+                    return Err(Error::internal(format!(
+                        "quarantine row carries unknown stream tag {stream:?}"
+                    )));
+                };
                 if next_retry_at.as_str() <= now.as_str() {
-                    quarantine_due.push((id.clone(), u32::try_from(attempts).unwrap_or(0)));
+                    quarantine_due.push((id.clone(), u32::try_from(attempts).unwrap_or(0), stream));
                 }
                 quarantined.insert(id);
             }
         }
 
-        let reverify = reverify_due(conn, &repo, cfg, now, &quarantined)?;
+        let reverify = reverify_due(conn, &repo, &rc, cfg, now, &quarantined, issue_stream_on)?;
 
+        // Starvation is per stream in the schema but starved-FIRST ordering
+        // is per repo (a repo is the unit a worker takes): the max over its
+        // streams, so either stream starving pulls the repo forward.
         let runs_since_advance: i64 = conn
             .query_row(
-                "SELECT runs_since_advance FROM sync_state WHERE repo = ?1 AND stream = 'pr'",
+                "SELECT coalesce(max(runs_since_advance), 0) FROM sync_state WHERE repo = ?1",
                 [&repo],
                 |r| r.get(0),
             )
-            .or_else(|e| if_no_rows(e, 0))
             .map_err(|e| classify_sql(&e))?;
         let size: i64 = conn
-            .query_row("SELECT count(*) FROM prs WHERE repo = ?1", [&repo], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT (SELECT count(*) FROM prs WHERE repo = ?1) + \
+                        (SELECT count(*) FROM issues WHERE repo = ?1)",
+                [&repo],
+                |r| r.get(0),
+            )
             .map_err(|e| classify_sql(&e))?;
         order_keys.insert(repo.clone(), (runs_since_advance, size));
 
@@ -690,6 +885,10 @@ fn plan(cfg: &Config, archive: &RwArchive, now: &Rfc3339Utc, full: bool) -> Resu
             rc,
             repo,
             since,
+            issue_since,
+            cold_start,
+            issue_cold_start,
+            issue_stored_fingerprint,
             backfill,
             fingerprint: fp_json,
             stored_fingerprint: state.as_ref().map(|(_, fp)| fp.clone()),
@@ -831,77 +1030,175 @@ fn subset(a: &Value, b: &Value) -> bool {
 }
 
 /// The re-verify schedule: due = verified_at is NULL (never witnessed) or
-/// older than the tier period plus a deterministic per-PR jitter
+/// older than the tier period plus a deterministic per-item jitter
 /// (FNV-1a(repo, number) mod period — no RNG), which spreads a cold
 /// archive's re-verifies across [period, 2·period) instead of a thundering
 /// herd on day N. Open tier is lookback-exempt (OPEN is the relevance
-/// signal); closed tier is bounded by lookback of closed_at/merged_at.
-/// Quarantined ids are excluded — backoff dominates every hydration cause.
+/// signal); the PR closed tier is bounded by lookback of
+/// closed_at/merged_at. Quarantined ids are excluded — backoff dominates
+/// every hydration cause.
+///
+/// Issues re-verify under the same two tiers when the repo runs the issue
+/// stream, with two deviations, both decisions:
+///   * Only hydration_source='stream' rows: a working-scope linked row is
+///     a fill-only context cache with no witness to keep honest — putting
+///     it in the schedule would hydrate it into a full row, exactly the
+///     scope widening DESIGN.md's "stays a skinny context cache" forbids.
+///   * The closed tier bounds by updated_at, not closed_at (the issues
+///     table stores none — queries.rs HYDRATE_ISSUE records the cut).
+///     Containment: updated_at ≥ close time always (closing bumps it), so
+///     the updated_at bound re-verifies a superset of the closed_at rule's
+///     rows — wider by exactly the issues still discussed after closing,
+///     never narrower, so no closed-within-lookback issue is missed.
+///
+/// The cap applies per stream, not shared: a PR backlog must not starve
+/// issue re-verify or vice versa, and two bounded lists stay bounded.
+/// Each tier's SQL carries the cap as a bound LIMIT — it bounds
+/// CANDIDATES, not dues (the jitter filter runs in Rust), so a mixed
+/// window can under-fill the cap; that self-heals because due-ness is
+/// monotone in time and the verified_at ASC order moves re-verified rows
+/// behind the pending ones, while the LIMIT keeps plan-time cost bounded
+/// by the cap instead of the archive (D1 panel, S1).
 fn reverify_due(
     conn: &rusqlite::Connection,
     repo: &str,
+    rc: &RepoConfig,
     cfg: &Config,
     now: &Rfc3339Utc,
     quarantined: &HashSet<String>,
-) -> Result<Vec<(String, i64)>> {
-    let mut due: Vec<(String, i64)> = Vec::new();
-    let mut tier = |sql: &str, args: &[&dyn rusqlite::ToSql], period_days: u32| -> Result<()> {
-        let mut stmt = conn.prepare(sql).map_err(|e| classify_sql(&e))?;
-        let rows = stmt
-            .query_map(args, |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .map_err(|e| classify_sql(&e))?;
-        for row in rows {
-            let (id, number, verified_at) = row.map_err(|e| classify_sql(&e))?;
-            if quarantined.contains(&id) {
-                continue;
-            }
-            let period = i64::from(period_days) * 86_400;
-            let is_due = match verified_at
-                .as_deref()
-                .and_then(|v| Rfc3339Utc::parse(v).ok())
-            {
-                None => true,
-                Some(v) => {
-                    let jitter = (fnv1a(repo, number) % period.unsigned_abs()) as i64;
-                    v.epoch() + period + jitter <= now.epoch()
-                }
-            };
-            if is_due {
-                due.push((id, number));
-            }
-        }
-        Ok(())
-    };
+    issue_stream_on: bool,
+) -> Result<Vec<(String, i64, Stream)>> {
+    let closed_floor = lookback_floor_str(now, rc, cfg);
+    let cap = i64::try_from(REVERIFY_CAP).unwrap_or(i64::MAX);
+
     // NULL verified_at leads (never witnessed), then oldest; number breaks
     // ties for a total order.
-    tier(
+    let mut pr_due: Vec<(String, i64)> = Vec::new();
+    reverify_tier(
+        conn,
+        repo,
+        now,
+        quarantined,
         "SELECT id, number, verified_at FROM prs \
          WHERE repo = ?1 AND deleted_at IS NULL AND state = 'OPEN' \
-         ORDER BY verified_at IS NOT NULL, verified_at ASC, number ASC",
-        &[&repo],
+         ORDER BY verified_at IS NOT NULL, verified_at ASC, number ASC LIMIT ?2",
+        &[&repo, &cap],
         cfg.reverify_open_days,
+        &mut pr_due,
     )?;
-    let closed_floor = lookback_floor_str(now, cfg);
-    tier(
+    reverify_tier(
+        conn,
+        repo,
+        now,
+        quarantined,
         "SELECT id, number, verified_at FROM prs \
          WHERE repo = ?1 AND deleted_at IS NULL AND state != 'OPEN' \
            AND coalesce(merged_at, closed_at, '') >= ?2 \
-         ORDER BY verified_at IS NOT NULL, verified_at ASC, number ASC",
-        &[&repo, &closed_floor],
+         ORDER BY verified_at IS NOT NULL, verified_at ASC, number ASC LIMIT ?3",
+        &[&repo, &closed_floor, &cap],
         cfg.reverify_closed_days,
+        &mut pr_due,
     )?;
-    due.truncate(REVERIFY_CAP);
-    Ok(due)
+    pr_due.truncate(REVERIFY_CAP);
+    let mut out: Vec<(String, i64, Stream)> = pr_due
+        .into_iter()
+        .map(|(id, n)| (id, n, Stream::Pr))
+        .collect();
+
+    if issue_stream_on {
+        let mut issue_due: Vec<(String, i64)> = Vec::new();
+        reverify_tier(
+            conn,
+            repo,
+            now,
+            quarantined,
+            "SELECT id, number, verified_at FROM issues \
+             WHERE repo = ?1 AND deleted_at IS NULL AND state = 'OPEN' \
+               AND hydration_source = ?2 \
+             ORDER BY verified_at IS NOT NULL, verified_at ASC, number ASC LIMIT ?3",
+            &[&repo, &HydrationSource::Stream.as_str(), &cap],
+            cfg.reverify_open_days,
+            &mut issue_due,
+        )?;
+        reverify_tier(
+            conn,
+            repo,
+            now,
+            quarantined,
+            "SELECT id, number, verified_at FROM issues \
+             WHERE repo = ?1 AND deleted_at IS NULL AND state != 'OPEN' \
+               AND hydration_source = ?2 AND updated_at >= ?3 \
+             ORDER BY verified_at IS NOT NULL, verified_at ASC, number ASC LIMIT ?4",
+            &[
+                &repo,
+                &HydrationSource::Stream.as_str(),
+                &closed_floor,
+                &cap,
+            ],
+            cfg.reverify_closed_days,
+            &mut issue_due,
+        )?;
+        issue_due.truncate(REVERIFY_CAP);
+        out.extend(issue_due.into_iter().map(|(id, n)| (id, n, Stream::Issue)));
+    }
+    Ok(out)
 }
 
-fn lookback_floor_str(now: &Rfc3339Utc, cfg: &Config) -> String {
-    now.checked_sub_days(cfg.lookback_days)
+/// One re-verify tier query: append due (id, number) pairs. The due rule
+/// (NULL verified_at, or older than period + deterministic jitter) is
+/// documented at [`reverify_due`].
+#[allow(clippy::too_many_arguments)]
+fn reverify_tier(
+    conn: &rusqlite::Connection,
+    repo: &str,
+    now: &Rfc3339Utc,
+    quarantined: &HashSet<String>,
+    sql: &str,
+    args: &[&dyn rusqlite::ToSql],
+    period_days: u32,
+    due: &mut Vec<(String, i64)>,
+) -> Result<()> {
+    let mut stmt = conn.prepare(sql).map_err(|e| classify_sql(&e))?;
+    let rows = stmt
+        .query_map(args, |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|e| classify_sql(&e))?;
+    for row in rows {
+        let (id, number, verified_at) = row.map_err(|e| classify_sql(&e))?;
+        if quarantined.contains(&id) {
+            continue;
+        }
+        let period = i64::from(period_days) * 86_400;
+        let is_due = match verified_at
+            .as_deref()
+            .and_then(|v| Rfc3339Utc::parse(v).ok())
+        {
+            None => true,
+            Some(v) => {
+                let jitter = (fnv1a(repo, number) % period.unsigned_abs()) as i64;
+                v.epoch() + period + jitter <= now.epoch()
+            }
+        };
+        if is_due {
+            due.push((id, number));
+        }
+    }
+    Ok(())
+}
+
+/// The closed re-verify tiers' reach, from the repo's EFFECTIVE lookback
+/// (the per-repo override, then the global) — the same resolution
+/// discovery uses (lookback_start). The D1 panel caught the old form
+/// reading only the global: a repo with a wider per-repo lookback
+/// discovered closed items its re-verify tier then never scheduled, so
+/// quiet mutations on items closed in the gap went permanently uncaught.
+fn lookback_floor_str(now: &Rfc3339Utc, rc: &RepoConfig, cfg: &Config) -> String {
+    now.checked_sub_days(rc.lookback_days.unwrap_or(cfg.lookback_days))
         .map(|t| t.as_str().to_string())
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
 }
@@ -935,11 +1232,16 @@ fn worker(
         if floor.load(Ordering::Relaxed) {
             // The run-wide floor tripped before this repo started: defer it
             // whole, zero calls — the summary shows why nothing moved.
-            let deferred = tx.send(Msg::Deferred {
-                repo: plan.repo.clone(),
-                stream: Stream::Pr,
-                reset_at: None,
-            });
+            // Every configured stream deferred: the starvation counter is
+            // per stream, and both were denied this run.
+            let mut deferred = Ok(());
+            for stream in streams(&plan) {
+                deferred = deferred.and(tx.send(Msg::Deferred {
+                    repo: plan.repo.clone(),
+                    stream,
+                    reset_at: None,
+                }));
+            }
             let stats = tx.send(Msg::Stats {
                 repo: plan.repo,
                 tel: gh::Telemetry::default(),
@@ -993,20 +1295,30 @@ fn worker(
             Err(Stop::Floor) => {
                 floor.store(true, Ordering::Relaxed);
                 let reset = s.gh.tel.reset_at.as_ref().map(|t| t.as_str().to_string());
-                if tx
-                    .send(Msg::Deferred {
+                // Every configured stream: the floor stopped the RUN, and
+                // the module docs' rule is "increments on a deferred or
+                // failed run" — a stream that completed before the trip
+                // still eats the increment (its Done reset to 0 first, so
+                // the count reads "runs since it last finished", which is
+                // the starvation the scheduler orders by).
+                let mut deferred = Ok(());
+                for stream in streams(&plan) {
+                    deferred = deferred.and(tx.send(Msg::Deferred {
                         repo: plan.repo.clone(),
-                        stream: Stream::Pr,
-                        reset_at: reset,
-                    })
-                    .is_err()
-                {
+                        stream,
+                        reset_at: reset.clone(),
+                    }));
+                }
+                if deferred.is_err() {
                     return;
                 }
                 let _ = tx.send(stats);
             }
             Err(Stop::Repo(error)) => {
-                if tx.send(Msg::Failed(plan.repo.clone(), error)).is_err() {
+                if tx
+                    .send(Msg::Failed(plan.repo.clone(), streams(&plan), error))
+                    .is_err()
+                {
                     return;
                 }
                 let _ = tx.send(stats);
@@ -1063,20 +1375,35 @@ struct StreamCtx<'a> {
 
 impl StreamCtx<'_> {
     fn sync_repo(&mut self) -> std::result::Result<(), Stop> {
-        // Targeted backfill first (old windows), then the main walk whose
-        // final window completes the stream. The writer's max() keeps the
-        // backfill's older watermarks from regressing anything.
+        // Targeted backfill first (old windows), then each stream's main
+        // walk, whose final window completes that stream. The writer's
+        // max() keeps the backfill's older watermarks from regressing
+        // anything. PR stream first (walk order is a determinism choice,
+        // recorded at `streams`); a halt in one stream does NOT skip the
+        // other — watermarks are per stream and a lost PR tail says
+        // nothing about the issue stream — but any halt skips retries and
+        // re-verify, the existing posture (a capped unsplittable window is
+        // repo-level trouble; spending the budget's remainder on
+        // maintenance calls before the operator sees the disclosure buys
+        // staleness polish at freshness cost).
         if !self.plan.backfill.is_empty() {
             let start = lookback_start(&Rfc3339Utc::now(), &self.plan.rc, self.cfg);
             let added = self.plan.backfill.clone();
-            let completed = self.walk_window(&start, None, &TermSource::Backfill(added))?;
+            let completed =
+                self.walk_window(&start, None, &TermSource::Backfill(added), Stream::Pr)?;
             if !completed {
                 return Ok(()); // halted: discovery_truncated disclosed
             }
         }
         let since = self.plan.since.clone();
-        let completed = self.walk_window(&since, None, &TermSource::Full)?;
-        if !completed {
+        let pr_completed = self.walk_window(&since, None, &TermSource::Full, Stream::Pr)?;
+        let issue_completed = match self.plan.issue_since.clone() {
+            Some(issue_since) => {
+                self.walk_window(&issue_since, None, &TermSource::Full, Stream::Issue)?
+            }
+            None => true,
+        };
+        if !(pr_completed && issue_completed) {
             return Ok(());
         }
         self.retry_quarantined()?;
@@ -1117,8 +1444,9 @@ impl StreamCtx<'_> {
         since: &Rfc3339Utc,
         until: Option<&Rfc3339Utc>,
         terms: &TermSource,
+        stream: Stream,
     ) -> std::result::Result<bool, Stop> {
-        let d = self.discover(since, until, terms)?;
+        let d = self.discover(since, until, terms, stream)?;
         if !d.complete
             && let Some(mid) = split_point(since, until)
         {
@@ -1128,21 +1456,21 @@ impl StreamCtx<'_> {
             // MIN_WINDOW_SECS floor is ~22 levels.
             let right_start = Rfc3339Utc::from_epoch(mid.epoch() + 1)
                 .expect("split point is far from the representable range");
-            if !self.walk_window(since, Some(&mid), terms)? {
+            if !self.walk_window(since, Some(&mid), terms, stream)? {
                 return Ok(false);
             }
-            return self.walk_window(&right_start, until, terms);
+            return self.walk_window(&right_start, until, terms, stream);
         }
 
         self.windows_done += 1;
-        self.heartbeat(d.hits.len());
+        self.heartbeat(stream, d.hits.len());
 
         // Hydration ascends by updatedAt (then id for a total order): the
         // hydrated prefix is contiguous, so a boundary is a checkpoint.
         let mut ordered: Vec<&Hit> = d.hits.values().collect();
         ordered.sort_by(|a, b| a.updated_at.cmp(&b.updated_at).then(a.id.cmp(&b.id)));
 
-        let mut rows: Vec<PrBundle> = Vec::new();
+        let mut rows: Vec<Bundle> = Vec::new();
         let mut quarantine: Vec<QuarantineRecord> = Vec::new();
         let mut watermark: Option<Rfc3339Utc> = None;
         // Known-equivalent mutant on the comparison (> vs >=), and it
@@ -1171,11 +1499,28 @@ impl StreamCtx<'_> {
             // last completed window — the mid-run banking the module docs
             // promise.
             self.gate()?;
-            match self.hydrate(&hit.id, Origin::Discovery)? {
+            let hydrated = match stream {
+                Stream::Pr => self.hydrate(&hit.id, Origin::Discovery)?,
+                Stream::Issue => self.hydrate_issue_item(&hit.id, Origin::Discovery)?,
+            };
+            match hydrated {
                 Hydrated::Bundle(bundle) => {
-                    extend(&mut watermark, &bundle.pr.updated_at);
+                    // The fold takes the DISCOVERY-time updatedAt — the
+                    // value the `updated:` window bounded — not the
+                    // hydration-time one, which an item touched between
+                    // the two calls can carry past a closed window's right
+                    // edge. Unbounded, that overshoot commits a watermark
+                    // covering the sibling right window before it runs; a
+                    // floor stop then resumes PAST an item whose only home
+                    // was that window — the one shape "watermark never
+                    // leads data" did not cover (D1 panel). The drifted
+                    // item itself is safe either way: its new updatedAt
+                    // exceeds the folded one, so the next run's window
+                    // rediscovers it and the upsert dedups. Same rule as
+                    // the filtered arm below — one fold, one time base.
+                    extend(&mut watermark, &hit.updated_at);
                     self.fetched += 1;
-                    rows.push(*bundle);
+                    rows.push(bundle);
                     if rows.len() >= PAGE_BATCH {
                         self.send(Msg::Page {
                             repo: self.plan.repo.clone(),
@@ -1184,7 +1529,7 @@ impl StreamCtx<'_> {
                     }
                 }
                 Hydrated::Quarantine(class) => {
-                    quarantine.push(quarantine_record(&hit.id, 1, class));
+                    quarantine.push(quarantine_record(&hit.id, stream, 1, class));
                 }
             }
         }
@@ -1192,7 +1537,7 @@ impl StreamCtx<'_> {
         let halt = !d.complete; // unsplittable and still capped
         self.send(Msg::Done {
             repo: self.plan.repo.clone(),
-            stream: Stream::Pr,
+            stream,
             witness: WindowComplete(()),
             rows,
             quarantine,
@@ -1200,15 +1545,33 @@ impl StreamCtx<'_> {
             // than everything seen (sort is updated-desc), so any advance
             // would pass it permanently.
             watermark: if halt { None } else { watermark },
-            fingerprint: match terms {
-                TermSource::Full => self.plan.fingerprint.clone(),
-                // See RepoPlan::stored_fingerprint. A backfill only exists
-                // when a stored row does.
-                TermSource::Backfill(_) => self
-                    .plan
-                    .stored_fingerprint
-                    .clone()
-                    .unwrap_or_else(|| self.plan.fingerprint.clone()),
+            fingerprint: {
+                let stored = match stream {
+                    Stream::Pr => &self.plan.stored_fingerprint,
+                    Stream::Issue => &self.plan.issue_stored_fingerprint,
+                };
+                let cold_start = match stream {
+                    Stream::Pr => self.plan.cold_start,
+                    Stream::Issue => self.plan.issue_cold_start,
+                };
+                let completes = until.is_none() && matches!(terms, TermSource::Full) && !halt;
+                match terms {
+                    // A cold start's intermediate windows commit the STORED
+                    // inputs; only the completing window claims the new ones
+                    // (RepoPlan::cold_start carries the argument). First
+                    // contact has nothing stored and writes the new
+                    // fingerprint from the first window — its convergence
+                    // is the banked watermark, which needs the row.
+                    TermSource::Full if cold_start && !completes => stored
+                        .clone()
+                        .unwrap_or_else(|| self.plan.fingerprint.clone()),
+                    TermSource::Full => self.plan.fingerprint.clone(),
+                    // See RepoPlan::stored_fingerprint. A backfill only
+                    // exists when a stored row does.
+                    TermSource::Backfill(_) => stored
+                        .clone()
+                        .unwrap_or_else(|| self.plan.fingerprint.clone()),
+                }
             },
             completes_stream: until.is_none() && matches!(terms, TermSource::Full) && !halt,
             discovery_truncated: u64::from(halt),
@@ -1226,6 +1589,7 @@ impl StreamCtx<'_> {
         since: &Rfc3339Utc,
         until: Option<&Rfc3339Utc>,
         source: &TermSource,
+        stream: Stream,
     ) -> std::result::Result<Discovered, Stop> {
         let terms = match source {
             TermSource::Full => queries::discovery_terms(
@@ -1234,7 +1598,7 @@ impl StreamCtx<'_> {
                 &self.cfg.people,
                 since,
                 until,
-                Stream::Pr,
+                stream,
             ),
             TermSource::Backfill(added) => {
                 queries::backfill_terms(&self.plan.rc, added, since, until)
@@ -1359,7 +1723,7 @@ impl StreamCtx<'_> {
                 &mut self.bodies_skipped,
             ) {
                 RefreshEnd::End(end) => {
-                    if let HydrateEnd::Bundle(b) = &end
+                    if let HydrateEnd::Bundle(Bundle::Pr(b)) = &end
                         && b.comments == CommentsCompleteness::TailHit
                     {
                         self.tail_hits += 1;
@@ -1391,6 +1755,30 @@ impl StreamCtx<'_> {
         self.hydrate_end(end)
     }
 
+    /// Hydrate one issue by node id: always the full walk — issues have no
+    /// refresh/tail path (queries.rs HYDRATE_ISSUE records the cut), so the
+    /// dispatch gate has nothing to decide here. Same outcome discipline as
+    /// [`Self::hydrate`], and successful walks enter `full_walked` so the
+    /// re-verify tier skips them identically.
+    fn hydrate_issue_item(
+        &mut self,
+        id: &str,
+        origin: Origin,
+    ) -> std::result::Result<Hydrated, Stop> {
+        let end = hydrate_issue_one(
+            &mut self.gh,
+            &self.plan.repo,
+            id,
+            origin,
+            self.cfg.rate_limit_floor,
+            || self.floor.load(Ordering::Relaxed),
+        );
+        if matches!(end, HydrateEnd::Bundle(_)) {
+            self.full_walked.insert(id.to_string());
+        }
+        self.hydrate_end(end)
+    }
+
     /// Map a walk's terminal outcome onto the stream's typed results —
     /// shared by the full walk and the refresh so both classify at the
     /// same call site.
@@ -1401,7 +1789,7 @@ impl StreamCtx<'_> {
             HydrateEnd::ParseDrift => Ok(Hydrated::Quarantine("parse")),
             HydrateEnd::Retryable => Ok(Hydrated::Quarantine("transient")),
             HydrateEnd::Renamed => Err(Stop::Repo(Error::config(format!(
-                "repo {}: a hydrated PR reports a different repository — renamed or \
+                "repo {}: a hydrated item reports a different repository — renamed or \
                  transferred upstream; update the config entry",
                 self.plan.repo
             )))),
@@ -1479,23 +1867,27 @@ impl StreamCtx<'_> {
         let mut resolved = Vec::new();
         let mut requeued = Vec::new();
         let mut drained = Vec::new();
-        for (id, attempts) in &self.plan.quarantine_due {
+        for (id, attempts, stream) in &self.plan.quarantine_due {
             // The floor gates each retry; undone retries simply stay due —
             // their rows are durable, no Deferred bookkeeping needed.
             if self.gate().is_err() {
                 break;
             }
-            match self.hydrate(id, Origin::Retry)? {
+            let hydrated = match stream {
+                Stream::Pr => self.hydrate(id, Origin::Retry)?,
+                Stream::Issue => self.hydrate_issue_item(id, Origin::Retry)?,
+            };
+            match hydrated {
                 Hydrated::Bundle(bundle) => {
                     self.fetched += 1;
-                    resolved.push(*bundle);
+                    resolved.push(bundle);
                 }
                 Hydrated::Quarantine(class) => {
                     let next = attempts + 1;
                     if class == "node_null" && next >= QUARANTINE_DRAIN_ATTEMPTS {
-                        drained.push(id.clone());
+                        drained.push((id.clone(), *stream));
                     } else {
-                        requeued.push(quarantine_record_at(&now, id, next, class));
+                        requeued.push(quarantine_record_at(&now, id, *stream, next, class));
                     }
                 }
             }
@@ -1509,10 +1901,10 @@ impl StreamCtx<'_> {
     }
 
     fn reverify(&mut self) -> std::result::Result<(), Stop> {
-        let mut rows: Vec<PrBundle> = Vec::new();
+        let mut rows: Vec<Bundle> = Vec::new();
         let mut requeued: Vec<QuarantineRecord> = Vec::new();
         let now = Rfc3339Utc::now();
-        for (i, (id, _number)) in self.plan.reverify.iter().enumerate() {
+        for (i, (id, _number, stream)) in self.plan.reverify.iter().enumerate() {
             if self.full_walked.contains(id) {
                 // Discovery already gave it a complete refetch. `hydrated`
                 // would be the wrong set here: a tail-hit rehydration is
@@ -1526,11 +1918,15 @@ impl StreamCtx<'_> {
                 self.reverify_shed += (self.plan.reverify.len() - i) as u64;
                 break;
             }
-            match self.hydrate(id, Origin::Reverify)? {
+            let hydrated = match stream {
+                Stream::Pr => self.hydrate(id, Origin::Reverify)?,
+                Stream::Issue => self.hydrate_issue_item(id, Origin::Reverify)?,
+            };
+            match hydrated {
                 Hydrated::Bundle(bundle) => {
                     self.reverified += 1;
                     self.fetched += 1;
-                    rows.push(*bundle);
+                    rows.push(bundle);
                     if rows.len() >= PAGE_BATCH {
                         self.send(Msg::Page {
                             repo: self.plan.repo.clone(),
@@ -1539,7 +1935,7 @@ impl StreamCtx<'_> {
                     }
                 }
                 Hydrated::Quarantine(class) => {
-                    requeued.push(quarantine_record_at(&now, id, 1, class));
+                    requeued.push(quarantine_record_at(&now, id, *stream, 1, class));
                 }
             }
         }
@@ -1568,14 +1964,16 @@ impl StreamCtx<'_> {
     /// stderr stays non-contract — which is also why mutants on this
     /// counter and format survive mutation testing, and stay: a test
     /// asserting heartbeat text would promote noise space into contract.
-    fn heartbeat(&self, window_items: usize) {
+    fn heartbeat(&self, stream: Stream, window_items: usize) {
         let points = match self.gh.tel.remaining {
             Some(r) => r.to_string(),
             None => "?".to_string(),
         };
         eprintln!(
-            "ghgraph: {}: pr window {} ({window_items} items), {points} points remaining",
-            self.plan.repo, self.windows_done
+            "ghgraph: {}: {} window {} ({window_items} items), {points} points remaining",
+            self.plan.repo,
+            stream.as_str(),
+            self.windows_done
         );
     }
 }
@@ -1598,7 +1996,7 @@ struct Hit {
 }
 
 enum Hydrated {
-    Bundle(Box<PrBundle>),
+    Bundle(Bundle),
     /// Quarantine with this error class; the caller owns attempts/backoff.
     Quarantine(&'static str),
 }
@@ -1625,13 +2023,14 @@ fn split_point(since: &Rfc3339Utc, until: Option<&Rfc3339Utc>) -> Option<Rfc3339
     Rfc3339Utc::from_epoch(since.epoch() + width / 2)
 }
 
-fn quarantine_record(id: &str, attempts: u32, class: &str) -> QuarantineRecord {
-    quarantine_record_at(&Rfc3339Utc::now(), id, attempts, class)
+fn quarantine_record(id: &str, stream: Stream, attempts: u32, class: &str) -> QuarantineRecord {
+    quarantine_record_at(&Rfc3339Utc::now(), id, stream, attempts, class)
 }
 
 fn quarantine_record_at(
     now: &Rfc3339Utc,
     id: &str,
+    stream: Stream,
     attempts: u32,
     class: &str,
 ) -> QuarantineRecord {
@@ -1642,6 +2041,7 @@ fn quarantine_record_at(
         .unwrap_or_else(|| now.clone());
     QuarantineRecord {
         id: id.to_string(),
+        stream,
         attempts,
         next_retry_at: next.as_str().to_string(),
         error_class: class.to_string(),
@@ -1652,7 +2052,7 @@ fn quarantine_record_at(
 // Hydration: one PR, full walk, witnesses earned here and nowhere else.
 
 enum HydrateEnd {
-    Bundle(Box<PrBundle>),
+    Bundle(Bundle),
     /// node: null — the id no longer resolves (deleted or access lost).
     Vanished,
     /// The response did not match the parse type: quarantine class 'parse',
@@ -1779,7 +2179,7 @@ fn hydrate_one(
 
     let body_refs = refs::extract(&node.body, repo).unwrap_or_default();
 
-    HydrateEnd::Bundle(Box::new(PrBundle {
+    HydrateEnd::Bundle(Bundle::Pr(Box::new(PrBundle {
         repo: repo.to_string(),
         pr: node,
         refs: body_refs,
@@ -1795,7 +2195,95 @@ fn hydrate_one(
         requests_complete,
         reviews_complete,
         closing_complete,
-    }))
+    })))
+}
+
+/// Hydrate one issue by node id: the first-page document, then follow-up
+/// pages for the comments connection. The same witness discipline as
+/// [`hydrate_one`]: every completeness claim is earned by pagination
+/// TERMINATING; any failure or backstop withholds the witness and the row
+/// lands truncated — never silently smaller. The two small counted
+/// connections (labels, assignees) have no follow-up document (queries.rs
+/// records the cut), so nodes covering totalCount IS their termination.
+fn hydrate_issue_one(
+    gh_ctx: &mut GhCtx,
+    repo: &str,
+    id: &str,
+    origin: Origin,
+    floor: u32,
+    floor_tripped: impl Fn() -> bool,
+) -> HydrateEnd {
+    let floor_hit = |ctx: &GhCtx| ctx.tel.remaining.is_some_and(|r| r < floor) || floor_tripped();
+    let resp = match gh::graphql(queries::HYDRATE_ISSUE, &[("id", id)], gh_ctx) {
+        Ok(resp) => resp,
+        Err(e) => return hydrate_failure(e),
+    };
+    let mut node = match parse::hydrate_issue(&resp.data) {
+        Err(_) => return HydrateEnd::ParseDrift,
+        Ok(None) => return HydrateEnd::Vanished,
+        Ok(Some(node)) => node,
+    };
+    // Rename detection: the issue's own view of its repo, case-folded
+    // (queries.rs records why), against the canonical config key.
+    if node.repository.name_with_owner.to_ascii_lowercase() != repo {
+        return HydrateEnd::Renamed;
+    }
+
+    // Follow-up pages for the comments connection — the same walk as
+    // hydrate_one's top-level comments, against the issue-rooted document.
+    let mut comments_complete = !node.comments.page_info.has_next_page;
+    let mut cursor = node.comments.page_info.end_cursor.clone();
+    let mut pages: u32 = 0;
+    while !comments_complete {
+        if floor_hit(gh_ctx) || pages >= MAX_CONNECTION_PAGES {
+            break;
+        }
+        let Some(after) = cursor.clone() else { break };
+        let resp = match gh::graphql(
+            queries::ISSUE_COMMENTS_PAGE,
+            &[("id", id), ("after", &after)],
+            gh_ctx,
+        ) {
+            Ok(resp) => resp,
+            Err(_) => break, // witness withheld; the row lands truncated
+        };
+        let page = match parse::issue_comments_page(&resp.data) {
+            Ok(Some(page)) => page,
+            // Vanished or drifted mid-walk: keep what we have, no witness.
+            Ok(None) | Err(_) => break,
+        };
+        pages += 1;
+        node.comments.nodes.extend(page.comments.nodes);
+        comments_complete = !page.comments.page_info.has_next_page;
+        // Known-equivalent mutants here, and they stay: `pages` feeds only
+        // the MAX_CONNECTION_PAGES backstop (defense-in-depth against a
+        // server advancing cursors forever — the non-advancing guard below
+        // is the live witness one level down, same argument as discovery's
+        // page counter), and the second arm's guard only chooses between
+        // exiting via {} and exiting via break when the walk is already
+        // complete — every input converges to the same state either way.
+        match page.comments.page_info.end_cursor {
+            Some(c) if Some(&c) != cursor.as_ref() => cursor = Some(c),
+            _ if comments_complete => {}
+            _ => break, // non-advancing cursor: stop, no witness
+        }
+    }
+
+    // labels is schema-nullable (error-masked; parse.rs), so it takes the
+    // same judgment as the PR's three nullable connections; assignees is
+    // non-null and judges its own coverage.
+    let labels_complete = counted_complete(&node.labels);
+    let assignees_complete =
+        i64::try_from(node.assignees.nodes.len()).is_ok_and(|n| n >= node.assignees.total_count);
+
+    HydrateEnd::Bundle(Bundle::Issue(Box::new(IssueBundle {
+        repo: repo.to_string(),
+        issue: node,
+        origin,
+        comments_complete,
+        labels_complete,
+        assignees_complete,
+    })))
 }
 
 /// Present (not error-masked) and complete (every node the count claims).
@@ -2217,7 +2705,7 @@ fn refresh_one(
             nodes: threads,
         },
     };
-    RefreshEnd::End(HydrateEnd::Bundle(Box::new(PrBundle {
+    RefreshEnd::End(HydrateEnd::Bundle(Bundle::Pr(Box::new(PrBundle {
         repo: repo.to_string(),
         pr,
         refs: body_refs,
@@ -2231,7 +2719,7 @@ fn refresh_one(
         requests_complete,
         reviews_complete,
         closing_complete,
-    })))
+    }))))
 }
 
 /// A skeleton thread whose every comment resolved from the archive.
@@ -2401,21 +2889,26 @@ fn writer(
                     exec(
                         &tx,
                         "DELETE FROM quarantine WHERE id = ?1",
-                        rusqlite::params![bundle.pr.id],
+                        rusqlite::params![bundle.id()],
                     )?;
                 }
                 for q in &requeued {
                     upsert_quarantine(&tx, &repo, q)?;
                 }
-                for id in &drained {
+                for (id, stream) in &drained {
                     // Repeated node:null drains to deleted_at: the id is
                     // gone upstream; the row (if any) becomes a soft delete
-                    // and the quarantine entry retires with it.
-                    let n = exec(
-                        &tx,
-                        "UPDATE prs SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
-                        rusqlite::params![now.as_str(), id],
-                    )?;
+                    // in the STREAM'S table and the quarantine entry
+                    // retires with it.
+                    let sql = match stream {
+                        Stream::Pr => {
+                            "UPDATE prs SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL"
+                        }
+                        Stream::Issue => {
+                            "UPDATE issues SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL"
+                        }
+                    };
+                    let n = exec(&tx, sql, rusqlite::params![now.as_str(), id])?;
                     t.soft_deleted += n as u64;
                     exec(
                         &tx,
@@ -2443,17 +2936,25 @@ fn writer(
                 )
                 .map_err(|e| classify_sql(&e))?;
             }
-            Msg::Failed(repo, error) => {
+            Msg::Failed(repo, streams, error) => {
                 let t = tally(&mut tallies, &repo);
                 t.errors.push(error.to_string());
-                archive
-                    .conn()
-                    .execute(
-                        "UPDATE sync_state SET runs_since_advance = runs_since_advance + 1 \
-                         WHERE repo = ?1 AND stream = 'pr'",
-                        rusqlite::params![repo],
-                    )
-                    .map_err(|e| classify_sql(&e))?;
+                // A repo failure is a failed RUN for every stream this run
+                // was configured to walk (the module docs' "increments on
+                // a deferred or failed run") — and only those (the message
+                // doc carries the residual-row argument). Only existing
+                // rows move, as with Deferred: a never-synced stream has
+                // nothing to starve.
+                for stream in streams {
+                    archive
+                        .conn()
+                        .execute(
+                            "UPDATE sync_state SET runs_since_advance = runs_since_advance + 1 \
+                             WHERE repo = ?1 AND stream = ?2",
+                            rusqlite::params![repo, stream.as_str()],
+                        )
+                        .map_err(|e| classify_sql(&e))?;
+                }
             }
             Msg::Stats {
                 repo,
@@ -2501,7 +3002,7 @@ fn writer(
 fn apply_rows(
     archive: &mut RwArchive,
     now: &Rfc3339Utc,
-    rows: &[PrBundle],
+    rows: &[Bundle],
     t: &mut RepoTally,
 ) -> Result<()> {
     if rows.is_empty() {
@@ -2581,24 +3082,55 @@ fn advance_state(
 }
 
 fn upsert_quarantine(tx: &rusqlite::Transaction, repo: &str, q: &QuarantineRecord) -> Result<()> {
+    // `stream` updates on conflict for completeness, but it cannot actually
+    // flip: node ids are globally unique, so an id re-quarantined by the
+    // other stream would mean discovery itself mislabeled it. Detecting
+    // that cannot-happen here was considered and declined (D1 panel, S5):
+    // a WHERE on the conflict arm turns a mismatch into a silent no-op
+    // (worse), and a SELECT-and-compare per quarantine write prices every
+    // real failure for a bug no flow constructs — the milestone-5 stats
+    // consistency audit is the named detector home, as for comment-id
+    // reuse (upsert_comment).
     exec(
         tx,
-        "INSERT INTO quarantine (id, repo, attempts, next_retry_at, error_class) \
-         VALUES (?1, ?2, ?3, ?4, ?5) \
+        "INSERT INTO quarantine (id, repo, stream, attempts, next_retry_at, error_class) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
          ON CONFLICT(id) DO UPDATE SET \
+           stream = excluded.stream, \
            attempts = excluded.attempts, \
            next_retry_at = excluded.next_retry_at, \
            error_class = excluded.error_class",
-        rusqlite::params![q.id, repo, q.attempts, q.next_retry_at, q.error_class],
+        rusqlite::params![
+            q.id,
+            repo,
+            q.stream.as_str(),
+            q.attempts,
+            q.next_retry_at,
+            q.error_class
+        ],
     )?;
     Ok(())
 }
 
 // --- the bundle upsert: diff-gated everywhere, witnesses gate the sweeps ---
 
-/// Everything the archive records about one hydrated PR, one transaction
-/// scope (the caller's). Returns nothing; effects land in the tally.
+/// Everything the archive records about one hydrated item, one transaction
+/// scope (the caller's) — dispatched by stream, so a PR bundle and an issue
+/// bundle can never take each other's write path.
 fn apply_bundle(
+    tx: &rusqlite::Transaction,
+    now: &Rfc3339Utc,
+    b: &Bundle,
+    t: &mut RepoTally,
+) -> Result<()> {
+    match b {
+        Bundle::Pr(b) => apply_pr_bundle(tx, now, b, t),
+        Bundle::Issue(b) => apply_issue_bundle(tx, now, b, t),
+    }
+}
+
+/// One hydrated PR's writes. Returns nothing; effects land in the tally.
+fn apply_pr_bundle(
     tx: &rusqlite::Transaction,
     now: &Rfc3339Utc,
     b: &PrBundle,
@@ -2629,6 +3161,68 @@ fn apply_bundle(
     if b.origin == Origin::Reverify && changed {
         // The tier exists to catch quiet mutations; a re-verify whose
         // refetch changed CONTENT found one. Feeds the tier defaults.
+        t.quiet_mutations_found += 1;
+    }
+    Ok(())
+}
+
+/// One hydrated issue's writes: the row (labels/assignees as canonical
+/// JSON), its comments under parent_kind='issue', and the witness-gated
+/// comment sweep. Same tally semantics as [`apply_pr_bundle`]; no
+/// observations rows ever — that table is PR-fields only in both scopes
+/// (DESIGN.md's fence), and no refs — refs are extracted from PRs
+/// (queries.rs HYDRATE_ISSUE records the cut).
+fn apply_issue_bundle(
+    tx: &rusqlite::Transaction,
+    now: &Rfc3339Utc,
+    b: &IssueBundle,
+    t: &mut RepoTally,
+) -> Result<()> {
+    let mut changed = false;
+
+    let (pk, landed_truncated) = upsert_issue_stream(tx, now, b, &mut changed)?;
+
+    let mut seen: HashSet<String> = HashSet::new();
+    for c in &b.issue.comments.nodes {
+        seen.insert(c.id.clone());
+        upsert_comment(
+            tx,
+            "issue",
+            pk,
+            None,
+            "comment",
+            None,
+            &CommentFields::from_node(c),
+            &mut changed,
+        )?;
+    }
+    // The sweep is witness-gated, as everywhere: truncation must never
+    // read as deletion. The gate is the COMMENTS witness alone, not
+    // verified(): witnesses are per connection, and masked labels have no
+    // child rows to sweep — "fixing" this to verified() would silently
+    // skip sweeps on rows with masked labels but fully-paginated
+    // comments (the PR path makes the same per-connection choice).
+    if b.comments_complete {
+        t.soft_deleted += sweep(
+            tx,
+            now,
+            "SELECT id FROM comments WHERE parent_kind='issue' AND parent=?1 \
+             AND kind='comment' AND deleted_at IS NULL",
+            pk,
+            &seen,
+            &mut changed,
+        )?;
+    }
+
+    if changed {
+        t.upserted += 1;
+    } else {
+        t.unchanged += 1;
+    }
+    if landed_truncated {
+        t.truncated += 1;
+    }
+    if b.origin == Origin::Reverify && changed {
         t.quiet_mutations_found += 1;
     }
     Ok(())
@@ -2928,6 +3522,7 @@ fn upsert_children(
             seen_review_comments.insert(c.id.clone());
             upsert_comment(
                 tx,
+                "pr",
                 pk,
                 Some(thread_pk),
                 "review_comment",
@@ -2944,6 +3539,7 @@ fn upsert_children(
         seen_comments.insert(c.id.clone());
         upsert_comment(
             tx,
+            "pr",
             pk,
             None,
             "comment",
@@ -2966,6 +3562,7 @@ fn upsert_children(
             seen_reviews.insert(r.id.clone());
             upsert_comment(
                 tx,
+                "pr",
                 pk,
                 None,
                 "review",
@@ -3268,9 +3865,19 @@ impl<'a> CommentFields<'a> {
     }
 }
 
+/// Keyed on the upstream comment id, which GitHub guarantees globally
+/// unique — the one place this writer leans on an upstream invariant with
+/// no local witness: if an id ever named both a PR comment and an issue
+/// comment, the UPDATE would re-home it whole (parent_kind and parent move
+/// in the same statement — atomic, never a cross-table orphan) but
+/// silently, each hydration flipping it back. The milestone-5 stats
+/// consistency audit is the named place to add the oscillation detector if
+/// that invariant ever cracks.
+#[allow(clippy::too_many_arguments)]
 fn upsert_comment(
     tx: &rusqlite::Transaction,
-    pr_pk: i64,
+    parent_kind: &str,
+    parent_pk: i64,
     thread_pk: Option<i64>,
     kind: &str,
     state: Option<&str>,
@@ -3281,14 +3888,14 @@ fn upsert_comment(
     let author_id = c.author.and_then(|a| a.database_id);
     let existing: Option<(i64, Vec<Option<String>>)> = tx
         .query_row(
-            "SELECT pk, parent, thread, kind, state, author, author_id, author_assoc, body, \
-                    is_minimized, created_at, updated_at, url, deleted_at \
+            "SELECT pk, parent_kind, parent, thread, kind, state, author, author_id, \
+                    author_assoc, body, is_minimized, created_at, updated_at, url, deleted_at \
              FROM comments WHERE id = ?1",
             [c.id],
             |r| {
                 let pk: i64 = r.get(0)?;
                 let mut cols = Vec::new();
-                for i in 1..14 {
+                for i in 1..15 {
                     cols.push(r.get::<_, Option<String>>(i).or_else(|_| {
                         r.get::<_, Option<i64>>(i).map(|v| v.map(|v| v.to_string()))
                     })?);
@@ -3300,7 +3907,8 @@ fn upsert_comment(
         .or_else(none_if_no_rows)
         .map_err(|e| classify_sql(&e))?;
     let new: Vec<Option<String>> = vec![
-        Some(pr_pk.to_string()),
+        Some(parent_kind.to_string()),
+        Some(parent_pk.to_string()),
         thread_pk.map(|x| x.to_string()),
         Some(kind.to_string()),
         state.map(str::to_string),
@@ -3322,10 +3930,11 @@ fn upsert_comment(
                 "INSERT INTO comments (id, parent_kind, parent, thread, kind, state, author, \
                                        author_id, author_assoc, body, is_minimized, created_at, \
                                        updated_at, url, deleted_at) \
-                 VALUES (?1, 'pr', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL)",
                 rusqlite::params![
                     c.id,
-                    pr_pk,
+                    parent_kind,
+                    parent_pk,
                     thread_pk,
                     kind,
                     state,
@@ -3344,11 +3953,12 @@ fn upsert_comment(
             *changed = true;
             exec(
                 tx,
-                "UPDATE comments SET parent=?1, thread=?2, kind=?3, state=?4, author=?5, \
-                   author_id=?6, author_assoc=?7, body=?8, is_minimized=?9, created_at=?10, \
-                   updated_at=?11, url=?12, deleted_at=NULL WHERE pk=?13",
+                "UPDATE comments SET parent_kind=?1, parent=?2, thread=?3, kind=?4, state=?5, \
+                   author=?6, author_id=?7, author_assoc=?8, body=?9, is_minimized=?10, \
+                   created_at=?11, updated_at=?12, url=?13, deleted_at=NULL WHERE pk=?14",
                 rusqlite::params![
-                    pr_pk,
+                    parent_kind,
+                    parent_pk,
                     thread_pk,
                     kind,
                     state,
@@ -3438,6 +4048,233 @@ fn sweep_threads(
     Ok(n)
 }
 
+/// The issue-stream row upsert: diff-gated like upsert_pr, minus the
+/// PR-only machinery (no observations — the fence — and no TailHit carry,
+/// since issues have no inference path: truncated is always this bundle's
+/// own !verified()). Writing hydration_source='stream' takes ownership of
+/// a fill-only 'linked' row — the upgrade direction; the linked writer
+/// cannot take it back (its UPDATE is gated on hydration_source='linked',
+/// upsert_linked_issue below).
+///
+/// labels and assignees are stored as CANONICAL JSON: name/login-sorted,
+/// deduped. GitHub's response order is presentation, not data, and a
+/// canonical form is what keeps the diff gate honest — an order shuffle
+/// upstream must not read as a change (replay idempotence) — and the
+/// stored value deterministic for golden output.
+///
+/// A masked labels connection (schema-nullable; parse.rs) is not up for
+/// recomputation — the same rule as the refs writer under a missing
+/// closing witness: the stored value carries through the diff and the
+/// UPDATE untouched, and only a fresh insert lands NULL (an unknown,
+/// disclosed by the truncated flag the withheld witness already set).
+fn upsert_issue_stream(
+    tx: &rusqlite::Transaction,
+    now: &Rfc3339Utc,
+    b: &IssueBundle,
+    changed: &mut bool,
+) -> Result<(i64, bool)> {
+    let issue = &b.issue;
+    let author = issue.author.as_ref();
+    let landed_truncated = !b.verified();
+
+    let labels: Option<String> = issue.labels.as_ref().map(|c| {
+        let mut names: Vec<&str> = c.nodes.iter().map(|l| l.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        serde_json::to_string(&names).expect("labels are plain data")
+    });
+    let mut assignees: Vec<&str> = issue
+        .assignees
+        .nodes
+        .iter()
+        .map(|a| a.login.as_str())
+        .collect();
+    assignees.sort_unstable();
+    assignees.dedup();
+    let assignees = serde_json::to_string(&assignees).expect("assignees are plain data");
+
+    let existing: Option<(i64, Vec<Option<String>>, Option<String>)> = tx
+        .query_row(
+            "SELECT pk, id, title, state, body, author, author_id, author_assoc, labels, \
+                    assignees, url, created_at, updated_at, hydration_source, truncated, \
+                    deleted_at, verified_at \
+             FROM issues WHERE repo = ?1 AND number = ?2",
+            rusqlite::params![b.repo, issue.number],
+            |r| {
+                let pk: i64 = r.get(0)?;
+                let mut cols = Vec::new();
+                for i in 1..16 {
+                    // Numeric columns read back as text for a uniform diff;
+                    // SQLite's CAST of INTEGER to TEXT is exact.
+                    cols.push(r.get::<_, Option<String>>(i).or_else(|_| {
+                        r.get::<_, Option<i64>>(i).map(|v| v.map(|v| v.to_string()))
+                    })?);
+                }
+                let verified_at: Option<String> = r.get(16)?;
+                Ok((pk, cols, verified_at))
+            },
+        )
+        .map(Some)
+        .or_else(none_if_no_rows)
+        .map_err(|e| classify_sql(&e))?;
+
+    match existing {
+        None => {
+            *changed = true;
+            let verified_at = if b.verified() {
+                Some(now.as_str())
+            } else {
+                None
+            };
+            exec(
+                tx,
+                "INSERT INTO issues (id, repo, number, title, state, body, author, author_id, \
+                                     author_assoc, labels, assignees, url, created_at, \
+                                     updated_at, hydration_source, truncated, verified_at, \
+                                     synced_at, deleted_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                         ?15, ?16, ?17, ?18, NULL)",
+                rusqlite::params![
+                    issue.id,
+                    b.repo,
+                    issue.number,
+                    issue.title,
+                    issue.state,
+                    issue.body,
+                    author.map(|a| a.login.as_str()),
+                    author.and_then(|a| a.database_id),
+                    issue.author_association,
+                    labels,
+                    assignees,
+                    issue.url,
+                    issue.created_at.as_str(),
+                    issue.updated_at.as_str(),
+                    HydrationSource::Stream.as_str(),
+                    landed_truncated,
+                    verified_at,
+                    now.as_str(),
+                ],
+            )?;
+            Ok((tx.last_insert_rowid(), landed_truncated))
+        }
+        Some((pk, old_cols, old_verified_at)) => {
+            let names = [
+                "id",
+                "title",
+                "state",
+                "body",
+                "author",
+                "author_id",
+                "author_assoc",
+                "labels",
+                "assignees",
+                "url",
+                "created_at",
+                "updated_at",
+                "hydration_source",
+                "truncated",
+                "deleted_at",
+            ];
+            let old: HashMap<&str, &Option<String>> =
+                names.iter().copied().zip(old_cols.iter()).collect();
+            // The masked-labels carry (doc above): the stored value stands
+            // in for the unfetchable one, in the diff and the UPDATE both.
+            let labels_row = labels.clone().or_else(|| old["labels"].clone());
+            let new: Vec<(&str, Option<String>)> = vec![
+                ("id", Some(issue.id.clone())),
+                ("title", Some(issue.title.clone())),
+                ("state", Some(issue.state.clone())),
+                ("body", Some(issue.body.clone())),
+                ("author", author.map(|a| a.login.as_str().to_string())),
+                (
+                    "author_id",
+                    author.and_then(|a| a.database_id).map(|i| i.to_string()),
+                ),
+                ("author_assoc", Some(issue.author_association.clone())),
+                ("labels", labels_row.clone()),
+                ("assignees", Some(assignees.clone())),
+                ("url", Some(issue.url.clone())),
+                ("created_at", Some(issue.created_at.as_str().to_string())),
+                ("updated_at", Some(issue.updated_at.as_str().to_string())),
+                (
+                    "hydration_source",
+                    Some(HydrationSource::Stream.as_str().to_string()),
+                ),
+                ("truncated", Some(i64::from(landed_truncated).to_string())),
+                ("deleted_at", None),
+            ];
+            let mut field_changed = false;
+            for (name, new_val) in &new {
+                if old[*name] != new_val {
+                    field_changed = true;
+                }
+            }
+            // verified_at moves only when it says something new — the
+            // upsert_pr rule verbatim (module docs). The never-verified
+            // arm is defensive here exactly as it is there: this writer's
+            // own insert stamps or marks truncated, and the one other
+            // writer ('linked' fill) leaves verified_at NULL only on rows
+            // whose upgrade must flip hydration_source — which trips
+            // field_changed first. Its mutants are equivalent by that
+            // precondition, and stay; the arm itself stays because the
+            // precondition lives in ANOTHER function's SQL. The truncated
+            // arm co-fires with field_changed for the same reason (a
+            // healing walk flips the stored truncated column, a diffed
+            // field) — load-bearing only on the PR side, where the
+            // TailHit carry can hold the column still; kept for rule
+            // parity, mutants equivalent. Targeted is unreachable on the
+            // issue path today (--pr is PR-only by verb contract) —
+            // written for rule parity, so a future --issue lands on the
+            // decided policy instead of re-deriving it; its mutants are
+            // equivalent by the same argument.
+            let stamp = b.verified()
+                && (field_changed
+                    || old_verified_at.is_none()
+                    || old["truncated"].as_deref() == Some("1")
+                    || b.origin == Origin::Reverify
+                    || b.origin == Origin::Targeted);
+            if field_changed {
+                *changed = true;
+            }
+            if field_changed || stamp {
+                let verified_at = if stamp {
+                    Some(now.as_str().to_string())
+                } else {
+                    old_verified_at
+                };
+                exec(
+                    tx,
+                    "UPDATE issues SET id=?1, title=?2, state=?3, body=?4, author=?5, \
+                       author_id=?6, author_assoc=?7, labels=?8, assignees=?9, url=?10, \
+                       created_at=?11, updated_at=?12, hydration_source=?13, \
+                       truncated=?14, verified_at=?15, synced_at=?16, deleted_at=NULL \
+                     WHERE pk = ?17",
+                    rusqlite::params![
+                        issue.id,
+                        issue.title,
+                        issue.state,
+                        issue.body,
+                        author.map(|a| a.login.as_str()),
+                        author.and_then(|a| a.database_id),
+                        issue.author_association,
+                        labels_row,
+                        assignees,
+                        issue.url,
+                        issue.created_at.as_str(),
+                        issue.updated_at.as_str(),
+                        HydrationSource::Stream.as_str(),
+                        landed_truncated,
+                        verified_at,
+                        now.as_str(),
+                        pk,
+                    ],
+                )?;
+            }
+            Ok((pk, landed_truncated))
+        }
+    }
+}
+
 fn upsert_linked_issue(
     tx: &rusqlite::Transaction,
     now: &Rfc3339Utc,
@@ -3446,13 +4283,33 @@ fn upsert_linked_issue(
 ) -> Result<()> {
     let repo = issue.repository.name_with_owner.to_ascii_lowercase();
     let author = issue.author.as_ref();
+    // A linked reference is a live API sighting: GitHub just rendered this
+    // issue's node inside a PR's closingIssuesReferences, standing evidence
+    // the id resolves to something the viewer can see — exactly what a
+    // node:null drain concluded was gone. Presence is not content, so the
+    // resurrect deliberately crosses the hydration_source boundary (a
+    // drained STREAM row revives here too; its content refreshes on its
+    // next discovery or re-verify) while the content freshen below keeps
+    // its 'linked'-only gate. Conflicting evidence can alternate this
+    // across runs (direct lookup null, connection rendering it) — each
+    // flip is evidence-driven and counted (soft_deleted), never a guess.
+    // Diff-gated by the WHERE, like every write here.
+    let revived = exec(
+        tx,
+        "UPDATE issues SET deleted_at = NULL \
+         WHERE repo = ?1 AND number = ?2 AND deleted_at IS NOT NULL",
+        rusqlite::params![repo, issue.number],
+    )?;
+    if revived > 0 {
+        *changed = true;
+    }
     let inserted = exec(
         tx,
         "INSERT INTO issues (id, repo, number, title, state, body, author, author_id, \
                              author_assoc, labels, assignees, url, created_at, updated_at, \
                              hydration_source, truncated, verified_at, synced_at, deleted_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, NULL, ?11, 'linked', \
-                 0, NULL, ?12, NULL) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, NULL, ?11, ?12, \
+                 0, NULL, ?13, NULL) \
          ON CONFLICT(repo, number) DO NOTHING",
         rusqlite::params![
             issue.id,
@@ -3466,9 +4323,16 @@ fn upsert_linked_issue(
             issue.author_association,
             issue.url,
             issue.updated_at.as_str(),
+            HydrationSource::Linked.as_str(),
             now.as_str()
         ],
     )?;
+    // The early return's comparison mutants are known-equivalent, and
+    // stay: an insert-as-the-run's-only-change would need an absent row
+    // beside an otherwise-unchanged PR, which no flow constructs (a PR's
+    // first contact is itself a change, and rows never hard-delete), and
+    // the mutant's fall-through freshen no-ops against the just-inserted
+    // values.
     if inserted > 0 {
         *changed = true;
         return Ok(());
@@ -3477,7 +4341,7 @@ fn upsert_linked_issue(
     let n = exec(
         tx,
         "UPDATE issues SET title=?1, state=?2, body=?3, updated_at=?4, synced_at=?5 \
-         WHERE repo=?6 AND number=?7 AND hydration_source='linked' \
+         WHERE repo=?6 AND number=?7 AND hydration_source=?8 \
            AND (title IS NOT ?1 OR state IS NOT ?2 OR body IS NOT ?3 OR updated_at IS NOT ?4)",
         rusqlite::params![
             issue.title,
@@ -3486,7 +4350,8 @@ fn upsert_linked_issue(
             issue.updated_at.as_str(),
             now.as_str(),
             repo,
-            issue.number
+            issue.number,
+            HydrationSource::Linked.as_str()
         ],
     )?;
     if n > 0 {
@@ -3676,6 +4541,13 @@ fn run_targeted(cfg: &Config, archive: &mut RwArchive, reference: &str) -> Resul
         false
     }) {
         HydrateEnd::Bundle(bundle) => {
+            // hydrate_one constructs Pr bundles only; the match keeps the
+            // targeted path total if that ever changes.
+            let Bundle::Pr(bundle) = bundle else {
+                return Err(Error::internal(
+                    "targeted PR hydration produced a non-PR bundle",
+                ));
+            };
             if let Some(author) = &bundle.pr.author {
                 let bot_excluded = author.is_bot() && !rc.bots();
                 let listed = rc
@@ -3701,7 +4573,7 @@ fn run_targeted(cfg: &Config, archive: &mut RwArchive, reference: &str) -> Resul
                 .conn_mut()
                 .transaction()
                 .map_err(|e| classify_sql(&e))?;
-            apply_bundle(&tx, &now, &bundle, &mut t)?;
+            apply_pr_bundle(&tx, &now, &bundle, &mut t)?;
             exec(
                 &tx,
                 "DELETE FROM quarantine WHERE id = ?1",
@@ -3793,7 +4665,8 @@ fn quarantine_targeted(
     attempts: u32,
     class: &str,
 ) -> Result<()> {
-    let record = quarantine_record_at(now, id, attempts, class);
+    // --pr is PR-only by its verb contract; the record's stream follows.
+    let record = quarantine_record_at(now, id, Stream::Pr, attempts, class);
     let tx = archive
         .conn_mut()
         .transaction()
@@ -4064,20 +4937,79 @@ mod tests {
         let boundary = 1_782_864_000 + 7 * 86_400 + 457_686;
 
         let before = Rfc3339Utc::from_epoch(boundary - 1).unwrap();
-        let due = reverify_due(conn, "o/n", &cfg, &before, &quarantined).unwrap();
+        let rc = cfg.repos[0].resolved();
+        let due = reverify_due(conn, "o/n", &rc, &cfg, &before, &quarantined, false).unwrap();
         assert_eq!(
             due,
-            vec![("PR_2".to_string(), 2)],
+            vec![("PR_2".to_string(), 2, Stream::Pr)],
             "one second early: only the never-verified row is due"
         );
 
         let at = Rfc3339Utc::from_epoch(boundary).unwrap();
-        let due = reverify_due(conn, "o/n", &cfg, &at, &quarantined).unwrap();
+        let due = reverify_due(conn, "o/n", &rc, &cfg, &at, &quarantined, false).unwrap();
         assert_eq!(
             due,
-            vec![("PR_2".to_string(), 2), ("PR_1".to_string(), 1)],
+            vec![
+                ("PR_2".to_string(), 2, Stream::Pr),
+                ("PR_1".to_string(), 1, Stream::Pr)
+            ],
             "at the jittered boundary the aged row joins, after the NULL"
         );
+        drop(archive);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The issue tiers: only stream-owned rows enter the schedule (a linked
+    // row is a fill-only cache — re-verifying it would widen working scope
+    // into the issue hydration DESIGN.md forbids), quarantine excludes as
+    // for PRs, and the closed tier bounds by updated_at (the containment
+    // argument at reverify_due). Off means off: no issue rows, whatever
+    // the table holds.
+    #[test]
+    fn reverify_due_issue_tiers_respect_source_and_gate() {
+        let dir = std::env::temp_dir().join(format!("ghgraph-reverify-iss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let archive = crate::db::open_rw(&dir.join("g.db")).unwrap();
+        let conn = archive.conn();
+        let insert = |id: &str, number: i64, state: &str, source: &str, updated: &str| {
+            conn.execute(
+                "INSERT INTO issues (id, repo, number, title, state, body, url, updated_at, \
+                                     hydration_source, synced_at) \
+                 VALUES (?1, 'o/n', ?2, 't', ?3, '', 'u', ?4, ?5, '2026-06-01T00:00:00Z')",
+                rusqlite::params![id, number, state, updated, source],
+            )
+            .unwrap();
+        };
+        insert("I_1", 1, "OPEN", "stream", "2026-06-01T00:00:00Z");
+        insert("I_2", 2, "OPEN", "linked", "2026-06-01T00:00:00Z"); // cache: never
+        insert("I_3", 3, "OPEN", "stream", "2026-06-01T00:00:00Z"); // quarantined
+        insert("I_4", 4, "CLOSED", "stream", "2026-07-01T00:00:00Z"); // in lookback
+        insert("I_5", 5, "CLOSED", "stream", "2020-01-01T00:00:00Z"); // beyond it
+        // In the PER-REPO lookback (90d) but outside the global (30d):
+        // the closed tier's floor must resolve the repo's own override,
+        // exactly as discovery does (the D1 panel's out-of-scope catch,
+        // pulled in because the issue tier was born with it).
+        insert("I_6", 6, "CLOSED", "stream", "2026-05-01T00:00:00Z");
+
+        let cfg = cfg(r#"{"viewer":"v","lookback_days":30,
+                "repos":[{"repo":"o/n","scope":"project","lookback_days":90}]}"#);
+        let quarantined: HashSet<String> = [String::from("I_3")].into();
+        let now = Rfc3339Utc::parse("2026-07-10T00:00:00Z").unwrap();
+
+        let rc = cfg.repos[0].resolved();
+        let due = reverify_due(conn, "o/n", &rc, &cfg, &now, &quarantined, true).unwrap();
+        assert_eq!(
+            due,
+            vec![
+                ("I_1".to_string(), 1, Stream::Issue),
+                ("I_4".to_string(), 4, Stream::Issue),
+                ("I_6".to_string(), 6, Stream::Issue)
+            ],
+            "stream-owned, unquarantined, and (for CLOSED) within the \
+             repo's EFFECTIVE lookback only"
+        );
+        let due = reverify_due(conn, "o/n", &rc, &cfg, &now, &quarantined, false).unwrap();
+        assert_eq!(due, Vec::new(), "issue stream off: no issue re-verify");
         drop(archive);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4087,9 +5019,9 @@ mod tests {
     #[test]
     fn quarantine_backoff_doubles_and_caps() {
         let now = Rfc3339Utc::parse("2026-07-01T00:00:00Z").unwrap();
-        let r1 = quarantine_record_at(&now, "X", 1, "transient");
-        let r2 = quarantine_record_at(&now, "X", 2, "transient");
-        let r9 = quarantine_record_at(&now, "X", 9, "transient");
+        let r1 = quarantine_record_at(&now, "X", Stream::Pr, 1, "transient");
+        let r2 = quarantine_record_at(&now, "X", Stream::Pr, 2, "transient");
+        let r9 = quarantine_record_at(&now, "X", Stream::Pr, 9, "transient");
         assert_eq!(r1.next_retry_at, "2026-07-01T01:00:00Z", "base 1h");
         assert_eq!(r2.next_retry_at, "2026-07-01T02:00:00Z", "doubled");
         assert_eq!(r9.next_retry_at, "2026-07-08T00:00:00Z", "capped at 7d");

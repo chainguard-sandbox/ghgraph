@@ -2,13 +2,15 @@
 // recursion limit; raising it is cosmetic, not architectural.
 #![recursion_limit = "256"]
 
-//! The milestone-2 load-bearing suite (ROADMAP): fixture replay with zero
-//! row and zero FTS deltas (including a metadata-only flip proving the FTS
-//! WHEN guards), SIGKILL at arbitrary points (watermark never leads data;
-//! the redo converges), two-process lock contention, floor-injection
-//! deferral across runs (window banking, monotone watermark, no double
-//! hydration of banked windows), a config-transition test per fingerprint
-//! case including person removal, and the quarantine lifecycle.
+//! The sync pipeline's load-bearing suite (ROADMAP milestones 2 and 4):
+//! fixture replay with zero row and zero FTS deltas (including a
+//! metadata-only flip proving the FTS WHEN guards), SIGKILL at arbitrary
+//! points (watermark never leads data; the redo converges), two-process
+//! lock contention, floor-injection deferral across runs (window banking,
+//! monotone watermark, no double hydration of banked windows), a
+//! config-transition test per fingerprint case including person removal,
+//! the quarantine lifecycle, and the issue stream (stream-typed dispatch,
+//! per-stream watermarks, the linked-cache ownership rule).
 //!
 //! Every test drives the REAL binary (CARGO_BIN_EXE_ghgraph) end to end
 //! with a scripted fake `gh` reached through the child's PATH — the same
@@ -63,10 +65,30 @@ done
 run=$(cat "$dir/run_n" 2>/dev/null || echo 1)
 case "$doc" in
   *'search(type: ISSUE'*)
-    seqf="$dir/disc_seq_$run"; s=$(cat "$seqf" 2>/dev/null || echo 0); echo $((s+1)) > "$seqf"
-    echo "DISC|run=$run|seq=$s|q=$q" >> "$dir/calls.log"
-    resp="$dir/disc-$run-$s.json"
-    [ -f "$resp" ] || resp="$dir/disc-default.json"
+    case "$q" in
+      *'is:issue'*)
+        seqf="$dir/idisc_seq_$run"; s=$(cat "$seqf" 2>/dev/null || echo 0); echo $((s+1)) > "$seqf"
+        echo "IDISC|run=$run|seq=$s|q=$q" >> "$dir/calls.log"
+        resp="$dir/idisc-$run-$s.json"
+        [ -f "$resp" ] || resp="$dir/idisc-default.json"
+        ;;
+      *)
+        seqf="$dir/disc_seq_$run"; s=$(cat "$seqf" 2>/dev/null || echo 0); echo $((s+1)) > "$seqf"
+        echo "DISC|run=$run|seq=$s|q=$q" >> "$dir/calls.log"
+        resp="$dir/disc-$run-$s.json"
+        [ -f "$resp" ] || resp="$dir/disc-default.json"
+        ;;
+    esac
+    ;;
+  *'... on Issue'*'comments(first: 100'*)
+    echo "ICPAGE|run=$run|id=$id|after=$after" >> "$dir/calls.log"
+    resp="$dir/icpage-$id-$after.json"
+    [ -f "$resp" ] || resp="$dir/icpage-$id.json"
+    ;;
+  *'labels(first: 20'*)
+    echo "IHYD|run=$run|id=$id" >> "$dir/calls.log"
+    if [ -f "$dir/stderr-$id" ]; then cat "$dir/stderr-$id" >&2; exit 1; fi
+    resp="$dir/ihyd-$id.json"
     ;;
   *'PullRequestReviewThread'*)
     echo "TBODIES|run=$run|id=$id" >> "$dir/calls.log"
@@ -122,6 +144,11 @@ impl Fake {
         let fake = Fake { dir };
         fake.write_exec("gh", GH_SCRIPT);
         fake.write("user.json", r#"{"login":"viewer"}"#);
+        // The issue stream's discovery default: empty. Present from the
+        // start so a project-scope test that only exercises PRs gets an
+        // empty issue walk instead of a missing-fixture transport failure;
+        // issue tests overwrite it via install_issues.
+        fake.write("idisc-default.json", &discovery(&[], None, 4000));
         fake
     }
 
@@ -196,6 +223,16 @@ impl Fake {
             .iter()
             .filter_map(|l| {
                 l.strip_prefix(&format!("REFRESH|run={run}|id="))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    fn issue_hydrations(&self, run: u32) -> Vec<String> {
+        self.calls()
+            .iter()
+            .filter_map(|l| {
+                l.strip_prefix(&format!("IHYD|run={run}|id="))
                     .map(str::to_string)
             })
             .collect()
@@ -486,7 +523,14 @@ impl Pr {
 }
 
 fn discovery(hits: &[&Pr], issue_count: Option<i64>, remaining: u32) -> String {
-    let nodes: Vec<Value> = hits.iter().map(|p| p.hit()).collect();
+    discovery_nodes(
+        hits.iter().map(|p| p.hit()).collect(),
+        issue_count,
+        remaining,
+    )
+}
+
+fn discovery_nodes(nodes: Vec<Value>, issue_count: Option<i64>, remaining: u32) -> String {
     json!({
         "data": {
             "search": {
@@ -498,6 +542,118 @@ fn discovery(hits: &[&Pr], issue_count: Option<i64>, remaining: u32) -> String {
         }
     })
     .to_string()
+}
+
+/// The issue-stream sibling of [`Pr`]: builds DISCOVERY hits and
+/// HYDRATE_ISSUE responses shaped exactly like the live documents
+/// (parse.rs pins the shape offline; capture.rs re-captures it live).
+struct Issue {
+    id: &'static str,
+    number: i64,
+    updated_at: &'static str,
+    title: String,
+    body: String,
+    state: &'static str,
+    author_login: String,
+    author_type: &'static str,
+    labels: Vec<&'static str>,
+    assignees: Vec<&'static str>,
+    comment_ids: Vec<String>,
+    remaining: u32,
+    repo: String,
+    /// comments pageInfo claims another page (with no cursor to walk):
+    /// the witness-withholding shape.
+    comments_has_next: bool,
+    /// A real follow-up cursor: the walkable multi-page shape.
+    comments_cursor: Option<&'static str>,
+    /// labels arrives error-masked (null): the schema-nullable connection
+    /// GraphQL bubbles a failed sub-resolver into (unlike assignees).
+    mask_labels: bool,
+}
+
+impl Issue {
+    fn new(id: &'static str, number: i64, updated_at: &'static str) -> Issue {
+        Issue {
+            id,
+            number,
+            updated_at,
+            title: format!("issue title {number}"),
+            body: format!("issue body {number}"),
+            state: "OPEN",
+            author_login: "alice".into(),
+            author_type: "User",
+            labels: vec!["bug"],
+            assignees: vec![],
+            comment_ids: vec![format!("IC_{id}")],
+            remaining: 4000,
+            repo: "o/n".into(),
+            comments_has_next: false,
+            comments_cursor: None,
+            mask_labels: false,
+        }
+    }
+
+    fn hit(&self) -> Value {
+        json!({
+            "id": self.id,
+            "updatedAt": self.updated_at,
+            "author": {"login": self.author_login, "__typename": self.author_type}
+        })
+    }
+
+    fn hydration(&self) -> String {
+        let comments: Vec<Value> = self
+            .comment_ids
+            .iter()
+            .map(|cid| {
+                json!({
+                    "id": cid, "body": format!("comment {cid}"),
+                    "createdAt": "2026-07-10T00:00:00Z", "lastEditedAt": null,
+                    "url": "https://github.com/x", "isMinimized": false,
+                    "authorAssociation": "NONE", "author": author("carol", "User")
+                })
+            })
+            .collect();
+        let labels: Value = if self.mask_labels {
+            Value::Null
+        } else {
+            let nodes: Vec<Value> = self.labels.iter().map(|l| json!({"name": l})).collect();
+            json!({"totalCount": nodes.len(), "nodes": nodes})
+        };
+        let assignees: Vec<Value> = self.assignees.iter().map(|a| json!({"login": a})).collect();
+        json!({
+            "data": {
+                "node": {
+                    "id": self.id, "number": self.number, "title": self.title,
+                    "body": self.body, "state": self.state,
+                    "url": format!("https://github.com/{}/issues/{}", self.repo, self.number),
+                    "author": author(&self.author_login, self.author_type),
+                    "authorAssociation": "NONE",
+                    "repository": {"nameWithOwner": self.repo},
+                    "createdAt": "2026-07-01T00:00:00Z",
+                    "updatedAt": self.updated_at,
+                    "labels": labels,
+                    "assignees": {"totalCount": assignees.len(), "nodes": assignees},
+                    "comments": {"totalCount": comments.len() + usize::from(self.comments_has_next),
+                        "pageInfo": {"hasNextPage": self.comments_has_next,
+                                     "endCursor": self.comments_cursor},
+                        "nodes": comments}
+                },
+                "rateLimit": rate_limit(self.remaining)
+            }
+        })
+        .to_string()
+    }
+}
+
+fn install_issues(fake: &Fake, issues: &[&Issue]) {
+    fake.write(
+        "idisc-default.json",
+        &discovery_nodes(issues.iter().map(|i| i.hit()).collect(), None, 4000),
+    );
+    for issue in issues {
+        fake.write(&format!("ihyd-{}.json", issue.id), &issue.hydration());
+    }
 }
 
 fn base_config() -> Value {
@@ -850,6 +1006,16 @@ fn floor_deferral_banks_windows_and_never_rehydrates_them() {
     for pr in [&a1, &a2, &b1, &b2] {
         fake.write(&format!("hyd-{}.json", pr.id), &pr.hydration());
     }
+    // A2 is touched upstream BETWEEN discovery and hydration: its
+    // hydration response carries a far-future updatedAt. The watermark
+    // fold must take the discovery-time value — folding this one would
+    // bank window A past window B before B ever runs, and the deferral
+    // below would then skip B's items forever (D1 panel finding).
+    {
+        let mut drifted: Value = serde_json::from_str(&a2.hydration()).unwrap();
+        drifted["data"]["node"]["updatedAt"] = json!("2026-07-25T00:00:00Z");
+        fake.write("hyd-PR_A2.json", &drifted.to_string());
+    }
     // Run 1: the full window reports capped (issueCount far above the two
     // nodes returned) → split; left half completes (A1, A2 — A2's response
     // drains the budget); right half's discovery defers at the floor.
@@ -863,7 +1029,10 @@ fn floor_deferral_banks_windows_and_never_rehydrates_them() {
     assert_eq!(s["counts"]["fetched"], 2, "window A only");
     let wm: String = fake
         .query_one("SELECT last_item_updated_at FROM sync_state WHERE repo='o/n' AND stream='pr'");
-    assert_eq!(wm, "2026-07-10T06:00:00Z", "banked at window A's boundary");
+    assert_eq!(
+        wm, "2026-07-10T06:00:00Z",
+        "banked at window A's boundary — A2's drifted hydration time never folds"
+    );
     assert_eq!(
         fake.hydrations(1),
         vec!["PR_A1", "PR_A2"],
@@ -1573,10 +1742,11 @@ fn floor_boundary_is_strict() {
 }
 
 // ---------------------------------------------------------------------------
-// 17. The default project-scope config (issues on) syncs its PR stream
-// cleanly: the stream-typed discovery terms keep Issue ids out of PR
-// hydration entirely (the B2 panel's S1 — before the fix, every issue in
-// a project repo became an eternal parse-class quarantine row).
+// 17. Stream-typed dispatch, both directions (the B2 panel's S1, upgraded
+// for milestone 4): the PR walk's terms never carry is:issue and an Issue
+// id never reaches HYDRATE_PR — before the typed terms, every issue in a
+// project repo became an eternal parse-class quarantine row — and,
+// symmetrically, a PR id never reaches HYDRATE_ISSUE.
 
 #[test]
 fn default_project_scope_never_discovers_issues_into_pr_hydration() {
@@ -1590,17 +1760,1003 @@ fn default_project_scope_never_discovers_issues_into_pr_hydration() {
     }));
     let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
     install_prs(&fake, &[&a]);
+    let i = Issue::new("I_9", 9, "2026-07-20T11:00:00Z");
+    install_issues(&fake, &[&i]);
 
     let doc = fake.sync_ok();
     let s = fake.repo_summary(&doc, "o/n");
     assert_eq!(s["health"]["quarantined"], 0, "{s}");
-    assert_eq!(s["counts"]["fetched"], 1);
+    assert_eq!(s["counts"]["fetched"], 2, "one PR + one issue");
+    assert_eq!(fake.hydrations(1), vec!["PR_1"], "PR walk: PR ids only");
+    assert_eq!(
+        fake.issue_hydrations(1),
+        vec!["I_9"],
+        "issue walk: issue ids only, through HYDRATE_ISSUE"
+    );
     for call in fake.calls() {
-        assert!(
-            !call.contains("is:issue"),
-            "the milestone-2 PR walk must never emit an issue term: {call}"
+        if call.starts_with("DISC|") {
+            assert!(
+                !call.contains("is:issue"),
+                "the PR walk must never emit an issue term: {call}"
+            );
+        }
+        if call.starts_with("IDISC|") {
+            assert!(
+                call.contains("is:issue"),
+                "the issue walk's terms are issue-typed: {call}"
+            );
+        }
+    }
+}
+
+// 17a. The issue stream end to end: hydration writes the row (labels and
+// assignees canonical), its comments land under parent_kind='issue', FTS
+// serves them, the (repo,'issue') watermark advances independently of the
+// PR stream's, and an unchanged replay writes nothing — the same replay
+// idempotence bar the PR stream clears.
+
+#[test]
+fn issue_stream_hydrates_populates_fts_and_replays_clean() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}],
+        "workers": 1,
+        "retry_attempts": 1,
+        "retry_budget": 5
+    }));
+    let pr = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    install_prs(&fake, &[&pr]);
+    let mut a = Issue::new("I_1", 11, "2026-07-20T12:00:00Z");
+    a.labels = vec!["zeta", "bug", "bug"]; // canonicalized: sorted, deduped
+    a.assignees = vec!["bob"];
+    a.body = "the frobnicator misfires".into();
+    let b = Issue::new("I_2", 12, "2026-07-19T09:00:00Z");
+    install_issues(&fake, &[&a, &b]);
+
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["counts"]["fetched"], 3, "{s}");
+    assert_eq!(
+        s["health"],
+        json!({
+            "truncated": 0, "quarantined": 0, "discovery_truncated": 0,
+            "deferred_at_floor": false, "watchdog_kills": 0, "masked_hits": 0,
+            "rate_limit_unknown": 0, "errors": []
+        })
+    );
+
+    let labels: String = fake.query_one(
+        "SELECT labels FROM issues WHERE repo='o/n' AND number=11 AND hydration_source='stream'",
+    );
+    assert_eq!(labels, r#"["bug","zeta"]"#, "canonical: sorted, deduped");
+    let assignees: String =
+        fake.query_one("SELECT assignees FROM issues WHERE repo='o/n' AND number=11");
+    assert_eq!(assignees, r#"["bob"]"#);
+    let verified: i64 = fake.query_one(
+        "SELECT count(*) FROM issues WHERE repo='o/n' AND hydration_source='stream' \
+         AND verified_at IS NOT NULL AND truncated = 0",
+    );
+    assert_eq!(verified, 2, "witnessed hydrations stamp");
+    let issue_comments: i64 = fake.query_one(
+        "SELECT count(*) FROM comments c JOIN issues i ON c.parent = i.pk \
+         WHERE c.parent_kind = 'issue' AND i.repo = 'o/n' AND i.number IN (11, 12)",
+    );
+    assert_eq!(issue_comments, 2);
+    let fts_hits: i64 =
+        fake.query_one("SELECT count(*) FROM issues_fts WHERE issues_fts MATCH 'frobnicator'");
+    assert_eq!(fts_hits, 1, "the stream writer feeds issues_fts");
+
+    // Per-stream watermarks: each stream's max updatedAt, independently.
+    let pr_wm: String = fake
+        .query_one("SELECT last_item_updated_at FROM sync_state WHERE repo='o/n' AND stream='pr'");
+    let issue_wm: String = fake.query_one(
+        "SELECT last_item_updated_at FROM sync_state WHERE repo='o/n' AND stream='issue'",
+    );
+    assert_eq!(pr_wm, "2026-07-20T10:00:00Z");
+    assert_eq!(issue_wm, "2026-07-20T12:00:00Z");
+
+    assert_eq!(s["counts"]["upserted"], 3, "first contact writes each row");
+
+    // Backdate the issue stamps (well inside the re-verify period, so
+    // nothing is due): the replay must not move them — the PR-side stamp
+    // rule, held on the issue path (upsert_issue_stream).
+    let recent = ghgraph::time::Rfc3339Utc::now()
+        .checked_sub_days(2)
+        .unwrap();
+    fake.db()
+        .execute(
+            "UPDATE issues SET verified_at = ?1 WHERE hydration_source = 'stream'",
+            rusqlite::params![recent.as_str()],
+        )
+        .unwrap();
+
+    // Replay: an unchanged remote writes no row, no observation, no FTS
+    // churn — and re-hydrates nothing it already full-walked... it DOES
+    // re-hydrate (the overlap window rediscovers), but the diff gate makes
+    // every write a no-op.
+    let dump1 = fake.dump();
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["counts"]["upserted"], 0, "replay upserts nothing: {s}");
+    assert_eq!(s["counts"]["unchanged"], 3, "every replayed row is a no-op");
+    let stamps: i64 = fake.query_one(&format!(
+        "SELECT count(*) FROM issues WHERE hydration_source = 'stream' AND verified_at = '{}'",
+        recent.as_str()
+    ));
+    assert_eq!(stamps, 2, "replay must not move issue verified_at");
+    assert_eq!(dump1, fake.dump(), "byte-identical archive after replay");
+
+    // A real change on a verified, untruncated row: the witnessed refetch
+    // both writes the field and MOVES the stamp — the field_changed arm of
+    // the stamp rule standing alone (no truncation, no re-verify origin).
+    let mut a2 = Issue::new("I_1", 11, "2026-07-23T00:00:00Z");
+    a2.labels = vec!["zeta", "bug", "bug"];
+    a2.assignees = vec!["bob"];
+    a2.body = "the frobnicator misfires".into();
+    a2.title = "retitled upstream".into();
+    install_issues(&fake, &[&a2, &b]);
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["counts"]["upserted"], 1, "{s}");
+    let (title, verified_at): (String, Option<String>) = fake
+        .db()
+        .query_row(
+            "SELECT title, verified_at FROM issues WHERE repo='o/n' AND number=11",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(title, "retitled upstream");
+    assert_ne!(
+        verified_at.as_deref(),
+        Some(recent.as_str()),
+        "a changed witnessed refetch re-stamps"
+    );
+}
+
+// 17a'. Off means off, at both gates: a project repo with issues: false
+// runs no issue discovery (zero IDISC calls — the walk gate) and grows no
+// (repo,'issue') sync_state row (the plan gate; an empty walk would still
+// commit one, flipping _meta config_pending forever). The discriminating
+// input for the plan-gate's && — either operand alone would pass a
+// project-with-issues-off config through.
+
+#[test]
+fn issues_off_project_repo_runs_no_issue_stream() {
+    let fake = Fake::new();
+    fake.config(&base_config()); // project scope, issues: false
+    let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    install_prs(&fake, &[&a]);
+    let i = Issue::new("I_1", 11, "2026-07-20T11:00:00Z");
+    install_issues(&fake, &[&i]); // present but must never be asked for
+
+    fake.sync_ok();
+    assert!(
+        fake.calls().iter().all(|c| !c.starts_with("IDISC|")),
+        "issues off: no issue discovery call"
+    );
+    let issue_rows: i64 =
+        fake.query_one("SELECT count(*) FROM sync_state WHERE repo='o/n' AND stream='issue'");
+    assert_eq!(issue_rows, 0, "issues off: no issue stream state row");
+}
+
+// 17b. Issue-stream filters: a bot-authored issue is skipped at discovery
+// (no hydration subprocess), counted as filtered, and STILL advances the
+// issue watermark — declined, not unfetched, exactly the PR-stream rule.
+
+#[test]
+fn issue_stream_filters_bots_and_still_advances() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}], // bots default OFF
+        "workers": 1,
+        "retry_attempts": 1,
+        "retry_budget": 5
+    }));
+    install_prs(&fake, &[]);
+    let mut bot = Issue::new("I_B", 21, "2026-07-22T00:00:00Z");
+    bot.author_login = "dependabot".into();
+    bot.author_type = "Bot";
+    let human = Issue::new("I_H", 22, "2026-07-21T00:00:00Z");
+    install_issues(&fake, &[&bot, &human]);
+
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["counts"]["filtered"], 1, "{s}");
+    assert_eq!(s["counts"]["fetched"], 1);
+    assert_eq!(
+        fake.issue_hydrations(1),
+        vec!["I_H"],
+        "the filtered issue costs discovery only"
+    );
+    let issue_wm: String = fake.query_one(
+        "SELECT last_item_updated_at FROM sync_state WHERE repo='o/n' AND stream='issue'",
+    );
+    assert_eq!(
+        issue_wm, "2026-07-22T00:00:00Z",
+        "the bot issue's updatedAt advances the fold: filtered is declined, not unfetched"
+    );
+}
+
+// 17c. The linked-cache upgrade, both directions of the ownership rule:
+// stream hydration takes over a fill-only 'linked' row (labels land,
+// verified_at stamps), and the linked writer can never downgrade it back —
+// a later PR sync carrying staler linked data leaves the stream row
+// untouched.
+
+#[test]
+fn issue_stream_upgrades_linked_rows_and_linked_never_downgrades() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}],
+        "workers": 1,
+        "retry_attempts": 1,
+        "retry_budget": 5
+    }));
+    // Run 1: PRs only. PR_1's closingIssuesReferences plants the linked
+    // cache row for issue number 101 (Pr::hydration's fixture shape).
+    let pr = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    install_prs(&fake, &[&pr]);
+    fake.write("idisc-1-0.json", &discovery_nodes(vec![], None, 4000));
+    fake.sync_ok();
+    let source: String =
+        fake.query_one("SELECT hydration_source FROM issues WHERE repo='o/n' AND number=101");
+    assert_eq!(source, "linked");
+
+    // Run 1b: the linked TARGET changes upstream while the PR itself does
+    // not — the freshen is the run's only write, and it must both land
+    // and count (a linked-owned row is this writer's to keep fresh).
+    {
+        let mut refreshed: Value = serde_json::from_str(&pr.refresh()).unwrap();
+        refreshed["data"]["node"]["closingIssuesReferences"]["nodes"][0]["title"] =
+            json!("fresher linked title");
+        fake.write("refresh-PR_1.json", &refreshed.to_string());
+    }
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["counts"]["upserted"], 1, "the freshen counts: {s}");
+    let title: String = fake.query_one("SELECT title FROM issues WHERE repo='o/n' AND number=101");
+    assert_eq!(title, "fresher linked title");
+    fake.write("refresh-PR_1.json", &pr.refresh());
+
+    // Run 2: the issue stream discovers the same issue; hydration upgrades.
+    let mut upstream = Issue::new("I_PR_1", 101, "2026-07-22T00:00:00Z");
+    upstream.title = "stream-owned title".into();
+    upstream.labels = vec!["triaged"];
+    install_issues(&fake, &[&upstream]);
+    fake.sync_ok();
+    let (source, title, labels, verified_at): (String, String, String, Option<String>) = fake
+        .db()
+        .query_row(
+            "SELECT hydration_source, title, labels, verified_at FROM issues \
+             WHERE repo='o/n' AND number=101",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(source, "stream", "hydration takes ownership");
+    assert_eq!(title, "stream-owned title");
+    assert_eq!(labels, r#"["triaged"]"#);
+    assert!(verified_at.is_some(), "witnessed upgrade stamps");
+
+    // Final run: PRs only again (issue stream empty this run); the PR's
+    // linked reference still carries the OLD title — the fill-only writer
+    // must not clobber the stream row with it. (Run 4: run 1b above
+    // shifted the numbering.)
+    fake.write("idisc-4-0.json", &discovery_nodes(vec![], None, 4000));
+    fake.sync_ok();
+    let title: String = fake.query_one("SELECT title FROM issues WHERE repo='o/n' AND number=101");
+    assert_eq!(
+        title, "stream-owned title",
+        "linked data never downgrades a stream row"
+    );
+}
+
+// 17d. Issue truncation discipline: a comments walk that cannot terminate
+// lands the row truncated with no verified_at and sweeps nothing; the next
+// run's complete walk heals it — witnessed, stamped, swept.
+
+#[test]
+fn issue_truncation_never_sweeps_and_heals_on_the_complete_walk() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}],
+        "workers": 1,
+        "retry_attempts": 1,
+        "retry_budget": 5
+    }));
+    install_prs(&fake, &[]);
+    // Run 1: complete — two comments land.
+    let mut a = Issue::new("I_1", 11, "2026-07-20T00:00:00Z");
+    a.comment_ids = vec!["IC_1".into(), "IC_2".into()];
+    install_issues(&fake, &[&a]);
+    fake.sync_ok();
+    let live: i64 = fake.query_one(
+        "SELECT count(*) FROM comments WHERE parent_kind='issue' AND deleted_at IS NULL",
+    );
+    assert_eq!(live, 2);
+    // Pin the run-1 stamp to a known marker: run 2 changes fields but is
+    // unwitnessed, and an unwitnessed write must never move verified_at —
+    // exactly (not just "still set"), or the stamp gate's `verified() &&`
+    // could silently become `||`.
+    let marker = ghgraph::time::Rfc3339Utc::now()
+        .checked_sub_days(2)
+        .unwrap();
+    fake.db()
+        .execute(
+            "UPDATE issues SET verified_at = ?1",
+            rusqlite::params![marker.as_str()],
+        )
+        .unwrap();
+
+    // Run 2: the remote claims another page but offers no cursor — the
+    // witness-withholding shape — and one comment is missing from the
+    // nodes. Truncation must not read as deletion.
+    let mut t = Issue::new("I_1", 11, "2026-07-21T00:00:00Z");
+    t.comment_ids = vec!["IC_1".into()];
+    t.comments_has_next = true;
+    install_issues(&fake, &[&t]);
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["truncated"], 1, "{s}");
+    let (truncated, verified_at): (i64, Option<String>) = fake
+        .db()
+        .query_row(
+            "SELECT truncated, verified_at FROM issues WHERE repo='o/n' AND number=11",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(truncated, 1);
+    assert_eq!(
+        verified_at.as_deref(),
+        Some(marker.as_str()),
+        "an unwitnessed hydration carries the stamp, to the byte"
+    );
+    let live: i64 = fake.query_one(
+        "SELECT count(*) FROM comments WHERE parent_kind='issue' AND deleted_at IS NULL",
+    );
+    assert_eq!(live, 2, "an incomplete connection sweeps nothing");
+
+    // Run 3: complete again, and IC_2 is genuinely gone upstream — the
+    // witnessed walk heals truncated and sweeps softly.
+    let mut h = Issue::new("I_1", 11, "2026-07-22T00:00:00Z");
+    h.comment_ids = vec!["IC_1".into()];
+    install_issues(&fake, &[&h]);
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["counts"]["soft_deleted"], 1, "{s}");
+    let truncated: i64 =
+        fake.query_one("SELECT truncated FROM issues WHERE repo='o/n' AND number=11");
+    assert_eq!(truncated, 0, "the complete refetch heals truncation");
+    let deleted: i64 = fake.query_one(
+        "SELECT count(*) FROM comments WHERE parent_kind='issue' AND deleted_at IS NOT NULL",
+    );
+    assert_eq!(deleted, 1, "soft delete: the row stays, dated");
+}
+
+// 17d'. A masked labels connection (schema-nullable; the D1 panel finding)
+// is a withheld witness, not data: the row lands truncated with the STORED
+// labels carried — never overwritten with "no labels", never a parse-class
+// quarantine — and the next unmasked walk heals it.
+
+#[test]
+fn masked_labels_carry_stored_value_and_heal() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}],
+        "workers": 1,
+        "retry_attempts": 1,
+        "retry_budget": 5
+    }));
+    install_prs(&fake, &[]);
+    let mut a = Issue::new("I_1", 11, "2026-07-20T00:00:00Z");
+    a.labels = vec!["bug", "triaged"];
+    install_issues(&fake, &[&a]);
+    fake.sync_ok();
+
+    let mut m = Issue::new("I_1", 11, "2026-07-21T00:00:00Z");
+    m.mask_labels = true;
+    install_issues(&fake, &[&m]);
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["quarantined"], 0, "a mask is not drift: {s}");
+    assert_eq!(s["health"]["truncated"], 1, "{s}");
+    let labels: String = fake.query_one("SELECT labels FROM issues WHERE repo='o/n' AND number=11");
+    assert_eq!(
+        labels, r#"["bug","triaged"]"#,
+        "the stored labels carry through the mask"
+    );
+
+    let mut h = Issue::new("I_1", 11, "2026-07-22T00:00:00Z");
+    h.labels = vec!["bug"];
+    install_issues(&fake, &[&h]);
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["truncated"], 0, "{s}");
+    let (labels, truncated): (String, i64) = fake
+        .db()
+        .query_row(
+            "SELECT labels, truncated FROM issues WHERE repo='o/n' AND number=11",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(labels, r#"["bug"]"#, "the unmasked walk recomputes");
+    assert_eq!(truncated, 0, "and heals the truncation");
+}
+
+// 17e. Issue quarantine round-trips through the stream column: a failed
+// issue hydration quarantines with stream='issue', and the retry
+// resurrects it through HYDRATE_ISSUE — never HYDRATE_PR, which would
+// parse-fail forever (the drain would also hit the wrong table).
+
+#[test]
+fn issue_quarantine_retries_through_the_issue_document() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}],
+        "workers": 1,
+        "retry_attempts": 1,
+        "retry_budget": 5
+    }));
+    install_prs(&fake, &[]);
+    let a = Issue::new("I_1", 11, "2026-07-20T00:00:00Z");
+    install_issues(&fake, &[&a]);
+    fake.write("stderr-I_1", "boom: transient trouble");
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["quarantined"], 1, "{s}");
+    let stream: String = fake.query_one("SELECT stream FROM quarantine WHERE id = 'I_1'");
+    assert_eq!(stream, "issue");
+
+    // Make the retry due, clear the fault, and re-run: the retry must
+    // dispatch through HYDRATE_ISSUE and the row must land whole.
+    fake.remove("stderr-I_1");
+    fake.db()
+        .execute(
+            "UPDATE quarantine SET next_retry_at = '2020-01-01T00:00:00Z' WHERE id = 'I_1'",
+            [],
+        )
+        .unwrap();
+    fake.sync_ok();
+    assert_eq!(
+        fake.issue_hydrations(2),
+        vec!["I_1"],
+        "the window walk skips quarantined ids (backoff dominates); the one \
+         hydration is the retry, through the issue document"
+    );
+    assert_eq!(fake.hydrations(2), Vec::<String>::new());
+    let quarantined: i64 = fake.query_one("SELECT count(*) FROM quarantine");
+    assert_eq!(quarantined, 0, "resolution deletes the record");
+    let landed: i64 = fake.query_one(
+        "SELECT count(*) FROM issues WHERE repo='o/n' AND number=11 \
+         AND hydration_source='stream' AND verified_at IS NOT NULL",
+    );
+    assert_eq!(landed, 1);
+}
+
+// 17f. Issue multi-page hydration: the follow-up page merges and the
+// witness is earned by TERMINATED pagination — the issue-side mirror of
+// test 18.
+
+#[test]
+fn issue_follow_up_pages_merge_and_earn_the_witness() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}],
+        "workers": 1, "retry_attempts": 1, "retry_budget": 5
+    }));
+    install_prs(&fake, &[]);
+    let mut a = Issue::new("I_1", 11, "2026-07-20T00:00:00Z");
+    a.comments_has_next = true;
+    a.comments_cursor = Some("c1");
+    install_issues(&fake, &[&a]);
+    fake.write(
+        "icpage-I_1.json",
+        &json!({"data": {"node": {"comments": {
+            "totalCount": 2,
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": [{
+                "id": "IC_p2", "body": "second-page comment",
+                "createdAt": "2026-07-10T02:00:00Z", "lastEditedAt": null,
+                "url": "https://github.com/x2", "isMinimized": false,
+                "authorAssociation": "NONE", "author": author("carol", "User")}]}},
+            "rateLimit": rate_limit(4000)}})
+        .to_string(),
+    );
+
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["truncated"], 0, "{s}");
+    assert!(
+        fake.calls()
+            .iter()
+            .any(|c| c.starts_with("ICPAGE|run=1|id=I_1|after=c1")),
+        "the follow-up page walks the cursor: {:?}",
+        fake.calls()
+    );
+    let comments: i64 = fake.query_one("SELECT count(*) FROM comments WHERE parent_kind='issue'");
+    assert_eq!(comments, 2, "pages merge");
+    let verified: i64 = fake.query_one(
+        "SELECT count(*) FROM issues WHERE number=11 AND verified_at IS NOT NULL AND truncated=0",
+    );
+    assert_eq!(verified, 1, "terminated pagination earns the witness");
+}
+
+// 17f'. Three pages: the mid-walk cursor ADVANCE (c1 → c2) is the arm the
+// two-page shape never exercises — a walk that cannot take it reads every
+// multi-follow-up issue as truncated.
+
+#[test]
+fn issue_walk_advances_through_a_mid_walk_cursor() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}],
+        "workers": 1, "retry_attempts": 1, "retry_budget": 5
+    }));
+    install_prs(&fake, &[]);
+    let mut a = Issue::new("I_1", 11, "2026-07-20T00:00:00Z");
+    a.comments_has_next = true;
+    a.comments_cursor = Some("c1");
+    install_issues(&fake, &[&a]);
+    let page = |cid: &str, cursor: Value, has_next: bool| {
+        json!({"data": {"node": {"comments": {
+            "totalCount": 3,
+            "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+            "nodes": [{
+                "id": cid, "body": format!("comment {cid}"),
+                "createdAt": "2026-07-10T02:00:00Z", "lastEditedAt": null,
+                "url": "https://github.com/x", "isMinimized": false,
+                "authorAssociation": "NONE", "author": author("carol", "User")}]}},
+            "rateLimit": rate_limit(4000)}})
+        .to_string()
+    };
+    fake.write("icpage-I_1-c1.json", &page("IC_p2", json!("c2"), true));
+    fake.write("icpage-I_1-c2.json", &page("IC_p3", Value::Null, false));
+
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["truncated"], 0, "{s}");
+    let pages: Vec<String> = fake
+        .calls()
+        .iter()
+        .filter(|c| c.starts_with("ICPAGE|run=1"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        pages,
+        vec![
+            "ICPAGE|run=1|id=I_1|after=c1".to_string(),
+            "ICPAGE|run=1|id=I_1|after=c2".to_string(),
+        ],
+        "the walk advances through the mid-walk cursor exactly once each"
+    );
+    let comments: i64 = fake.query_one("SELECT count(*) FROM comments WHERE parent_kind='issue'");
+    assert_eq!(comments, 3, "all three pages merge");
+}
+
+// 17g. An issue follow-up page whose cursor does not advance reads as a
+// withheld witness (truncated), never an infinite walk and never a sweep.
+
+#[test]
+fn issue_non_advancing_cursor_withholds_the_witness() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}],
+        "workers": 1, "retry_attempts": 1, "retry_budget": 5
+    }));
+    install_prs(&fake, &[]);
+    let mut a = Issue::new("I_1", 11, "2026-07-20T00:00:00Z");
+    a.comments_has_next = true;
+    a.comments_cursor = Some("c1");
+    install_issues(&fake, &[&a]);
+    // The follow-up claims yet another page behind the SAME cursor.
+    fake.write(
+        "icpage-I_1.json",
+        &json!({"data": {"node": {"comments": {
+            "totalCount": 3,
+            "pageInfo": {"hasNextPage": true, "endCursor": "c1"},
+            "nodes": [{
+                "id": "IC_p2", "body": "second-page comment",
+                "createdAt": "2026-07-10T02:00:00Z", "lastEditedAt": null,
+                "url": "https://github.com/x2", "isMinimized": false,
+                "authorAssociation": "NONE", "author": author("carol", "User")}]}},
+            "rateLimit": rate_limit(4000)}})
+        .to_string(),
+    );
+
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["truncated"], 1, "{s}");
+    let icpages = fake
+        .calls()
+        .iter()
+        .filter(|c| c.starts_with("ICPAGE|run=1"))
+        .count();
+    assert_eq!(icpages, 1, "a stuck cursor is walked exactly once");
+    let verified: i64 =
+        fake.query_one("SELECT count(*) FROM issues WHERE number=11 AND verified_at IS NOT NULL");
+    assert_eq!(verified, 0, "no witness from a walk that could not end");
+}
+
+// 17h. The floor gates issue follow-up paging, strictly: remaining == floor
+// keeps paging, remaining < floor stops mid-walk with the witness withheld
+// — the issue-side floor_boundary_is_strict.
+
+#[test]
+fn issue_floor_boundary_gates_follow_up_pages() {
+    for (remaining, pages) in [(500u32, true), (499, false)] {
+        let fake = Fake::new();
+        fake.config(&json!({
+            "viewer": "viewer",
+            "repos": [{"repo": "o/n", "scope": "project"}], // floor: 500 default
+            "workers": 1, "retry_attempts": 1, "retry_budget": 5
+        }));
+        install_prs(&fake, &[]);
+        let mut a = Issue::new("I_1", 11, "2026-07-20T00:00:00Z");
+        a.comments_has_next = true;
+        a.comments_cursor = Some("c1");
+        a.remaining = remaining; // observed after the first-page document
+        install_issues(&fake, &[&a]);
+        fake.write(
+            "icpage-I_1.json",
+            &json!({"data": {"node": {"comments": {
+                "totalCount": 2,
+                "pageInfo": {"hasNextPage": false, "endCursor": null},
+                "nodes": [{
+                    "id": "IC_p2", "body": "second-page comment",
+                    "createdAt": "2026-07-10T02:00:00Z", "lastEditedAt": null,
+                    "url": "https://github.com/x2", "isMinimized": false,
+                    "authorAssociation": "NONE", "author": author("carol", "User")}]}},
+                "rateLimit": rate_limit(4000)}})
+            .to_string(),
+        );
+
+        let doc = fake.sync_ok();
+        let s = fake.repo_summary(&doc, "o/n");
+        let paged = fake.calls().iter().any(|c| c.starts_with("ICPAGE|run=1"));
+        assert_eq!(paged, pages, "remaining={remaining}: {s}");
+        assert_eq!(
+            s["health"]["truncated"],
+            json!(u64::from(!pages)),
+            "remaining={remaining}: an aborted walk lands truncated"
         );
     }
+}
+
+// 17i. A halted stream skips the maintenance phases: an issue-stream halt
+// (unsplittable capped window) must leave a due quarantine retry unrun,
+// exactly as a PR-stream halt does — either stream failing to complete
+// gates retries and re-verify.
+
+#[test]
+fn issue_stream_halt_skips_quarantine_retries() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}],
+        "lookback_days": 1, // bounds the halving depth
+        "workers": 1, "retry_attempts": 1, "retry_budget": 5
+    }));
+    // Run 1: PR_1 fails hydration → quarantined.
+    let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    install_prs(&fake, &[&a]);
+    fake.write("stderr-PR_1", "boom");
+    install_issues(&fake, &[]);
+    fake.sync_ok();
+    fake.remove("stderr-PR_1");
+    let q: i64 = fake.query_one("SELECT count(*) FROM quarantine WHERE id='PR_1'");
+    assert_eq!(q, 1);
+    fake.db()
+        .execute(
+            "UPDATE quarantine SET next_retry_at = '2020-01-01T00:00:00Z'",
+            [],
+        )
+        .unwrap();
+
+    // Run 2: every issue window, at every depth, reports far more hits
+    // than it returns — capped, splittable to the 2s floor, then halted.
+    let i = Issue::new("I_1", 11, "2026-07-20T11:00:00Z");
+    fake.write("ihyd-I_1.json", &i.hydration());
+    fake.write(
+        "idisc-default.json",
+        &discovery_nodes(vec![i.hit()], Some(1500), 4000),
+    );
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["discovery_truncated"], 1, "{s}");
+    assert_eq!(
+        fake.hydrations(2),
+        Vec::<String>::new(),
+        "the due retry must NOT run behind a halted stream"
+    );
+    let q: i64 = fake.query_one("SELECT count(*) FROM quarantine WHERE id='PR_1'");
+    assert_eq!(q, 1, "the quarantine row stays due for a completing run");
+}
+
+// 17j. A relaxation cold start interrupted by the floor restarts as a cold
+// start: its intermediate windows commit the STORED fingerprint, so the
+// next run reads "unequal" and re-walks from the lookback floor instead of
+// resuming incrementally from the old watermark — which would silently
+// skip everything the relaxation existed to ingest (the F1 argument,
+// generalized; D1 panel finding).
+
+#[test]
+fn interrupted_cold_start_restarts_instead_of_resuming() {
+    let fake = Fake::new();
+    let cfg = |bots: bool| {
+        json!({
+            "viewer": "viewer",
+            "repos": [{"repo": "o/n", "scope": "project", "issues": false, "bots": bots}],
+            "workers": 1, "retry_attempts": 1, "retry_budget": 5
+        })
+    };
+    // Run 1: bots off; the human PR syncs, watermark lands at 07-20.
+    fake.config(&cfg(false));
+    let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    install_prs(&fake, &[&a]);
+    fake.sync_ok();
+
+    // Run 2: bots on — a relaxation, so a cold start from the lookback
+    // floor. The walk splits (capped top window), banks its left half —
+    // which hydrates the bot PR_B the relaxation revealed, at 499
+    // remaining — and floors before the right half.
+    fake.config(&cfg(true));
+    let mut b = Pr::new("PR_B", 2, "2026-07-01T00:00:00Z");
+    b.author_login = "dependabot".into();
+    b.author_type = "Bot";
+    b.remaining = 499; // below the default 500 floor after B hydrates
+    fake.write("disc-2-0.json", &discovery(&[&a], Some(1500), 4000));
+    fake.write("disc-2-1.json", &discovery(&[&b], None, 4000));
+    fake.write("hyd-PR_B.json", &b.hydration());
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["health"]["deferred_at_floor"], true, "{s}");
+    let banked: i64 = fake.query_one("SELECT count(*) FROM prs WHERE number=2");
+    assert_eq!(banked, 1, "the completed left window banked its rows");
+    let fp: String =
+        fake.query_one("SELECT fingerprint FROM sync_state WHERE repo='o/n' AND stream='pr'");
+    assert!(
+        fp.contains("\"bots\":false"),
+        "an interrupted cold start must keep the STORED inputs: {fp}"
+    );
+
+    // Run 3: same config, budget restored. The stored fingerprint still
+    // says bots:false, so the walk cold-starts again and completes; only
+    // now do the new inputs land.
+    b.remaining = 4000;
+    fake.write("refresh-PR_B.json", &b.refresh());
+    fake.write("hyd-PR_B.json", &b.hydration());
+    fake.write("disc-3-0.json", &discovery(&[&a, &b], None, 4000));
+    fake.sync_ok();
+    let fp: String =
+        fake.query_one("SELECT fingerprint FROM sync_state WHERE repo='o/n' AND stream='pr'");
+    assert!(
+        fp.contains("\"bots\":true"),
+        "the completing walk claims the new inputs: {fp}"
+    );
+    let q3 = fake
+        .calls()
+        .iter()
+        .find(|c| c.starts_with("DISC|run=3|seq=0"))
+        .expect("run 3 discovers")
+        .clone();
+    assert!(
+        !q3.contains("2026-07-20"),
+        "run 3 walks from the lookback floor, not from the old watermark: {q3}"
+    );
+}
+
+// 17k. A drained issue resurrects on a linked sighting: node:null drained
+// it, but a later PR's closingIssuesReferences RENDERING the node is live
+// evidence it resolves again — presence data that crosses the ownership
+// boundary while content stays stream-owned.
+
+#[test]
+fn drained_issue_resurrects_on_linked_sighting() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}],
+        "workers": 1, "retry_attempts": 1, "retry_budget": 5
+    }));
+    // Run 1: the stream owns issue 101 (the number PR_1's linked ref names).
+    install_prs(&fake, &[]);
+    let mut i = Issue::new("I_PR_1", 101, "2026-07-20T00:00:00Z");
+    i.title = "stream title".into();
+    install_issues(&fake, &[&i]);
+    fake.sync_ok();
+
+    // The issue vanishes upstream: node:null on every later hydration.
+    fake.write(
+        "ihyd-I_PR_1.json",
+        &json!({"data": {"node": null, "rateLimit": rate_limit(4000)}}).to_string(),
+    );
+    // Run 2: rediscovered (same window overlap), hydration nulls →
+    // quarantined. Runs 3 and 4: made due, retried, null again — the third
+    // null drains to deleted_at and retires the quarantine row.
+    fake.sync_ok();
+    for _ in 0..2 {
+        fake.db()
+            .execute(
+                "UPDATE quarantine SET next_retry_at = '2020-01-01T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+        fake.sync_ok();
+    }
+    let (deleted, source): (Option<String>, String) = fake
+        .db()
+        .query_row(
+            "SELECT deleted_at, hydration_source FROM issues WHERE repo='o/n' AND number=101",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(deleted.is_some(), "three nulls drain to deleted_at");
+    assert_eq!(source, "stream");
+    let q: i64 = fake.query_one("SELECT count(*) FROM quarantine");
+    assert_eq!(q, 0, "the drain retires the quarantine row");
+
+    // Run 5: a PR arrives whose closingIssuesReferences renders issue 101
+    // (Pr::hydration's linked fixture names number+100 with id I_PR_1).
+    // The sighting clears deleted_at; content stays stream-owned.
+    let pr = Pr::new("PR_1", 1, "2026-07-21T00:00:00Z");
+    install_prs(&fake, &[&pr]);
+    fake.write("idisc-5-0.json", &discovery_nodes(vec![], None, 4000));
+    fake.sync_ok();
+    let (deleted, source, title): (Option<String>, String, String) = fake
+        .db()
+        .query_row(
+            "SELECT deleted_at, hydration_source, title FROM issues \
+             WHERE repo='o/n' AND number=101",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert!(deleted.is_none(), "a live sighting clears the drain");
+    assert_eq!(source, "stream", "ownership does not move");
+    assert_eq!(title, "stream title", "content does not move either");
+
+    // The resurrect is a CONTENT change and must count as one: re-delete
+    // the row directly, replay the otherwise-unchanged PR — the only write
+    // in the run is the sighting's deleted_at clear, and upserted must say
+    // so (a silent resurrect would hide the flip from the summary).
+    fake.db()
+        .execute(
+            "UPDATE issues SET deleted_at = '2026-01-01T00:00:00Z' WHERE number = 101",
+            [],
+        )
+        .unwrap();
+    fake.write("idisc-6-0.json", &discovery_nodes(vec![], None, 4000));
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["counts"]["upserted"], 1, "the resurrect counts: {s}");
+    let deleted: Option<String> =
+        fake.query_one("SELECT deleted_at FROM issues WHERE repo='o/n' AND number=101");
+    assert!(deleted.is_none());
+}
+
+// 17l. A repo failure increments starvation only for the streams THIS RUN
+// walked: after issues flips off, the residual (repo,'issue') row must not
+// keep climbing (nothing can ever reset it), or the repo reads permanently
+// starved and biases starved-first ordering forever.
+
+#[test]
+fn failed_run_increments_only_the_configured_streams() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}],
+        "workers": 1, "retry_attempts": 1, "retry_budget": 5
+    }));
+    let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    install_prs(&fake, &[&a]);
+    let i = Issue::new("I_1", 11, "2026-07-20T11:00:00Z");
+    install_issues(&fake, &[&i]);
+    fake.sync_ok();
+
+    // Issues off; the PR stream's run-2 discovery drifts (wrong shape) →
+    // a repo-scoped failure.
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project", "issues": false}],
+        "workers": 1, "retry_attempts": 1, "retry_budget": 5
+    }));
+    fake.write(
+        "disc-2-0.json",
+        &json!({"data": {"search": {"unexpected": true}}}).to_string(),
+    );
+    let (code, doc, _stderr) = fake.run(&["sync"]);
+    assert_eq!(code, 0, "a repo failure is a summary disclosure");
+    let doc = doc.expect("summary emitted");
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(
+        s["health"]["errors"].as_array().map(Vec::len),
+        Some(1),
+        "{s}"
+    );
+    let pr_runs: i64 = fake
+        .query_one("SELECT runs_since_advance FROM sync_state WHERE repo='o/n' AND stream='pr'");
+    let issue_runs: i64 = fake
+        .query_one("SELECT runs_since_advance FROM sync_state WHERE repo='o/n' AND stream='issue'");
+    assert_eq!(pr_runs, 1, "the walked stream failed to complete");
+    assert_eq!(issue_runs, 0, "the unconfigured stream is not starving");
+}
+
+// 17m. Issue re-verify: the tier's complete refetch catches quiet
+// mutations (a comment edit that never bumps the issue's updatedAt),
+// counts them, and re-stamps verified_at even when nothing changed — the
+// re-stamp is what keeps the schedule advancing.
+
+#[test]
+fn issue_reverify_catches_quiet_mutations_and_restamps() {
+    let fake = Fake::new();
+    fake.config(&json!({
+        "viewer": "viewer",
+        "repos": [{"repo": "o/n", "scope": "project"}],
+        "workers": 1, "retry_attempts": 1, "retry_budget": 5
+    }));
+    install_prs(&fake, &[]);
+    let a = Issue::new("I_1", 11, "2026-07-20T00:00:00Z");
+    install_issues(&fake, &[&a]);
+    fake.sync_ok();
+
+    // Age the stamp past the open tier's period; quiet-edit the comment
+    // body upstream WITHOUT bumping the issue's updatedAt; empty the
+    // discovery windows so only re-verify can find it.
+    let backdate = |fake: &Fake| {
+        fake.db()
+            .execute("UPDATE issues SET verified_at = '2026-01-01T00:00:00Z'", [])
+            .unwrap();
+    };
+    backdate(&fake);
+    let mut quiet = Issue::new("I_1", 11, "2026-07-20T00:00:00Z");
+    quiet.comment_ids = vec!["IC_I_1".into()];
+    let mut hyd: Value = serde_json::from_str(&quiet.hydration()).unwrap();
+    hyd["data"]["node"]["comments"]["nodes"][0]["body"] = json!("edited quietly");
+    fake.write("ihyd-I_1.json", &hyd.to_string());
+    fake.write("idisc-2-0.json", &discovery_nodes(vec![], None, 4000));
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["reverified"], 1, "{s}");
+    assert_eq!(s["refresh"]["quiet_mutations_found"], 1, "{s}");
+    assert_eq!(s["counts"]["fetched"], 1, "a re-verify is a fetch");
+    assert_eq!(
+        fake.issue_hydrations(2),
+        vec!["I_1"],
+        "re-verify dispatches through the issue document"
+    );
+    let body: String =
+        fake.query_one("SELECT body FROM comments WHERE id='IC_I_1' AND parent_kind='issue'");
+    assert_eq!(body, "edited quietly");
+    let moved: i64 =
+        fake.query_one("SELECT count(*) FROM issues WHERE verified_at > '2026-01-01T00:00:00Z'");
+    assert_eq!(moved, 1, "the refetch re-stamps");
+
+    // Round 2, nothing changed upstream: the re-verify still re-stamps
+    // (the schedule reads verified_at) while counting no quiet mutation
+    // and writing no content.
+    backdate(&fake);
+    fake.write("idisc-3-0.json", &discovery_nodes(vec![], None, 4000));
+    let doc = fake.sync_ok();
+    let s = fake.repo_summary(&doc, "o/n");
+    assert_eq!(s["refresh"]["reverified"], 1, "{s}");
+    assert_eq!(s["refresh"]["quiet_mutations_found"], 0, "{s}");
+    assert_eq!(s["counts"]["upserted"], 0);
+    let moved: i64 =
+        fake.query_one("SELECT count(*) FROM issues WHERE verified_at > '2026-01-01T00:00:00Z'");
+    assert_eq!(moved, 1, "an unchanged re-verify still re-stamps");
 }
 
 // ---------------------------------------------------------------------------

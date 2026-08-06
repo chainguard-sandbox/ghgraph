@@ -135,8 +135,10 @@ where
 pub enum Doc {
     Discovery,
     HydratePr,
+    HydrateIssue,
     ThreadsPage,
     CommentsPage,
+    IssueCommentsPage,
     PrId,
     RefreshPr,
     TailComments,
@@ -149,8 +151,10 @@ impl fmt::Display for Doc {
         f.write_str(match self {
             Doc::Discovery => "DISCOVERY",
             Doc::HydratePr => "HYDRATE_PR",
+            Doc::HydrateIssue => "HYDRATE_ISSUE",
             Doc::ThreadsPage => "THREADS_PAGE",
             Doc::CommentsPage => "COMMENTS_PAGE",
+            Doc::IssueCommentsPage => "ISSUE_COMMENTS_PAGE",
             Doc::PrId => "PR_ID",
             Doc::RefreshPr => "REFRESH_PR",
             Doc::TailComments => "TAIL_COMMENTS",
@@ -697,6 +701,111 @@ pub fn comments_page(data: &serde_json::Value) -> Result<Option<CommentsPageNode
         .map(|d| d.node)
         .map_err(|_| ParseError {
             doc: Doc::CommentsPage,
+        })
+}
+
+// ---------------------------------------------------------------------------
+// HYDRATE_ISSUE / ISSUE_COMMENTS_PAGE
+
+/// One hydrated issue: the project-scope issue stream's full context.
+/// Field set = the HYDRATE_ISSUE selection, exactly (queries.rs records
+/// the cuts — no closedAt, no review machinery, no refs extraction).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct IssueNode {
+    pub id: String,
+    pub number: i64,
+    pub title: String,
+    pub body: String,
+    /// IssueState (OPEN | CLOSED); raw on purpose (module docs).
+    pub state: String,
+    pub url: String,
+    #[serde(deserialize_with = "nullable")]
+    pub author: Option<Author>,
+    pub author_association: String,
+    pub repository: RepoRef,
+    pub created_at: Rfc3339Utc,
+    pub updated_at: Rfc3339Utc,
+    /// Nullable in the introspected schema (Labelable's LabelConnection),
+    /// which is GraphQL's error-masking — `None` is a failed sub-resolver,
+    /// treated as a withheld witness (truncation), never as "no labels".
+    /// The review panel's D1 finding; live introspection confirmed the
+    /// asymmetry with the two below.
+    #[serde(deserialize_with = "nullable")]
+    pub labels: Option<Counted<LabelNode>>,
+    /// Non-null in the schema (Assignable's UserConnection!), like
+    /// comments: a missing connection fails the parse loudly instead of
+    /// masquerading as empty.
+    pub assignees: Counted<AssigneeNode>,
+    pub comments: Paged<CommentNode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct LabelNode {
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AssigneeNode {
+    pub login: ApiLogin,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct HydrateIssueData {
+    #[serde(deserialize_with = "nullable")]
+    node: Option<IssueNode>,
+    /// See DiscoveryData::rate_limit.
+    #[allow(dead_code)]
+    rate_limit: Option<serde_json::Value>,
+}
+
+/// Parse one HYDRATE_ISSUE response's `data`. Same outcome contract as
+/// [`hydrate_pr`]: `Ok(None)` is `node: null` (deleted or access lost) —
+/// data, never an error — and a non-Issue node arrives as `{}` and fails
+/// the parse, a ghgraph bug by construction, since only issue-stream
+/// discovery ids reach this document (the stream-typed terms and the
+/// quarantine stream column are that construction).
+pub fn hydrate_issue(data: &serde_json::Value) -> Result<Option<IssueNode>, ParseError> {
+    HydrateIssueData::deserialize(data)
+        .map(|d| d.node)
+        .map_err(|_| ParseError {
+            doc: Doc::HydrateIssue,
+        })
+}
+
+/// A follow-up issue-comments page, rooted at the issue node id.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct IssueCommentsPageNode {
+    pub comments: Paged<CommentNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct IssueCommentsPageData {
+    #[serde(deserialize_with = "nullable")]
+    node: Option<IssueCommentsPageNode>,
+    /// See DiscoveryData::rate_limit.
+    #[allow(dead_code)]
+    rate_limit: Option<serde_json::Value>,
+}
+
+/// Parse one ISSUE_COMMENTS_PAGE response's `data`. `Ok(None)` = the issue
+/// vanished mid-walk (`node: null`); the walk's outcome discipline owns it.
+pub fn issue_comments_page(
+    data: &serde_json::Value,
+) -> Result<Option<IssueCommentsPageNode>, ParseError> {
+    IssueCommentsPageData::deserialize(data)
+        .map(|d| d.node)
+        .map_err(|_| ParseError {
+            doc: Doc::IssueCommentsPage,
         })
 }
 
@@ -1339,6 +1448,122 @@ mod tests {
         // A node that is not a PullRequest ({} from an unmatched fragment)
         // must fail, not read as an empty page.
         assert!(comments_page(&json!({"node": {}})).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // HYDRATE_ISSUE / ISSUE_COMMENTS_PAGE fixtures
+
+    #[test]
+    fn hydrate_issue_assigned_fixture_parses() {
+        let issue = hydrate_issue(&data(include_str!(
+            "../tests/fixtures/hydrate_issue_assigned.json"
+        )))
+        .unwrap()
+        .expect("node resolves");
+        assert_eq!(issue.number, 13016);
+        assert_eq!(issue.state, "OPEN");
+        assert_eq!(issue.repository.name_with_owner, "cli/cli");
+        let author = issue.author.as_ref().expect("authored");
+        assert!(!author.is_bot());
+        assert!(author.database_id.is_some(), "User fragment carries the id");
+        // The two counted connections, populated: nodes cover totalCount —
+        // the shape whose coverage IS the witness (no follow-up document).
+        let labels = issue.labels.as_ref().expect("present in the capture");
+        assert_eq!(labels.total_count, 3);
+        assert_eq!(labels.nodes.len(), 3);
+        assert!(labels.nodes.iter().any(|l| l.name == "tech-debt"));
+        assert_eq!(issue.assignees.total_count, 2);
+        assert!(
+            issue
+                .assignees
+                .nodes
+                .iter()
+                .any(|a| a.login.as_str() == "babakks")
+        );
+        // Single-page comments: the walk-free witness shape.
+        assert!(!issue.comments.page_info.has_next_page);
+        assert_eq!(issue.comments.total_count, 1);
+        assert_eq!(issue.comments.nodes.len(), 1);
+    }
+
+    #[test]
+    fn hydrate_issue_paged_fixture_parses() {
+        let issue = hydrate_issue(&data(include_str!(
+            "../tests/fixtures/hydrate_issue_paged.json"
+        )))
+        .unwrap()
+        .expect("node resolves");
+        assert_eq!(issue.number, 13840);
+        // A live Bot author on the issue path: the Bot fragment's
+        // databaseId works here too, and the structural judgment reads it.
+        let author = issue.author.as_ref().expect("authored");
+        assert!(author.is_bot());
+        assert!(author.database_id.is_some(), "Bot fragment carries the id");
+        // The multi-page shape: more comments than one page, a cursor to
+        // walk — what earns (or, unfollowed, withholds) the witness.
+        assert!(issue.comments.page_info.has_next_page);
+        assert!(issue.comments.page_info.end_cursor.is_some());
+        assert!(issue.comments.total_count > issue.comments.nodes.len() as i64);
+    }
+
+    #[test]
+    fn issue_comments_page_fixture_parses() {
+        let node = issue_comments_page(&data(include_str!(
+            "../tests/fixtures/issue_comments_page.json"
+        )))
+        .unwrap()
+        .expect("node resolves");
+        assert!(node.comments.total_count >= 100);
+        assert_eq!(node.comments.nodes.len(), 100, "full follow-up page");
+        let c = &node.comments.nodes[0];
+        assert!(!c.id.is_empty());
+        assert!(!c.body.is_empty());
+    }
+
+    #[test]
+    fn issue_labels_null_is_a_mask_not_an_empty_set() {
+        // Issue.labels is schema-nullable (Labelable's LabelConnection —
+        // live-introspected; the D1 panel's finding): GitHub error-masks a
+        // failed sub-resolver to null there, unlike assignees/comments
+        // (both NON_NULL). The mask must parse as None — the withheld
+        // witness the hydrator turns into truncation — never fail the
+        // whole issue into a parse-class quarantine, and never read as
+        // "no labels".
+        let mut issue: Value = {
+            let v: Value = serde_json::from_str(include_str!(
+                "../tests/fixtures/hydrate_issue_assigned.json"
+            ))
+            .unwrap();
+            v["data"]["node"].clone()
+        };
+        issue["labels"] = Value::Null;
+        let parsed = hydrate_issue(&json!({"node": issue}))
+            .unwrap()
+            .expect("node resolves");
+        assert_eq!(parsed.labels, None, "mask, not empty");
+        // The strict pair: assignees null IS a parse failure — NON_NULL in
+        // the schema, so a null there is drift, not masking.
+        let mut issue: Value = {
+            let v: Value = serde_json::from_str(include_str!(
+                "../tests/fixtures/hydrate_issue_assigned.json"
+            ))
+            .unwrap();
+            v["data"]["node"].clone()
+        };
+        issue["assignees"] = Value::Null;
+        assert!(hydrate_issue(&json!({"node": issue})).is_err());
+    }
+
+    #[test]
+    fn hydrate_issue_node_null_and_shape_errors() {
+        assert_eq!(hydrate_issue(&json!({"node": null})).unwrap(), None);
+        assert!(hydrate_issue(&json!({})).is_err(), "missing key is drift");
+        // A node that is not an Issue ({} from an unmatched fragment) must
+        // fail the parse — the constructed-unreachable arm, kept loud.
+        let err = hydrate_issue(&json!({"node": {}})).unwrap_err();
+        assert_eq!(err.doc, Doc::HydrateIssue);
+        assert_eq!(issue_comments_page(&json!({"node": null})).unwrap(), None);
+        assert!(issue_comments_page(&json!({"node": {}})).is_err());
     }
 
     #[test]

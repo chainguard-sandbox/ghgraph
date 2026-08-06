@@ -255,10 +255,16 @@ CREATE TABLE IF NOT EXISTS sync_state (
 -- passes its id — the advance is licensed by the record that resurfaces the
 -- item, so no exit can turn "quarantined" into "forgotten". Retried under
 -- backoff by the scheduler (backoff dominates every hydration cause);
--- node:null after repeated attempts drains to prs.deleted_at.
+-- node:null after repeated attempts drains to the stream row's deleted_at.
+-- `stream` names the hydration document a retry must use: a node id is
+-- opaque (its format is data, never parsed), so without the column an issue
+-- id retried through HYDRATE_PR would parse-fail forever — the same
+-- stream-confusion the typed discovery terms exist to prevent (queries.rs,
+-- the B2 panel's S1) — and the drain would soft-delete in the wrong table.
 CREATE TABLE IF NOT EXISTS quarantine (
   id            TEXT PRIMARY KEY,              -- GraphQL node id
   repo          TEXT NOT NULL,
+  stream        TEXT NOT NULL DEFAULT 'pr',    -- 'pr' | 'issue': retry dispatch
   attempts      INTEGER NOT NULL DEFAULT 0,
   next_retry_at TEXT NOT NULL,
   error_class   TEXT NOT NULL
@@ -310,9 +316,11 @@ BEGIN
   INSERT INTO comments_fts(rowid, body) VALUES (new.pk, new.body);
 END;
 
--- Issues share the PR FTS shape (schema is final); the stream writer
--- populates it under project scope. "Where did we discuss X" lands in issue
--- bodies for an active project — the query that earns the index.
+-- Issues share the PR FTS shape (schema is final). The triggers index every
+-- issues row — the project-scope stream's full rows and the working-scope
+-- linked cache's skinny ones alike (a cached title/body is still searchable
+-- context). "Where did we discuss X" lands in issue bodies for an active
+-- project — the query that earned the index.
 CREATE VIRTUAL TABLE IF NOT EXISTS issues_fts USING fts5(
   title, body,
   content='issues', content_rowid='pk',

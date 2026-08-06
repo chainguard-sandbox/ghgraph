@@ -41,6 +41,14 @@
 //! * thread_bodies.json — THREAD_BODIES against cli/cli#13864's one review
 //!   thread (PRRT_kwDODKw3uc6QWWXy), tying the thread-rooted document to
 //!   the same thread the hydration fixture carries.
+//! * hydrate_issue_assigned.json — HYDRATE_ISSUE against cli/cli issue
+//!   #13016: two assignees and three labels on one page (the counted
+//!   connections populated), one comment — the single-page shape.
+//! * hydrate_issue_paged.json — HYDRATE_ISSUE against cli/cli issue
+//!   #13840: 100+ comments, so the first page reports hasNextPage — the
+//!   shape whose walk earns (or withholds) the comments witness.
+//! * issue_comments_page.json — ISSUE_COMMENTS_PAGE against the same
+//!   issue, no cursor, tying the follow-up document to the same anchor.
 //! * comments_minimized.json — TAIL_COMMENTS against cli/cli#13918, whose
 //!   ONLY top-level comment is minimized (spam). The enablement gate for
 //!   the layered-refresh conservation check: the capture asserts that
@@ -136,6 +144,43 @@ fn capture_hydrations() {
             &gh_graphql(ghgraph::queries::HYDRATE_PR, &[("id", id)]),
         );
     }
+}
+
+#[test]
+#[ignore = "talks to live GitHub and rewrites tests/fixtures/ — run explicitly"]
+fn capture_issue_hydrations() {
+    // #13016: assignees and labels populated, single-page comments.
+    write_fixture(
+        "hydrate_issue_assigned.json",
+        &gh_graphql(
+            ghgraph::queries::HYDRATE_ISSUE,
+            &[("id", "I_kwDODKw3uc71-pak")],
+        ),
+    );
+    // #13840: a 100+-comment issue — the first page must report another
+    // page, or the multi-page witness shape has no live pin.
+    let raw = gh_graphql(
+        ghgraph::queries::HYDRATE_ISSUE,
+        &[("id", "I_kwDODKw3uc8AAAABIWsa1Q")],
+    );
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("JSON");
+    assert_eq!(
+        v["data"]["node"]["comments"]["pageInfo"]["hasNextPage"], true,
+        "the pinned issue no longer overflows one page — pick a new anchor"
+    );
+    write_fixture("hydrate_issue_paged.json", &raw);
+}
+
+#[test]
+#[ignore = "talks to live GitHub and rewrites tests/fixtures/ — run explicitly"]
+fn capture_issue_comments_page() {
+    write_fixture(
+        "issue_comments_page.json",
+        &gh_graphql(
+            ghgraph::queries::ISSUE_COMMENTS_PAGE,
+            &[("id", "I_kwDODKw3uc8AAAABIWsa1Q")],
+        ),
+    );
 }
 
 #[test]

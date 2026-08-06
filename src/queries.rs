@@ -54,8 +54,8 @@ query($q: String!, $after: String) {
 /// out of PR hydration (the B2 panel's S1: an untyped term list fed
 /// project-scope issue hits into HYDRATE_PR, where every one became an
 /// eternal parse-class quarantine row). Stream::Issue emits terms only at
-/// project scope with the issue stream on; its consumer is the milestone-4
-/// walk.
+/// project scope with the issue stream on; sync.rs walks each configured
+/// stream against its own watermark.
 /// `since` is the caller's watermark with the overlap window already applied;
 /// `until`, when present, closes the window (`updated:since..until`) — the
 /// cap-splitting walk (sync.rs) halves a window that GitHub's ~1,000-result
@@ -275,6 +275,94 @@ pub const COMMENTS_PAGE: &str = r#"
 query($id: ID!, $after: String) {
   node(id: $id) {
     ... on PullRequest {
+      comments(first: 100, after: $after) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes { id body createdAt lastEditedAt url isMinimized authorAssociation
+                author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}"#;
+
+/// Hydration: one issue's full context by node id — the project-scope
+/// stream's document. Variables: $id.
+///
+/// Deliberately lighter than HYDRATE_PR, and the cuts are decisions:
+///
+///   * No review machinery — issues have none — and no timeline: the same
+///     event-system fence as everywhere.
+///   * No closedAt: the issues table has no column for it, and a selection
+///     without a consumer is waste (the telemetry rule's sibling). The
+///     re-verify closed tier bounds by updated_at instead (sync.rs records
+///     the containment argument).
+///   * labels and assignees are small counted connections, first: 20 with
+///     totalCount, like reviewRequests on the PR side: no follow-up
+///     document — an overflow withholds the witness and the row lands
+///     truncated, disclosed, like every other incompleteness. assignees
+///     cannot overflow (GitHub caps assignees at 10); labels can on a
+///     heavy-triage repo, and such a row is unhealable by design until a
+///     page document exists — never-verified, so the re-verify tier
+///     refetches it every run, one of the REVERIFY_CAP slots. That cost
+///     is the accepted interim (disclosed via health.truncated each run);
+///     a repo that routinely overflows 20 is the evidence that would add
+///     the page document. labels is also schema-nullable (error-masking,
+///     unlike assignees/comments — live-introspected): parse.rs carries
+///     it Option, and a masked connection withholds the witness while
+///     the writer carries the stored value forward (upsert_issue_stream).
+///   * No refresh/tail layer: every issue hydration is a full walk. The
+///     tail exists because PR hydration pays for review threads; an issue
+///     is one comments connection, and a single-page issue costs exactly
+///     one call already. The telemetry that would earn an issue tail is
+///     the same tail_hits/full_walks pair, measured on real archives.
+///   * No refs extraction from issue bodies: refs.src_pr is PR-keyed by
+///     schema and the reference graph is a PR working-set feature; an
+///     issue-sourced edge has no consumer. Revisit when a read verb wants
+///     issue-to-issue links, not before.
+///
+/// Author selections carry the full identity discipline (__typename +
+/// databaseId fragments, authorAssociation) — the shape notes at HYDRATE_PR
+/// apply verbatim. repository { nameWithOwner } feeds the same
+/// rename/transfer refusal.
+pub const HYDRATE_ISSUE: &str = r#"
+query($id: ID!) {
+  node(id: $id) {
+    ... on Issue {
+      id number title body state url
+      author { login __typename ... on User { databaseId } ... on Bot { databaseId } }
+      authorAssociation
+      repository { nameWithOwner }
+      createdAt updatedAt
+      labels(first: 20) {
+        totalCount
+        nodes { name }
+      }
+      assignees(first: 20) {
+        totalCount
+        nodes { login }
+      }
+      comments(first: 50) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes { id body createdAt lastEditedAt url isMinimized authorAssociation
+                author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}"#;
+
+/// Follow-up page for an overflowed issue comments connection — COMMENTS_PAGE
+/// with the fragment retyped (`... on Issue`), same shape rules (totalCount
+/// re-selected every page; parse::Paged both pages). A separate const, not a
+/// parameterized template: the fragment type is the whole difference, and a
+/// string-substituted type name would trade a grep-able document for a
+/// render path the fixture pin cannot see.
+pub const ISSUE_COMMENTS_PAGE: &str = r#"
+query($id: ID!, $after: String) {
+  node(id: $id) {
+    ... on Issue {
       comments(first: 100, after: $after) {
         totalCount
         pageInfo { hasNextPage endCursor }
