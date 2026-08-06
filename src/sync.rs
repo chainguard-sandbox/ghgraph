@@ -1678,6 +1678,9 @@ impl StreamCtx<'_> {
     /// The one filter judgment, on discovery-carried author data: a null
     /// author is ordinary data and never a filter match; bot-ness is
     /// structural; exclude_authors goes through the one login equivalence.
+    /// Client-side by decision, not omission: queries.rs discovery_terms
+    /// records why server-side `-author:` qualifiers are rejected (an
+    /// unresolvable negated author silently zeroes the whole search).
     fn excluded(&self, author: Option<&parse::Author>) -> bool {
         let Some(author) = author else {
             return false;

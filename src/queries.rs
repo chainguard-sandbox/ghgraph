@@ -70,6 +70,23 @@ query($q: String!, $after: String) {
 /// literal, not data). The counterexample strings live on as unit tests
 /// (identity.rs, config.rs). Do not add interpolation sites that take raw
 /// strings.
+///
+/// Rejected: server-side `exclude_authors` (`-author:x` qualifiers — the
+/// ROADMAP milestone-4 proposal). Probed live: a negated author qualifier
+/// that fails to resolve makes the WHOLE search silently return zero
+/// results — no error — and unresolvable is the steady state, twice over:
+/// an excluded account gets deleted or renamed (often why it was
+/// excluded), and the `-author:app/x` spelling has no referent for any
+/// human login, while a bare pattern needs BOTH spellings to match the
+/// client rule (config.rs AuthorPattern: bare matches either kind). A
+/// zeroed window reads exactly like a quiet repo — discovery starves,
+/// nothing discloses it, and the unchanged-remote replay detector cannot
+/// resurface items that were never discovered — so the failure defeats
+/// "incompleteness is never silent" undetectably. exclude_authors
+/// therefore stays client-side (sync.rs `excluded()`), where the skip
+/// still costs no hydration and the `filtered` count stays exact.
+/// Reversing evidence: GitHub search erroring (or excluding nothing) on
+/// an unresolvable negated author.
 pub fn discovery_terms(
     rc: &RepoConfig,
     viewer: &Login,
