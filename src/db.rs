@@ -389,6 +389,12 @@ fn refuse_writable_parent(dir: &Path) -> Result<()> {
     // the remedy applies). The plant-before-create residue a sticky dir
     // still permits (anyone may CREATE a symlink at a path that does not
     // exist yet) is closed by refuse_symlink_archive, not here.
+    //
+    // Mutation note: the sticky-mask operators (& 0o1000) have surviving
+    // mutants (|, ^) whose only discriminating fixture is a ROOT-owned
+    // writable NON-sticky directory — unprivileged tests cannot create
+    // one. The testable arms are covered: user-owned sticky refused,
+    // root-owned sticky (/tmp itself) exempt, plain writable refused.
     if mode & 0o022 != 0 && !(mode & 0o1000 != 0 && meta.uid() == 0) {
         return Err(Error::config(format!(
             "archive dir {} is group/other-writable (mode {:03o}) — anyone with write \

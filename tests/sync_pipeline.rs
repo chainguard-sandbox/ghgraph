@@ -765,19 +765,43 @@ fn replay_of_unchanged_remote_writes_nothing() {
     // nonzero delta column here is the regression the table exists to catch.
     let runs: i64 = fake.query_one("SELECT count(*) FROM sync_runs");
     assert_eq!(runs, 2, "one sync_runs row per completed run");
-    let (upserted, unchanged, observations, errors): (i64, i64, i64, i64) = fake
+    let (upserted, unchanged, observations, errors, intercept): (
+        i64,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+    ) = fake
         .db()
         .query_row(
-            "SELECT upserted, unchanged, observations, errors FROM sync_runs \
-             ORDER BY seq DESC LIMIT 1",
+            "SELECT upserted, unchanged, observations, errors, overhead_intercept_ms \
+             FROM sync_runs ORDER BY seq DESC LIMIT 1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(
         (upserted, unchanged, observations, errors),
         (0, 2, 0, 0),
         "the replay run's sync_runs row shows zero deltas"
+    );
+    // The intercept VALUE is wall-clock and unassertable, but its
+    // PRESENCE is structural: the run made three data-bearing calls
+    // whose response sizes differ (discovery page vs hydration docs),
+    // so a regression exists and the column must be non-NULL — a
+    // sample-collection regression (e.g. sampling only killed calls)
+    // yields zero samples and NULL here.
+    assert!(
+        intercept.is_some(),
+        "three differing-size fixture calls must yield an intercept"
     );
 }
 
