@@ -1319,25 +1319,83 @@ fn audits_fire_on_a_corrupted_archive() {
             [],
         )
         .unwrap();
+        // The remaining orphan counters, one forgery each: a ref, a review
+        // request, and a review thread whose parent pk resolves nowhere.
+        conn.execute(
+            "INSERT INTO refs (src_pr, kind, source, target_repo, target_number) \
+             VALUES (9999, 'mentions', 'body', 'octo/alpha', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO review_requests (pr, reviewer, kind) VALUES (9999, 'ghost', 'user')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO review_threads (id, pr) VALUES ('RT_orphan', 9999)",
+            [],
+        )
+        .unwrap();
+        // The comments and issues FTS pairs, same two desyncs as prs: a
+        // deindexed content row (pick deterministically among rows the
+        // ASCII gate covers) and a ghost index entry.
+        conn.execute(
+            "INSERT INTO comments_fts(comments_fts, rowid, body) \
+             SELECT 'delete', pk, body FROM comments \
+             WHERE body GLOB '*[a-zA-Z0-9]*' ORDER BY pk LIMIT 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO comments_fts(rowid, body) VALUES (8887, 'ghost comment body')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issues_fts(issues_fts, rowid, title, body) \
+             SELECT 'delete', pk, title, body FROM issues \
+             WHERE title GLOB '*[a-zA-Z0-9]*' OR body GLOB '*[a-zA-Z0-9]*' \
+             ORDER BY pk LIMIT 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issues_fts(rowid, title, body) VALUES (8886, 'ghost issue', 'x')",
+            [],
+        )
+        .unwrap();
     }
     let doc = s.run_ok(&["stats"]);
     let a = &doc["stats"]["audits"];
+    // Every counter, exactly its own forgery's count — attribution is the
+    // point: a matrix where each corruption moves one number proves the
+    // audits distinguish, not merely detect.
     assert_eq!(a["orphans"]["comments"], 1, "comment orphan: {a}");
     assert_eq!(a["orphans"]["observations"], 1, "observation orphan: {a}");
-    assert_eq!(a["orphans"]["refs"], 0, "untouched tables stay clean: {a}");
+    assert_eq!(a["orphans"]["refs"], 1, "ref orphan: {a}");
+    assert_eq!(
+        a["orphans"]["review_requests"], 1,
+        "review-request orphan: {a}"
+    );
+    assert_eq!(
+        a["orphans"]["review_threads"], 1,
+        "review-thread orphan: {a}"
+    );
     assert_eq!(
         a["observation_chain_breaks"], 2,
         "one plain break, one behind a NULL-new predecessor: {a}"
     );
-    assert_eq!(a["fts"]["prs"]["missing"], 1, "deindexed content row: {a}");
-    assert_eq!(
-        a["fts"]["prs"]["index_orphans"], 1,
-        "ghost index entry: {a}"
-    );
-    assert_eq!(
-        a["fts"]["comments"]["missing"], 0,
-        "trigger-indexed forgeries are FTS-consistent: {a}"
-    );
+    for kind in ["prs", "comments", "issues"] {
+        assert_eq!(
+            a["fts"][kind]["missing"], 1,
+            "{kind}: deindexed content row: {a}"
+        );
+        assert_eq!(
+            a["fts"][kind]["index_orphans"], 1,
+            "{kind}: ghost index entry: {a}"
+        );
+    }
     assert_eq!(
         a["watermark"]["quarantine_unlicensed"], 1,
         "unlicensed quarantine: {a}"

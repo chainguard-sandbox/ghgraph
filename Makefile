@@ -129,9 +129,10 @@ tree-check: ## Fail if the dependency graph moved without a snapshot update
 		{ rm -f $$t; echo "dependency graph diverged from supply-chain/cargo-tree.txt — run 'make tree' and review"; exit 1; }; \
 		rm -f $$t
 
+# Versions match .github/workflows/ci.yml — bump both together, by diff.
 setup: ## Install the dev tools the quality targets need (cargo-audit, cargo-vet)
-	cargo install cargo-audit --locked
-	cargo install cargo-vet --locked
+	cargo install cargo-audit --version 0.22.2 --locked
+	cargo install cargo-vet --version 0.10.2 --locked
 
 #
 # Housekeeping

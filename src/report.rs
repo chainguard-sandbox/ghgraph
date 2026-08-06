@@ -1477,8 +1477,12 @@ fn sync_runs_trends(conn: &Connection) -> Result<Value> {
 
 /// The LOWER median of an ascending-sorted list: element (n-1)/2, an
 /// integer no averaging (hence no float) can produce. None on empty —
-/// unknown discloses as null, never as a zero-filled guess.
+/// unknown discloses as null, never as a zero-filled guess. The sole
+/// caller sorts in SQL (ORDER BY overhead_intercept_ms, seq); the
+/// debug_assert is the mechanism that keeps a future caller honest
+/// about the precondition the name states.
 fn lower_median(sorted_asc: &[i64]) -> Option<i64> {
+    debug_assert!(sorted_asc.is_sorted(), "lower_median needs sorted input");
     sorted_asc
         .get((sorted_asc.len().saturating_sub(1)) / 2)
         .copied()

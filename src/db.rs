@@ -147,8 +147,10 @@ impl RwArchive {
 /// steady-state sync can leave a WAL comparable to the archive itself, and
 /// the next writer may be days away. TRUNCATE (not PASSIVE) returns the disk
 /// space. Best-effort is load-bearing: a reader holding a WAL snapshot makes
-/// the truncate report busy, and a run that synced correctly must not turn
-/// into an error over housekeeping — so the result is deliberately ignored
+/// the truncate report busy — after the connection's busy handler waits out
+/// its window, so this close can stall up to BUSY_TIMEOUT (bounded, ~5s;
+/// never indefinite) — and a run that synced correctly must not turn
+/// into an error over housekeeping, so the result is deliberately ignored
 /// (the next close retries by existing). Drop, not an explicit close method:
 /// every writer path — sync's run, the targeted form, a mid-run error unwind,
 /// every test — closes through here, so the mechanism cannot be forgotten.
@@ -796,8 +798,9 @@ mod tests {
         let path = tmp.join(path.file_name().unwrap());
         let _ = std::fs::remove_file(&path);
         open_rw(&path).expect("root-owned sticky /tmp must open");
+        // SQLite removes -wal/-shm on the last close; the db file is ours
+        // to clean (open_rw takes no run lock — that is sync.rs's).
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("db.lock"));
     }
 
     #[test]
