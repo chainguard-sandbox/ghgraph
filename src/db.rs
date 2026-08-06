@@ -30,17 +30,23 @@
 //! process umask (we cannot set their mode at their creation without a libc dep
 //! we do not take).
 //!
-//! Two preconditions of the mode guarantee, stated rather than papered over:
-//!   * It covers only directories ghgraph creates. A pre-existing archive
-//!     directory (an operator's custom `db_path` pointed at a shared or
-//!     world-readable dir) keeps its own mode; the -wal/-shm confidentiality
-//!     boundary is then absent. Refusing a group/other-writable parent is
-//!     PLANNED (milestone 5, hardening) — the enforcement is a mechanism, and
-//!     until it exists this is a documented gap, not a silent one.
+//! Two preconditions of the mode guarantee, and their enforcement:
+//!   * A pre-existing archive directory (an operator's custom `db_path`
+//!     pointed at a shared dir) keeps its own mode — but open_rw REFUSES a
+//!     group/other-WRITABLE parent unless its sticky bit is set: a writable
+//!     parent is exactly the access the symlink-swap defense assumes the
+//!     attacker lacks, while a sticky writable dir (the /tmp shape) denies
+//!     non-owners the unlink+replace a swap needs. Write bits only, decided:
+//!     a world-READABLE parent weakens the -wal/-shm confidentiality
+//!     boundary but forges nothing — refusing it would false-refuse every
+//!     home directory more open than 0700, so readability stays the
+//!     operator's call and integrity does not.
 //!   * mode() is masked by the process umask, so 0700/0600 is a ceiling, not a
 //!     floor. umask can only tighten, never loosen, so confidentiality is never
 //!     regressed; an exotic umask that clears owner bits could make the archive
-//!     unwritable, which surfaces as a CONFIGURATION open error.
+//!     unwritable, which surfaces as a CONFIGURATION open error. The tests
+//!     re-exec themselves under `sh -c 'umask 0; ...'` to prove the explicit
+//!     .mode() calls carry the guarantee rather than an inherited umask.
 //!
 //! Versioning: PRAGMA user_version. 0 → apply schema.sql (always the CURRENT
 //! shape) → SCHEMA_VERSION, schema apply and the version bump in ONE
@@ -81,6 +87,11 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// v3: quarantine.stream — retry dispatch by hydration document (schema.sql
 /// records why an opaque node id cannot carry that fact itself).
 ///
+/// v4: the sync_runs run-telemetry table (hardening milestone) — one flat
+/// row per completed run, so trends are a `query` away without a telemetry
+/// store growing underneath. An archive fact only; no emitted field changed
+/// shape (`stats` gained additive keys under the additive-only contract).
+///
 /// MIGRATION POLICY, decided here so the machinery is not re-proposed every
 /// schema change: migrations begin at the first RELEASED binary — an
 /// archive someone cannot cheaply rebuild. Until then the archive is a
@@ -96,7 +107,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// TABLE migration existed briefly and was verified correct; it was deleted
 /// by this policy, not by a defect (the git history holds it if the first
 /// release ever needs the pattern back).
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 
@@ -116,9 +127,29 @@ impl RwArchive {
         &mut self.0
     }
 
-    /// Consume the wrapper for code that needs to own the `Connection`.
-    pub fn into_inner(self) -> Connection {
-        self.0
+    // No into_inner, DECIDED: an escaped Connection would outlive the
+    // truncate-on-close mechanism below, making "the WAL is truncated at
+    // writer close" hold on some paths and not others. Nothing needs to own
+    // the raw Connection; if something ever does, it must also own the close
+    // behavior it is opting out of.
+}
+
+/// Best-effort WAL truncate at writer close (hardening milestone): a busy
+/// steady-state sync can leave a WAL comparable to the archive itself, and
+/// the next writer may be days away. TRUNCATE (not PASSIVE) returns the disk
+/// space. Best-effort is load-bearing: a reader holding a WAL snapshot makes
+/// the truncate report busy, and a run that synced correctly must not turn
+/// into an error over housekeeping — so the result is deliberately ignored
+/// (the next close retries by existing). Drop, not an explicit close method:
+/// every writer path — sync's run, the targeted form, a mid-run error unwind,
+/// every test — closes through here, so the mechanism cannot be forgotten.
+impl Drop for RwArchive {
+    fn drop(&mut self) {
+        // wal_checkpoint returns a (busy, log, checkpointed) row; both the
+        // row and any error are non-actionable here by the argument above.
+        let _ = self
+            .0
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
     }
 }
 
@@ -135,6 +166,21 @@ impl RoArchive {
     }
 }
 
+/// The `stats`-audit connection: SQLITE_OPEN_READ_ONLY, deliberately WITHOUT
+/// query_only — see [`open_ro_audit`] for the argument and its bounds. A
+/// distinct type so the weakened belt cannot be handed to a verb that runs
+/// operator SQL by accident of sharing [`RoArchive`]'s signature.
+pub struct RoAuditArchive(Connection);
+
+impl RoAuditArchive {
+    /// The underlying connection. Archive writes fail at runtime via the
+    /// READ_ONLY open flag; temp-schema writes (the fts5vocab audit tables)
+    /// succeed, which is this type's whole reason to exist.
+    pub fn conn(&self) -> &Connection {
+        &self.0
+    }
+}
+
 /// Open (creating if absent) the read-write archive and migrate it to
 /// [`SCHEMA_VERSION`].
 ///
@@ -144,22 +190,24 @@ impl RoArchive {
 pub fn open_rw(path: &Path) -> Result<RwArchive> {
     if let Some(parent) = path.parent() {
         ensure_dir_0700(parent)?;
+        refuse_writable_parent(parent)?;
     }
     create_0600_if_absent(path)?;
 
     // create_0600_if_absent already birthed the file at 0600, so in the normal
     // path SQLITE_OPEN_CREATE never sets a mode. It is kept only to survive the
     // vanishing-file race between our create and this open — and in that race
-    // branch O_CREAT recreates the file at umask-default (not 0600). That narrow
-    // gap is undefended (PLANNED milestone 5: re-verify the fd's mode after
-    // open), but reaching it requires already controlling the 0700 archive
-    // directory. No NOFOLLOW — it false-refuses archives under symlinked parent
-    // dirs; the 0700 directory is the symlink-swap defense (module docs).
+    // branch O_CREAT recreates the file at umask-default (not 0600). The mode
+    // re-check after open (below) closes that branch: whatever file this open
+    // landed on must still be owner-only. No NOFOLLOW — it false-refuses
+    // archives under symlinked parent dirs; the 0700 directory is the
+    // symlink-swap defense (module docs).
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let mut conn = Connection::open_with_flags(path, flags)
         .map_err(|e| sqlite_err(path, "cannot open archive", e))?;
+    refuse_loose_archive_mode(path)?;
     configure_conn(&conn, path)?;
     set_wal(&conn, path)?;
     conn.pragma_update(None, "synchronous", "NORMAL")
@@ -218,10 +266,55 @@ pub fn open_ro(path: &Path) -> Result<RoArchive> {
     Ok(RoArchive(conn))
 }
 
+/// Open the archive for the `stats` audits: SQLITE_OPEN_READ_ONLY but NO
+/// PRAGMA query_only, because the FTS integrity audit introspects the index
+/// through `fts5vocab` TEMP virtual tables (the only read-only view of what
+/// the index actually holds — a plain fts5 full scan answers from the
+/// CONTENT table, so it cannot witness a desync), and query_only refuses
+/// even temp-schema writes. What this trades, precisely: archive
+/// write-immunity remains a mechanism (the VFS-level READ_ONLY flag), but
+/// the belt query_only adds — refusing ATTACH-based writes to OTHER files —
+/// is off. Admissible only because stats executes exclusively its own
+/// literal SQL; the `query` verb, which runs operator SQL, keeps the full
+/// pair and must never move to this open. Same existence and version gates
+/// as [`open_ro`]. Reversal evidence: an fts5 mechanism that lets a
+/// query_only connection see index rowids would retire this open.
+pub fn open_ro_audit(path: &Path) -> Result<RoAuditArchive> {
+    match path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(Error::config(format!(
+                "no archive at {} — run `ghgraph sync` first",
+                path.display()
+            )));
+        }
+        Err(e) => {
+            return Err(Error::config(format!(
+                "cannot access archive {}: {e}",
+                path.display()
+            )));
+        }
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)
+        .map_err(|e| sqlite_err(path, "cannot open archive", e))?;
+    configure_conn(&conn, path)?;
+    // The same determinism hook as open_ro: the audit statements are
+    // contract output too and must hold under reversed unordered selects.
+    if std::env::var_os("GHGRAPH_TEST_REVERSE_SELECTS").is_some_and(|v| v == "1") {
+        conn.pragma_update(None, "reverse_unordered_selects", true)
+            .map_err(|e| sqlite_err(path, "cannot set reverse_unordered_selects on", e))?;
+    }
+    let version = user_version(&conn, path)?;
+    if version != SCHEMA_VERSION {
+        return Err(wrong_version(path, version));
+    }
+    Ok(RoAuditArchive(conn))
+}
+
 /// Create the parent chain, with any directory WE create born 0700. A
-/// pre-existing directory is left as-is — its mode is the operator's (see the
-/// precondition in the module docs; enforcing 0700 on a pre-existing parent is
-/// PLANNED milestone 5).
+/// pre-existing directory keeps its mode — the integrity floor it must still
+/// meet is `refuse_writable_parent`, checked by open_rw right after this.
 fn ensure_dir_0700(dir: &Path) -> Result<()> {
     if dir.as_os_str().is_empty() {
         return Ok(());
@@ -243,6 +336,60 @@ fn ensure_dir_0700(dir: &Path) -> Result<()> {
         .mode(0o700)
         .create(dir)
         .map_err(|e| Error::config(format!("cannot create archive dir {}: {e}", dir.display())))
+}
+
+/// Refuse a group/other-WRITABLE archive directory without the sticky bit
+/// (module docs carry the full argument): the 0700-directory symlink-swap
+/// defense is void exactly when someone else can write the directory, so
+/// that state is a refusal, not a footnote. Sticky (the /tmp shape) is
+/// exempt — non-owners cannot unlink or rename our entries there, which is
+/// the operation a swap needs. Checked on the IMMEDIATE parent only: an
+/// ancestor's mode governs reaching the directory, not replacing entries
+/// inside it. RW-side only: the reader creates nothing and inherits a
+/// directory the writer already vetted; refusing reads of an archive that
+/// synced fine yesterday would punish the reader for the writer's problem.
+fn refuse_writable_parent(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(dir)
+        .map_err(|e| Error::config(format!("cannot access archive dir {}: {e}", dir.display())))?;
+    let mode = meta.permissions().mode();
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Err(Error::config(format!(
+            "archive dir {} is group/other-writable (mode {:03o}) — anyone with write \
+             access could swap the archive through a symlink; chmod go-w the directory \
+             or point db_path somewhere private",
+            dir.display(),
+            mode & 0o7777
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse an archive file with group/other permission bits, re-checked AFTER
+/// the SQLite open so it covers whatever file the open actually landed on —
+/// this closes the vanishing-file race in open_rw (a file recreated by
+/// O_CREAT at umask default between our 0600 birth and the open) and, the
+/// common case, a pre-existing archive born looser than ghgraph ever creates
+/// (a chmod'd file, or one copied in from elsewhere). A refusal with the
+/// remedy, never a repair chmod: modes are set at creation by design, and a
+/// silent chmod here would paper over whoever loosened it. Path re-stat, not
+/// literally the fd (rusqlite does not expose it): a swap between open and
+/// stat requires writing the parent, which `refuse_writable_parent` already
+/// bounds.
+fn refuse_loose_archive_mode(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| Error::config(format!("cannot stat archive {}: {e}", path.display())))?;
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(Error::config(format!(
+            "archive {} has group/other permission bits (mode {:03o}) — ghgraph creates \
+             it 0600; chmod 600 the file, or remove it and resync",
+            path.display(),
+            mode & 0o7777
+        )));
+    }
+    Ok(())
 }
 
 /// Birth the db file at 0600 if it does not exist. create_new is O_CREAT|O_EXCL:
@@ -470,10 +617,140 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(dir_mode, 0o700, "archive dir should be 0700");
-        // Note: this reads back the final bits under the ambient umask; since
-        // umask only clears bits, an unset .mode() call could still pass here
-        // under a benign umask. The explicit-mode guarantee is argued in the
-        // module docs; a umask-injecting harness is PLANNED (milestone 5).
+        // This reads back the final bits under the ambient umask; since umask
+        // only clears bits, an unset .mode() call could still pass here under
+        // a benign umask. umask_zero_still_births_0700_0600 below closes that
+        // hole by re-running the creation under `umask 0`.
+    }
+
+    /// The umask-injection harness: re-exec this test binary under
+    /// `sh -c 'umask 0'` and prove creation is STILL 0700/0600 — under a
+    /// zero umask an unset .mode() would leak 0755/0644, so this test dies
+    /// exactly when the explicit-mode call is dropped. Re-exec because umask
+    /// is process-global: setting it in-process would race sibling tests,
+    /// and std exposes no umask API anyway (the libc dep is off the floor).
+    #[test]
+    fn umask_zero_still_births_0700_0600() {
+        let s = Scratch::new();
+        std::fs::create_dir_all(&s.dir).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"umask 0; exec "$0" --exact db::tests::umask_child_open_rw --ignored"#)
+            .arg(&exe)
+            .env("GHGRAPH_TEST_UMASK_DIR", &s.dir)
+            .output()
+            .expect("re-exec test binary under umask 0");
+        assert!(
+            out.status.success(),
+            "umask-0 child failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Assert from the parent side too — the child ran under umask 0, so
+        // these bits can only be here because .mode() put them here.
+        let db = s.dir.join("sub/ghgraph.db");
+        let file_mode = std::fs::metadata(&db).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(file_mode, 0o600, "db must be 0600 even under umask 0");
+        let dir_mode = std::fs::metadata(db.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "archive dir must be 0700 even under umask 0"
+        );
+    }
+
+    /// Child half of umask_zero_still_births_0700_0600 — ignored so the
+    /// normal sweep never runs it directly; when it IS invoked without the
+    /// parent's env (e.g. `make check-heavy` runs everything ignored), it
+    /// has nothing to assert and exits clean.
+    #[test]
+    #[ignore = "child of umask_zero_still_births_0700_0600, spawned by it"]
+    fn umask_child_open_rw() {
+        let Some(dir) = std::env::var_os("GHGRAPH_TEST_UMASK_DIR") else {
+            return;
+        };
+        let path = PathBuf::from(dir).join("sub/ghgraph.db");
+        let _arc = open_rw(&path).unwrap();
+    }
+
+    #[test]
+    fn refuses_group_writable_parent_dir() {
+        let s = Scratch::new();
+        std::fs::create_dir_all(&s.dir).unwrap();
+        std::fs::set_permissions(&s.dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let err = open_rw(&s.join("ghgraph.db"))
+            .err()
+            .expect("a group-writable parent must be refused");
+        assert_eq!(err.code, crate::error::Code::Configuration);
+        assert!(
+            err.message.contains("chmod go-w"),
+            "message must carry the remedy, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn sticky_writable_parent_is_allowed() {
+        // The /tmp shape: world-writable but sticky — non-owners cannot
+        // unlink or rename our entries, which is the operation a symlink
+        // swap needs, so this is not the state the refusal exists for.
+        let s = Scratch::new();
+        std::fs::create_dir_all(&s.dir).unwrap();
+        std::fs::set_permissions(&s.dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        open_rw(&s.join("ghgraph.db")).expect("sticky writable dir must open");
+    }
+
+    #[test]
+    fn refuses_loose_archive_file_mode() {
+        // A pre-existing archive with group/other bits — chmod'd, or copied
+        // in — is refused with the remedy on the next writer open; the same
+        // check is what closes open_rw's vanishing-file race branch.
+        let s = Scratch::new();
+        let path = s.join("ghgraph.db");
+        {
+            let _a = open_rw(&path).unwrap();
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let err = open_rw(&path)
+            .err()
+            .expect("a group-readable archive must be refused");
+        assert_eq!(err.code, crate::error::Code::Configuration);
+        assert!(
+            err.message.contains("chmod 600"),
+            "message must carry the remedy, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn wal_truncates_at_writer_close() {
+        // Write enough to grow a WAL, then drop the writer: the Drop-side
+        // checkpoint must leave the -wal empty (this single-connection case
+        // has no reader to make it busy, so best-effort succeeds fully).
+        let s = Scratch::new();
+        let path = s.join("ghgraph.db");
+        {
+            let arc = open_rw(&path).unwrap();
+            arc.conn()
+                .execute_batch(
+                    "CREATE TABLE _bulk(x); \
+                     INSERT INTO _bulk (x) \
+                       WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n LIMIT 500) \
+                       SELECT zeroblob(1024) FROM n",
+                )
+                .unwrap();
+            let wal = std::fs::metadata(path.with_extension("db-wal"))
+                .expect("-wal exists while the writer is open");
+            assert!(wal.len() > 0, "WAL must be non-empty before close");
+        }
+        let wal_len = std::fs::metadata(path.with_extension("db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(wal_len, 0, "writer close must truncate the WAL");
     }
 
     #[test]

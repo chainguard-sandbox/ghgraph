@@ -1228,6 +1228,107 @@ fn golden_stats() {
     golden_verb(&s, "stats.json", &["stats"]);
 }
 
+/// The audits' negative half: the golden proves an intact archive reads
+/// all-zeros; this corrupts one archive seven distinct ways — each a state
+/// the write path is supposed to make unrepresentable — and asserts every
+/// audit counts exactly its own violation. Corruption goes through a raw
+/// rusqlite connection: the point is to forge states ghgraph itself cannot
+/// write.
+#[test]
+fn audits_fire_on_a_corrupted_archive() {
+    let s = Scratch::new();
+    seed(&s);
+    standard_config(&s);
+    {
+        let conn = rusqlite::Connection::open(s.db_path()).unwrap();
+        // An orphaned comment: parent pk 9999 resolves nowhere. The insert
+        // trigger indexes it in FTS (consistently — this row must trip the
+        // orphan audit and ONLY the orphan audit).
+        conn.execute(
+            "INSERT INTO comments (pk, id, parent_kind, parent, body, created_at) \
+             VALUES (9001, 'C_orphan', 'pr', 9999, 'orphan body', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // An orphaned observation.
+        conn.execute(
+            "INSERT INTO observations (pr, observed_at, field, old, new) \
+             VALUES (9999, '2026-01-01T00:00:00Z', 'state', 'OPEN', 'CLOSED')",
+            [],
+        )
+        .unwrap();
+        // A chain break on a real PR: the second row's old ('MERGED') is
+        // not the first row's new ('CLOSED') — an observation against a
+        // value the archive never held.
+        conn.execute(
+            "INSERT INTO observations (pr, observed_at, field, old, new) \
+             VALUES (1, '2026-01-06T00:00:00Z', 'state', 'OPEN', 'CLOSED')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO observations (pr, observed_at, field, old, new) \
+             VALUES (1, '2026-01-07T00:00:00Z', 'state', 'MERGED', 'OPEN')",
+            [],
+        )
+        .unwrap();
+        // FTS 'missing': remove PR #1's index entry through fts5's special
+        // delete command, leaving the content row in place — the desync the
+        // triggers exist to prevent, forged directly.
+        conn.execute(
+            "INSERT INTO prs_fts(prs_fts, rowid, title, body) \
+             SELECT 'delete', pk, title, body FROM prs WHERE pk = 1",
+            [],
+        )
+        .unwrap();
+        // FTS 'index_orphans': an index entry whose rowid has no content
+        // row (the VACUUM-renumber signature).
+        conn.execute(
+            "INSERT INTO prs_fts(rowid, title, body) VALUES (8888, 'ghost', 'ghost body')",
+            [],
+        )
+        .unwrap();
+        // An unlicensed quarantine row: no sync_state row for its
+        // (repo, stream) means no watermark whose advance it licensed.
+        conn.execute(
+            "INSERT INTO quarantine (id, repo, stream, attempts, next_retry_at, error_class) \
+             VALUES ('Q_x', 'octo/nowhere', 'pr', 1, '2026-01-01T00:00:00Z', 'transient')",
+            [],
+        )
+        .unwrap();
+        // A watermark our own RFC 3339 parser refuses.
+        conn.execute(
+            "INSERT INTO sync_state (repo, stream, last_item_updated_at, fingerprint) \
+             VALUES ('octo/bad', 'pr', 'not-a-timestamp', '{}')",
+            [],
+        )
+        .unwrap();
+    }
+    let doc = s.run_ok(&["stats"]);
+    let a = &doc["stats"]["audits"];
+    assert_eq!(a["orphans"]["comments"], 1, "comment orphan: {a}");
+    assert_eq!(a["orphans"]["observations"], 1, "observation orphan: {a}");
+    assert_eq!(a["orphans"]["refs"], 0, "untouched tables stay clean: {a}");
+    assert_eq!(a["observation_chain_breaks"], 1, "chain break: {a}");
+    assert_eq!(a["fts"]["prs"]["missing"], 1, "deindexed content row: {a}");
+    assert_eq!(
+        a["fts"]["prs"]["index_orphans"], 1,
+        "ghost index entry: {a}"
+    );
+    assert_eq!(
+        a["fts"]["comments"]["missing"], 0,
+        "trigger-indexed forgeries are FTS-consistent: {a}"
+    );
+    assert_eq!(
+        a["watermark"]["quarantine_unlicensed"], 1,
+        "unlicensed quarantine: {a}"
+    );
+    assert_eq!(
+        a["watermark"]["malformed_watermarks"], 1,
+        "unparseable watermark: {a}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Meta behaviors the fixed-past seed cannot golden
 

@@ -1,0 +1,65 @@
+ghgraph v0.1.0 (/Users/eslerm/code/eslerm/ghgraph)
+├── clap v4.6.4
+│   ├── clap_builder v4.6.2
+│   │   ├── anstyle v1.0.14
+│   │   └── clap_lex v1.1.0
+│   └── clap_derive v4.6.4 (proc-macro)
+│       ├── heck v0.5.0
+│       ├── proc-macro2 v1.0.107
+│       │   └── unicode-ident v1.0.24
+│       ├── quote v1.0.47
+│       │   └── proc-macro2 v1.0.107 (*)
+│       └── syn v3.0.3
+│           ├── proc-macro2 v1.0.107 (*)
+│           ├── quote v1.0.47 (*)
+│           └── unicode-ident v1.0.24
+├── rusqlite v0.40.1
+│   ├── bitflags v2.13.1
+│   ├── fallible-iterator v0.3.0
+│   ├── fallible-streaming-iterator v0.1.9
+│   ├── hashlink v0.12.1
+│   │   └── hashbrown v0.17.1
+│   │       └── foldhash v0.2.0
+│   ├── libsqlite3-sys v0.38.1
+│   ├── smallvec v1.15.2
+│   └── sqlite-wasm-rs v0.5.5
+│       ├── js-sys v0.3.103
+│       │   ├── cfg-if v1.0.4
+│       │   └── wasm-bindgen v0.2.126
+│       │       ├── cfg-if v1.0.4
+│       │       ├── once_cell v1.21.4
+│       │       ├── wasm-bindgen-macro v0.2.126 (proc-macro)
+│       │       │   ├── quote v1.0.47 (*)
+│       │       │   └── wasm-bindgen-macro-support v0.2.126
+│       │       │       ├── bumpalo v3.20.3
+│       │       │       ├── proc-macro2 v1.0.107 (*)
+│       │       │       ├── quote v1.0.47 (*)
+│       │       │       ├── syn v2.0.119
+│       │       │       │   ├── proc-macro2 v1.0.107 (*)
+│       │       │       │   ├── quote v1.0.47 (*)
+│       │       │       │   └── unicode-ident v1.0.24
+│       │       │       └── wasm-bindgen-shared v0.2.126
+│       │       │           └── unicode-ident v1.0.24
+│       │       └── wasm-bindgen-shared v0.2.126 (*)
+│       ├── rsqlite-vfs v0.1.1
+│       │   ├── hashbrown v0.16.1
+│       │   │   └── foldhash v0.2.0
+│       │   └── thiserror v2.0.19
+│       │       └── thiserror-impl v2.0.19 (proc-macro)
+│       │           ├── proc-macro2 v1.0.107 (*)
+│       │           ├── quote v1.0.47 (*)
+│       │           └── syn v3.0.3 (*)
+│       └── wasm-bindgen v0.2.126 (*)
+├── serde v1.0.229
+│   ├── serde_core v1.0.229
+│   │   └── serde_derive v1.0.229 (proc-macro)
+│   │       ├── proc-macro2 v1.0.107 (*)
+│   │       ├── quote v1.0.47 (*)
+│   │       └── syn v3.0.3 (*)
+│   └── serde_derive v1.0.229 (proc-macro) (*)
+└── serde_json v1.0.151
+    ├── itoa v1.0.18
+    ├── memchr v2.8.3
+    ├── serde v1.0.229 (*)
+    ├── serde_core v1.0.229 (*)
+    └── zmij v1.0.23

@@ -167,6 +167,140 @@ pub const CONTRACT_VERSION: u64 = 1;
 /// checked. Advisory only — reads never fail stale.
 const STALE_AFTER_SECS: i64 = 86_400;
 
+// ---------------------------------------------------------------------------
+// Hot read statements
+//
+// Named here and shared by two consumers: the verb that runs the statement
+// and the explain_gates test module (bottom of this file) that EXPLAIN QUERY
+// PLAN-gates it (DESIGN.md Verification). ONE string for both, so the plan
+// that was proven is the plan that runs — a gate over a copied string gates
+// nothing once the copies drift. Statements built per-invocation from
+// runtime input (the `query` verb; `prs` limits) are gated through the same
+// shared fragments their verbs format from.
+
+/// Attention's PR candidate sweep: deliberately a full pass over open PRs —
+/// every bucket judgment needs most of the row, so no secondary index could
+/// cover it and the scan IS the intended plan (the gate pins that intent).
+const HOT_ATTENTION_PR_CANDIDATES: &str = "SELECT pk, repo, number, title, is_draft, author, author_assoc, \
+            review_decision, created_at, updated_at, url, truncated, verified_at, \
+            head_committed_at \
+     FROM prs WHERE state = 'OPEN' AND deleted_at IS NULL ORDER BY repo, number";
+
+/// Attention's issue candidate sweep — same full-pass argument as the PRs.
+const HOT_ATTENTION_ISSUE_CANDIDATES: &str = "SELECT pk, repo, number, title, author, author_assoc, labels, assignees, \
+            updated_at, url, truncated, verified_at \
+     FROM issues WHERE state = 'OPEN' AND deleted_at IS NULL ORDER BY repo, number";
+
+/// Per-candidate and per-`pr`-view children: each runs once per PR (or per
+/// thread), so each must SEARCH its index, never scan — attention over N
+/// open PRs would otherwise be N full child-table scans.
+const HOT_REVIEW_REQUESTS_BY_PR: &str =
+    "SELECT reviewer, kind FROM review_requests WHERE pr = ?1 ORDER BY kind, reviewer";
+
+const HOT_REVIEWS_BY_PR: &str = "SELECT author, state, created_at FROM comments \
+     WHERE parent_kind = 'pr' AND parent = ?1 AND kind = 'review' \
+       AND deleted_at IS NULL \
+     ORDER BY created_at, id";
+
+const HOT_OBS_HEAD_FLIP: &str = "SELECT observed_at FROM observations \
+     WHERE pr = ?1 AND field = 'head_sha' \
+     ORDER BY observed_at DESC, seq DESC LIMIT 1";
+
+const HOT_UNRESOLVED_THREADS_BY_PR: &str = "SELECT pk FROM review_threads \
+     WHERE pr = ?1 AND deleted_at IS NULL AND is_resolved = 0 ORDER BY pk";
+
+const HOT_THREAD_SIGNAL_COMMENTS: &str = "SELECT author, is_minimized, deleted_at IS NOT NULL FROM comments \
+     WHERE thread = ?1 ORDER BY created_at, id";
+
+const HOT_VIEWER_LAST_ACTIVITY: &str = "SELECT MAX(created_at) FROM comments \
+     WHERE parent_kind = 'pr' AND parent = ?1 AND deleted_at IS NULL \
+       AND is_minimized = 0 AND author = ?2 COLLATE NOCASE";
+
+const HOT_OTHER_LAST_ACTIVITY: &str = "SELECT MAX(created_at) FROM comments \
+     WHERE parent_kind = 'pr' AND parent = ?1 AND deleted_at IS NULL \
+       AND is_minimized = 0 \
+       AND (author IS NULL OR author <> ?2 COLLATE NOCASE) \
+       AND NOT (kind = 'review' AND state IS 'APPROVED')";
+
+const HOT_ISSUE_SPEAKER_ASSOCS: &str = "SELECT DISTINCT author_assoc FROM comments \
+     WHERE parent_kind = 'issue' AND parent = ?1 AND deleted_at IS NULL \
+       AND is_minimized = 0";
+
+const HOT_PR_BY_REPO_NUMBER: &str = "SELECT pk, title, body, state, is_draft, author, author_assoc, head_ref, \
+            base_ref, head_sha, review_decision, created_at, updated_at, merged_at, \
+            closed_at, url, truncated, verified_at, deleted_at, head_committed_at \
+     FROM prs WHERE repo = ?1 AND number = ?2";
+
+const HOT_THREADS_DISPLAY: &str = "SELECT pk, id, path, line, is_resolved, is_outdated FROM review_threads \
+     WHERE pr = ?1 AND deleted_at IS NULL \
+     ORDER BY path, line, id";
+
+const HOT_THREAD_COMMENTS_DISPLAY: &str = "SELECT author, author_assoc, body, created_at, updated_at, is_minimized, \
+            deleted_at, url \
+     FROM comments WHERE thread = ?1 ORDER BY created_at, id";
+
+const HOT_PR_TOP_COMMENTS: &str = "SELECT author, author_assoc, body, created_at, updated_at, is_minimized, \
+            deleted_at, url \
+     FROM comments WHERE parent_kind = 'pr' AND parent = ?1 AND kind = 'comment' \
+     ORDER BY created_at, id";
+
+const HOT_REFS_BY_SRC: &str = "SELECT r.kind, r.source, r.target_repo, r.target_number, \
+            EXISTS (SELECT 1 FROM prs t \
+                    WHERE t.repo = r.target_repo AND t.number = r.target_number) \
+            OR EXISTS (SELECT 1 FROM issues t \
+                       WHERE t.repo = r.target_repo AND t.number = r.target_number) \
+     FROM refs r WHERE r.src_pr = ?1 \
+     ORDER BY r.kind, r.source, r.target_repo, r.target_number";
+
+const HOT_LINKED_ISSUES: &str = "SELECT DISTINCT r.target_repo, r.target_number, i.title, i.state, i.url, \
+            i.repo IS NOT NULL \
+     FROM refs r LEFT JOIN issues i \
+       ON i.repo = r.target_repo AND i.number = r.target_number \
+     WHERE r.src_pr = ?1 AND r.kind = 'fixes' \
+     ORDER BY r.target_repo, r.target_number";
+
+/// The `prs` listing predicate, shared by its count and page statements —
+/// and by the gate, which formats the same page statement the verb does.
+const HOT_PRS_WHERE: &str = "(?1 IS NULL OR repo = ?1) \
+     AND (?2 IS NULL OR author = ?2 COLLATE NOCASE) \
+     AND (?3 OR (state = 'OPEN' AND deleted_at IS NULL))";
+
+const SEARCH_PR_COLS: &str = "p.repo, p.number, p.title, p.state, p.updated_at, p.url, \
+     p.author, p.author_assoc, p.truncated, p.verified_at, p.deleted_at";
+const SEARCH_ISSUE_COLS: &str = "i.repo, i.number, i.title, i.state, i.updated_at, i.url, \
+     i.author, i.author_assoc, i.truncated, i.verified_at, i.deleted_at";
+
+/// The four search statements: FTS MATCH drives, content rows resolve by
+/// rowid / pk — the gate asserts no content table is ever scanned.
+fn search_sql_prs() -> String {
+    format!(
+        "SELECT {SEARCH_PR_COLS} FROM prs_fts f JOIN prs p ON p.pk = f.rowid \
+              WHERE prs_fts MATCH ?1"
+    )
+}
+fn search_sql_issues() -> String {
+    format!(
+        "SELECT {SEARCH_ISSUE_COLS} FROM issues_fts f JOIN issues i ON i.pk = f.rowid \
+              WHERE issues_fts MATCH ?1"
+    )
+}
+fn search_sql_pr_comments() -> String {
+    format!(
+        "SELECT {SEARCH_PR_COLS} FROM comments_fts f \
+         JOIN comments c ON c.pk = f.rowid AND c.parent_kind = 'pr' \
+         JOIN prs p ON p.pk = c.parent \
+         WHERE comments_fts MATCH ?1"
+    )
+}
+fn search_sql_issue_comments() -> String {
+    format!(
+        "SELECT {SEARCH_ISSUE_COLS} FROM comments_fts f \
+         JOIN comments c ON c.pk = f.rowid AND c.parent_kind = 'issue' \
+         JOIN issues i ON i.pk = c.parent \
+         WHERE comments_fts MATCH ?1"
+    )
+}
+
 pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
     let archive = open(cfg)?;
     let conn = read_snapshot(&archive)?;
@@ -193,12 +327,7 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
     // number) is a total order; the per-bucket recency sort below re-orders
     // deterministically on top of it.
     let mut cand_stmt = conn
-        .prepare(
-            "SELECT pk, repo, number, title, is_draft, author, author_assoc, \
-                    review_decision, created_at, updated_at, url, truncated, verified_at, \
-                    head_committed_at \
-             FROM prs WHERE state = 'OPEN' AND deleted_at IS NULL ORDER BY repo, number",
-        )
+        .prepare(HOT_ATTENTION_PR_CANDIDATES)
         .map_err(classify_ours)?;
     struct Cand {
         pk: i64,
@@ -241,34 +370,15 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
 
     // One prepared statement per signal, reused across candidates.
     let mut rq_stmt = conn
-        .prepare("SELECT reviewer, kind FROM review_requests WHERE pr = ?1 ORDER BY kind, reviewer")
+        .prepare(HOT_REVIEW_REQUESTS_BY_PR)
         .map_err(classify_ours)?;
-    let mut rev_stmt = conn
-        .prepare(
-            "SELECT author, state, created_at FROM comments \
-             WHERE parent_kind = 'pr' AND parent = ?1 AND kind = 'review' \
-               AND deleted_at IS NULL \
-             ORDER BY created_at, id",
-        )
-        .map_err(classify_ours)?;
-    let mut flip_stmt = conn
-        .prepare(
-            "SELECT observed_at FROM observations \
-             WHERE pr = ?1 AND field = 'head_sha' \
-             ORDER BY observed_at DESC, seq DESC LIMIT 1",
-        )
-        .map_err(classify_ours)?;
+    let mut rev_stmt = conn.prepare(HOT_REVIEWS_BY_PR).map_err(classify_ours)?;
+    let mut flip_stmt = conn.prepare(HOT_OBS_HEAD_FLIP).map_err(classify_ours)?;
     let mut thread_stmt = conn
-        .prepare(
-            "SELECT pk FROM review_threads \
-             WHERE pr = ?1 AND deleted_at IS NULL AND is_resolved = 0 ORDER BY pk",
-        )
+        .prepare(HOT_UNRESOLVED_THREADS_BY_PR)
         .map_err(classify_ours)?;
     let mut tc_stmt = conn
-        .prepare(
-            "SELECT author, is_minimized, deleted_at IS NOT NULL FROM comments \
-             WHERE thread = ?1 ORDER BY created_at, id",
-        )
+        .prepare(HOT_THREAD_SIGNAL_COMMENTS)
         .map_err(classify_ours)?;
     // Substantive activity split by party. Minimized and deleted comments
     // are neither activity nor participation (attention.rs); logins compare
@@ -276,11 +386,7 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
     // equivalence (identity.rs, the prs --author precedent). MAX over
     // RFC 3339 "Z" ingest text; attention.rs re-parses before judging.
     let mut viewer_last_stmt = conn
-        .prepare(
-            "SELECT MAX(created_at) FROM comments \
-             WHERE parent_kind = 'pr' AND parent = ?1 AND deleted_at IS NULL \
-               AND is_minimized = 0 AND author = ?2 COLLATE NOCASE",
-        )
+        .prepare(HOT_VIEWER_LAST_ACTIVITY)
         .map_err(classify_ours)?;
     // An APPROVED review verdict is not a reply (attention.rs module docs:
     // counting it would starve ready_to_merge behind they_replied). `IS`,
@@ -290,13 +396,7 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
     // polarity). Unreachable from ghgraph's own writer, but a derivation
     // input is validated where it is consumed (attention.rs).
     let mut other_last_stmt = conn
-        .prepare(
-            "SELECT MAX(created_at) FROM comments \
-             WHERE parent_kind = 'pr' AND parent = ?1 AND deleted_at IS NULL \
-               AND is_minimized = 0 \
-               AND (author IS NULL OR author <> ?2 COLLATE NOCASE) \
-               AND NOT (kind = 'review' AND state IS 'APPROVED')",
-        )
+        .prepare(HOT_OTHER_LAST_ACTIVITY)
         .map_err(classify_ours)?;
 
     // (updated_at, repo, number, row) per bucket, sorted after collection.
@@ -488,11 +588,7 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
     // scan — it can't change the outcome.
     if maintainer_scope {
         let mut issue_stmt = conn
-            .prepare(
-                "SELECT pk, repo, number, title, author, author_assoc, labels, assignees, \
-                        updated_at, url, truncated, verified_at \
-                 FROM issues WHERE state = 'OPEN' AND deleted_at IS NULL ORDER BY repo, number",
-            )
+            .prepare(HOT_ATTENTION_ISSUE_CANDIDATES)
             .map_err(classify_ours)?;
         // Association values of everyone who substantively spoke; the
         // maintainer judgment over them is attention.rs's
@@ -501,11 +597,7 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
         // BY: the set is consumed by any(), so row order cannot reach
         // output (held under reverse_unordered_selects like every read).
         let mut assoc_stmt = conn
-            .prepare(
-                "SELECT DISTINCT author_assoc FROM comments \
-                 WHERE parent_kind = 'issue' AND parent = ?1 AND deleted_at IS NULL \
-                   AND is_minimized = 0",
-            )
+            .prepare(HOT_ISSUE_SPEAKER_ASSOCS)
             .map_err(classify_ours)?;
         struct IssueCand {
             pk: i64,
@@ -659,9 +751,7 @@ pub fn prs(
     // shows everything, deleted_at disclosed. --author matches by login_eq
     // semantics: logins are ASCII, so COLLATE NOCASE (ASCII-only in stock
     // SQLite) is the same equivalence (identity.rs).
-    const WHERE: &str = "(?1 IS NULL OR repo = ?1) \
-         AND (?2 IS NULL OR author = ?2 COLLATE NOCASE) \
-         AND (?3 OR (state = 'OPEN' AND deleted_at IS NULL))";
+    const WHERE: &str = HOT_PRS_WHERE;
     let params = rusqlite::params![
         repo.as_ref().map(|r| r.as_str()),
         author.as_ref().map(|a| a.as_str()),
@@ -742,10 +832,7 @@ pub fn pr(
 
     let row = conn
         .query_row(
-            "SELECT pk, title, body, state, is_draft, author, author_assoc, head_ref, \
-                    base_ref, head_sha, review_decision, created_at, updated_at, merged_at, \
-                    closed_at, url, truncated, verified_at, deleted_at, head_committed_at \
-             FROM prs WHERE repo = ?1 AND number = ?2",
+            HOT_PR_BY_REPO_NUMBER,
             // parse_pr_ref numbers are u64 by type; GitHub numbers fit i64
             // (SQLite INTEGER) with 2^63 to spare, so the saturation arm is
             // unreachable in practice and merely total.
@@ -803,13 +890,7 @@ pub fn pr(
     // head_sha flip: freshness must be proven against the CURRENT head
     // (attention.rs PushBounds); seq breaks the tie among equal times.
     let head_flip: Option<String> = conn
-        .query_row(
-            "SELECT observed_at FROM observations \
-             WHERE pr = ?1 AND field = 'head_sha' \
-             ORDER BY observed_at DESC, seq DESC LIMIT 1",
-            [pk],
-            |r| r.get(0),
-        )
+        .query_row(HOT_OBS_HEAD_FLIP, [pk], |r| r.get(0))
         .map(Some)
         .or_else(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Ok(None),
@@ -823,14 +904,7 @@ pub fn pr(
     // Reviews: kind='review' rows are latest-per-reviewer (the sync sweeps
     // superseded ones — the effective_review_state precondition). Deleted
     // rows are superseded-or-removed reviews, not display rows.
-    let mut stmt = conn
-        .prepare(
-            "SELECT author, state, created_at FROM comments \
-             WHERE parent_kind = 'pr' AND parent = ?1 AND kind = 'review' \
-               AND deleted_at IS NULL \
-             ORDER BY created_at, id",
-        )
-        .map_err(classify_ours)?;
+    let mut stmt = conn.prepare(HOT_REVIEWS_BY_PR).map_err(classify_ours)?;
     let reviews: Vec<(Option<String>, Option<String>, String)> = stmt
         .query_map([pk], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .map_err(classify_ours)?
@@ -879,10 +953,7 @@ pub fn pr(
     );
 
     let mut stmt = conn
-        .prepare(
-            "SELECT reviewer, kind FROM review_requests WHERE pr = ?1 \
-             ORDER BY kind, reviewer",
-        )
+        .prepare(HOT_REVIEW_REQUESTS_BY_PR)
         .map_err(classify_ours)?;
     let requests: Vec<Value> = stmt
         .query_map([pk], |r| {
@@ -897,13 +968,7 @@ pub fn pr(
     obj.insert("review_requests".into(), Value::Array(requests));
 
     // Threads, with their comments and the waiting_on derivation.
-    let mut stmt = conn
-        .prepare(
-            "SELECT pk, id, path, line, is_resolved, is_outdated FROM review_threads \
-             WHERE pr = ?1 AND deleted_at IS NULL \
-             ORDER BY path, line, id",
-        )
-        .map_err(classify_ours)?;
+    let mut stmt = conn.prepare(HOT_THREADS_DISPLAY).map_err(classify_ours)?;
     // (pk, node id, path, line, resolved, outdated)
     type ThreadRow = (i64, String, Option<String>, Option<i64>, bool, bool);
     let threads: Vec<ThreadRow> = stmt
@@ -922,14 +987,7 @@ pub fn pr(
         .map_err(classify_ours)?;
     let mut thread_docs = Vec::with_capacity(threads.len());
     for (tpk, tid, path, line, resolved, outdated) in threads {
-        let comments = comment_rows(
-            conn,
-            "SELECT author, author_assoc, body, created_at, updated_at, is_minimized, \
-                    deleted_at, url \
-             FROM comments WHERE thread = ?1 ORDER BY created_at, id",
-            tpk,
-            max_body_bytes,
-        )?;
+        let comments = comment_rows(conn, HOT_THREAD_COMMENTS_DISPLAY, tpk, max_body_bytes)?;
         let waiting = comments
             .derivation
             .iter()
@@ -957,32 +1015,14 @@ pub fn pr(
     }
     obj.insert("threads".into(), Value::Array(thread_docs));
 
-    let top_level = comment_rows(
-        conn,
-        "SELECT author, author_assoc, body, created_at, updated_at, is_minimized, \
-                deleted_at, url \
-         FROM comments WHERE parent_kind = 'pr' AND parent = ?1 AND kind = 'comment' \
-         ORDER BY created_at, id",
-        pk,
-        max_body_bytes,
-    )?;
+    let top_level = comment_rows(conn, HOT_PR_TOP_COMMENTS, pk, max_body_bytes)?;
     obj.insert("comments".into(), Value::Array(top_level.docs));
 
     // Refs resolve lazily at read time (schema.sql): a dangling target is
     // signal, never an error — resolved: false IS the disclosure. linked
     // issues are the fixes-refs joined against the issues cache, deduped on
     // (repo, number) since one edge can arrive by both api and body.
-    let mut stmt = conn
-        .prepare(
-            "SELECT r.kind, r.source, r.target_repo, r.target_number, \
-                    EXISTS (SELECT 1 FROM prs t \
-                            WHERE t.repo = r.target_repo AND t.number = r.target_number) \
-                    OR EXISTS (SELECT 1 FROM issues t \
-                               WHERE t.repo = r.target_repo AND t.number = r.target_number) \
-             FROM refs r WHERE r.src_pr = ?1 \
-             ORDER BY r.kind, r.source, r.target_repo, r.target_number",
-        )
-        .map_err(classify_ours)?;
+    let mut stmt = conn.prepare(HOT_REFS_BY_SRC).map_err(classify_ours)?;
     let ref_docs: Vec<Value> = stmt
         .query_map([pk], |r| {
             Ok(json!({
@@ -998,16 +1038,7 @@ pub fn pr(
         .map_err(classify_ours)?;
     obj.insert("refs".into(), Value::Array(ref_docs));
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT DISTINCT r.target_repo, r.target_number, i.title, i.state, i.url, \
-                    i.repo IS NOT NULL \
-             FROM refs r LEFT JOIN issues i \
-               ON i.repo = r.target_repo AND i.number = r.target_number \
-             WHERE r.src_pr = ?1 AND r.kind = 'fixes' \
-             ORDER BY r.target_repo, r.target_number",
-        )
-        .map_err(classify_ours)?;
+    let mut stmt = conn.prepare(HOT_LINKED_ISSUES).map_err(classify_ours)?;
     let linked: Vec<Value> = stmt
         .query_map([pk], |r| {
             Ok(json!({
@@ -1107,50 +1138,14 @@ pub fn search(cfg: &Config, query: &str, limit: usize) -> Result<Value> {
         Ok(())
     };
 
-    const PR_COLS: &str = "p.repo, p.number, p.title, p.state, p.updated_at, p.url, \
-                           p.author, p.author_assoc, p.truncated, p.verified_at, p.deleted_at";
-    const ISSUE_COLS: &str = "i.repo, i.number, i.title, i.state, i.updated_at, i.url, \
-                              i.author, i.author_assoc, i.truncated, i.verified_at, i.deleted_at";
-    collect(
-        "pr",
-        &format!(
-            "SELECT {PR_COLS} FROM prs_fts f JOIN prs p ON p.pk = f.rowid \
-                  WHERE prs_fts MATCH ?1"
-        ),
-        true,
-    )?;
-    collect(
-        "issue",
-        &format!(
-            "SELECT {ISSUE_COLS} FROM issues_fts f JOIN issues i ON i.pk = f.rowid \
-                  WHERE issues_fts MATCH ?1"
-        ),
-        true,
-    )?;
+    collect("pr", &search_sql_prs(), true)?;
+    collect("issue", &search_sql_issues(), true)?;
     // One row per MATCHED COMMENT (not per parent): the per-group count is
     // the fold, done here rather than in SQL so the parent lookup branches
     // on parent_kind exactly the way the schema demands (comments join by
     // parent_kind — schema.sql).
-    collect(
-        "pr",
-        &format!(
-            "SELECT {PR_COLS} FROM comments_fts f \
-             JOIN comments c ON c.pk = f.rowid AND c.parent_kind = 'pr' \
-             JOIN prs p ON p.pk = c.parent \
-             WHERE comments_fts MATCH ?1"
-        ),
-        false,
-    )?;
-    collect(
-        "issue",
-        &format!(
-            "SELECT {ISSUE_COLS} FROM comments_fts f \
-             JOIN comments c ON c.pk = f.rowid AND c.parent_kind = 'issue' \
-             JOIN issues i ON i.pk = c.parent \
-             WHERE comments_fts MATCH ?1"
-        ),
-        false,
-    )?;
+    collect("pr", &search_sql_pr_comments(), false)?;
+    collect("issue", &search_sql_issue_comments(), false)?;
 
     // Recency DESC, then (repo, number, kind) — a total order: (repo,
     // number, kind) is the map key, hence unique (kind disambiguates
@@ -1265,14 +1260,21 @@ pub fn query(cfg: &Config, sql: Option<&str>, limit: usize) -> Result<Value> {
 }
 
 pub fn stats(cfg: &Config) -> Result<Value> {
-    let archive = open(cfg)?;
-    let conn = read_snapshot(&archive)?;
+    // stats alone opens through db::open_ro_audit (READ_ONLY, no
+    // query_only — db.rs owns that argument and its bounds): the FTS
+    // integrity audit must see the INDEX, and the only read-only window
+    // onto it is a set of fts5vocab TEMP virtual tables. They are created
+    // BEFORE the snapshot transaction — temp schema, not main-db data — so
+    // the transaction below stays the same one-snapshot read every other
+    // verb runs (read_snapshot's argument applies unchanged).
+    let archive = db::open_ro_audit(&cfg.db_path()?)?;
+    create_fts_vocab_tables(archive.conn())?;
+    let conn = archive
+        .conn()
+        .unchecked_transaction()
+        .map_err(classify_ours)?;
     let conn = &*conn;
 
-    // Audits (orphans, observation chain, FTS integrity, watermark
-    // assertion) are PLANNED (milestone 5, hardening) — this is the count
-    // surface they will land beside.
-    //
     // The format! below interpolates TABLE NAMES — admissible only because
     // the names come from this literal array and nowhere else. Never add a
     // computed or user-supplied entry here; user-named tables go through
@@ -1287,6 +1289,7 @@ pub fn stats(cfg: &Config) -> Result<Value> {
         "refs",
         "review_requests",
         "review_threads",
+        "sync_runs",
     ] {
         let n: i64 = conn
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
@@ -1350,16 +1353,283 @@ pub fn stats(cfg: &Config) -> Result<Value> {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(classify_ours)?;
 
+    // Per-repo open-PR staleness: runs_since_advance (sync_state above)
+    // says a stream never FINISHES; this says what that costs — the oldest
+    // last-witnessed-complete hydration among PRs still open, and how many
+    // were never witnessed at all. Starvation and staleness visible, not
+    // inferred (ROADMAP, hardening).
+    let mut stmt = conn
+        .prepare(
+            "SELECT repo, COUNT(*), \
+                    COALESCE(SUM(CASE WHEN verified_at IS NULL THEN 1 ELSE 0 END), 0), \
+                    MIN(verified_at) \
+             FROM prs WHERE state = 'OPEN' AND deleted_at IS NULL \
+             GROUP BY repo ORDER BY repo",
+        )
+        .map_err(classify_ours)?;
+    let open_prs: Vec<Value> = stmt
+        .query_map([], |r| {
+            Ok(json!({
+                "repo": r.get::<_, String>(0)?,
+                "open": r.get::<_, i64>(1)?,
+                "never_verified": r.get::<_, i64>(2)?,
+                // NULL when every open PR is unverified (MIN over no
+                // non-null values) — the worst case reads as the emptiest.
+                "oldest_verified_at": r.get::<_, Option<String>>(3)?,
+            }))
+        })
+        .map_err(classify_ours)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(classify_ours)?;
+
     Ok(json!({
         "_meta": meta(cfg, conn)?,
         "stats": {
             "archive_schema_version": archive_version,
+            "audits": audits(conn)?,
             "counts": counts,
             "db_bytes": db_bytes,
+            "open_prs": open_prs,
             "quarantine": quarantine,
+            "sync_runs": sync_runs_trends(conn)?,
             "sync_state": sync_state,
         },
     }))
+}
+
+/// The sync_runs trend surface: the named consumers of the run rows
+/// (schema.sql), read over a trailing window so one outlier run cannot
+/// steer a decision. All integers; the median is the LOWER median
+/// (element at (n-1)/2 of the sorted list) so no average — and no float —
+/// ever appears.
+const TRAILING_RUNS: u32 = 20;
+
+fn sync_runs_trends(conn: &Connection) -> Result<Value> {
+    let runs: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sync_runs", [], |r| r.get(0))
+        .map_err(classify_ours)?;
+
+    // The batching input: median per-run overhead intercept. NULL rows
+    // (too few / degenerate samples that run) don't vote.
+    let mut stmt = conn
+        .prepare(
+            "SELECT overhead_intercept_ms FROM \
+               (SELECT seq, overhead_intercept_ms FROM sync_runs \
+                ORDER BY seq DESC LIMIT ?1) \
+             WHERE overhead_intercept_ms IS NOT NULL \
+             ORDER BY overhead_intercept_ms",
+        )
+        .map_err(classify_ours)?;
+    let intercepts: Vec<i64> = stmt
+        .query_map([TRAILING_RUNS], |r| r.get(0))
+        .map_err(classify_ours)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(classify_ours)?;
+    let median = intercepts
+        .get((intercepts.len().saturating_sub(1)) / 2)
+        .copied();
+
+    let (window_runs, tail_hits, full_walks, floor_runs, sleeps, sleep_ms): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(tail_hits), 0), COALESCE(SUM(full_walks), 0), \
+                    COALESCE(SUM(deferred_at_floor), 0), COALESCE(SUM(sleeps), 0), \
+                    COALESCE(SUM(sleep_ms), 0) \
+             FROM (SELECT * FROM sync_runs ORDER BY seq DESC LIMIT ?1)",
+            [TRAILING_RUNS],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .map_err(classify_ours)?;
+
+    Ok(json!({
+        "runs": runs,
+        "trailing": {
+            "window": TRAILING_RUNS,
+            "runs": window_runs,
+            // The deferred nodes(ids:) batching decision reads this — a
+            // median, never one run (sync.rs module docs).
+            "overhead_intercept_ms_median": median,
+            // The TAIL_K sizing ratio, as its two integer terms.
+            "tail_hits": tail_hits,
+            "full_walks": full_walks,
+            // The floor/retry tuning counters (ROADMAP, deferred tuning).
+            "deferred_at_floor_runs": floor_runs,
+            "sleeps": sleeps,
+            "sleep_seconds": sleep_ms / 1_000,
+        },
+    }))
+}
+
+/// The archive integrity audits (DESIGN.md Verification: orphans,
+/// observation chain, FTS integrity, watermark assertion — "every operator
+/// is a CI runner"). Each value is a count of VIOLATIONS, so an intact
+/// archive reads as all zeros and any nonzero is a ghgraph bug surfaced on
+/// the operator's own data — file it, with this block attached.
+fn audits(conn: &Connection) -> Result<Value> {
+    let one =
+        |sql: &str| -> Result<i64> { conn.query_row(sql, [], |r| r.get(0)).map_err(classify_ours) };
+
+    // Orphans: the no-FK decision's backstop (schema.sql). The write path
+    // makes these unrepresentable (parent and children in one transaction);
+    // these counts are the standing proof that it stayed true. comments
+    // resolve their parent BY parent_kind, exactly as the schema instructs
+    // joins to; an out-of-enum parent_kind is counted with them.
+    let orphans = json!({
+        "comments": one(
+            "SELECT COUNT(*) FROM comments c WHERE \
+               (c.parent_kind = 'pr' AND NOT EXISTS \
+                  (SELECT 1 FROM prs p WHERE p.pk = c.parent)) \
+               OR (c.parent_kind = 'issue' AND NOT EXISTS \
+                  (SELECT 1 FROM issues i WHERE i.pk = c.parent)) \
+               OR c.parent_kind NOT IN ('pr', 'issue')",
+        )?,
+        "observations": one(
+            "SELECT COUNT(*) FROM observations o \
+             WHERE NOT EXISTS (SELECT 1 FROM prs p WHERE p.pk = o.pr)",
+        )?,
+        "refs": one(
+            "SELECT COUNT(*) FROM refs r \
+             WHERE NOT EXISTS (SELECT 1 FROM prs p WHERE p.pk = r.src_pr)",
+        )?,
+        "review_requests": one(
+            "SELECT COUNT(*) FROM review_requests rr \
+             WHERE NOT EXISTS (SELECT 1 FROM prs p WHERE p.pk = rr.pr)",
+        )?,
+        "review_threads": one(
+            "SELECT COUNT(*) FROM review_threads t \
+             WHERE NOT EXISTS (SELECT 1 FROM prs p WHERE p.pk = t.pr)",
+        )?,
+    });
+
+    // Observation chain: within one (pr, field), each row's `old` must be
+    // the previous row's `new` — the upsert diffs stored-vs-incoming inside
+    // the writing transaction, so a break means an observation was written
+    // against a value the archive never held. First observations (no
+    // predecessor) assert nothing.
+    let chain_breaks = one("SELECT COUNT(*) FROM ( \
+           SELECT old, LAG(new) OVER (PARTITION BY pr, field ORDER BY seq) AS prev \
+           FROM observations) \
+         WHERE prev IS NOT NULL AND old IS NOT prev")?;
+
+    // FTS integrity, via the fts5vocab tables created at open (stats()):
+    // `index_orphans` = rowids the INDEX holds terms for that no longer
+    // exist in the content table (the VACUUM-renumber / missed-delete
+    // desync the schema's pk convention exists to prevent); `missing` =
+    // content rows that visibly carry ASCII-alphanumeric text yet have no
+    // indexed term. The ASCII gate is a deliberate under-approximation: a
+    // row whose only tokens GLOB cannot see (non-ASCII scripts unicode61
+    // still tokenizes) is skipped rather than risk a false alarm — an
+    // audit that cries wolf gets ignored, and both desync mechanisms this
+    // audit exists for corrupt ASCII and non-ASCII rows alike. What neither
+    // count can witness read-only: token-level corruption inside a present
+    // rowid — that needs fts5's own 'integrity-check', a write-path command
+    // (db.rs open_ro_audit records the constraint).
+    let fts = json!({
+        "comments": json!({
+            "index_orphans": one(
+                "SELECT COUNT(*) FROM \
+                   (SELECT DISTINCT doc FROM audit_comments_v \
+                    WHERE doc NOT IN (SELECT pk FROM comments))",
+            )?,
+            "missing": one(
+                "SELECT COUNT(*) FROM comments WHERE body GLOB '*[a-zA-Z0-9]*' \
+                 AND pk NOT IN (SELECT DISTINCT doc FROM audit_comments_v)",
+            )?,
+        }),
+        "issues": json!({
+            "index_orphans": one(
+                "SELECT COUNT(*) FROM \
+                   (SELECT DISTINCT doc FROM audit_issues_v \
+                    WHERE doc NOT IN (SELECT pk FROM issues))",
+            )?,
+            "missing": one(
+                "SELECT COUNT(*) FROM issues \
+                 WHERE (title GLOB '*[a-zA-Z0-9]*' OR body GLOB '*[a-zA-Z0-9]*') \
+                 AND pk NOT IN (SELECT DISTINCT doc FROM audit_issues_v)",
+            )?,
+        }),
+        "prs": json!({
+            "index_orphans": one(
+                "SELECT COUNT(*) FROM \
+                   (SELECT DISTINCT doc FROM audit_prs_v \
+                    WHERE doc NOT IN (SELECT pk FROM prs))",
+            )?,
+            "missing": one(
+                "SELECT COUNT(*) FROM prs \
+                 WHERE (title GLOB '*[a-zA-Z0-9]*' OR body GLOB '*[a-zA-Z0-9]*') \
+                 AND pk NOT IN (SELECT DISTINCT doc FROM audit_prs_v)",
+            )?,
+        }),
+    });
+
+    // Watermark assertion: "watermark never leads data" is enforced at
+    // sync time by the fold over resolved outcomes (CLAUDE.md names the
+    // preconditions); what an audit can check after the fact is the
+    // DURABLE RESIDUE of that fold. `quarantine_unlicensed` = quarantine
+    // rows whose (repo, stream) has no sync_state row — a resurfacing
+    // record without the watermark whose advance it licensed.
+    // `malformed_watermarks` = sync_state stamps our own RFC 3339 parser
+    // refuses — a watermark that cannot order against anything has left
+    // the invariant's domain entirely.
+    let unlicensed = one("SELECT COUNT(*) FROM quarantine q \
+         WHERE NOT EXISTS (SELECT 1 FROM sync_state s \
+                           WHERE s.repo = q.repo AND s.stream = q.stream)")?;
+    let mut stmt = conn
+        .prepare("SELECT last_item_updated_at FROM sync_state")
+        .map_err(classify_ours)?;
+    let stamps: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .map_err(classify_ours)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(classify_ours)?;
+    let malformed = stamps
+        .iter()
+        .filter(|s| crate::time::Rfc3339Utc::parse(s).is_err())
+        .count();
+
+    Ok(json!({
+        "fts": fts,
+        "observation_chain_breaks": chain_breaks,
+        "orphans": orphans,
+        "watermark": {
+            "malformed_watermarks": malformed,
+            "quarantine_unlicensed": unlicensed,
+        },
+    }))
+}
+
+/// One fts5vocab 'instance' table per FTS index, TEMP so nothing touches
+/// the archive and the tables die with the connection. 'instance' is the
+/// only variant that exposes per-ROWID facts (term, doc, col, offset) —
+/// 'row' and 'col' aggregate across documents. The format! interpolates
+/// names from this literal array only (the counts-loop license).
+fn create_fts_vocab_tables(conn: &Connection) -> Result<()> {
+    for (vocab, fts) in [
+        ("audit_comments_v", "comments_fts"),
+        ("audit_issues_v", "issues_fts"),
+        ("audit_prs_v", "prs_fts"),
+    ] {
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE temp.{vocab} USING fts5vocab(main, '{fts}', 'instance')"
+        ))
+        .map_err(classify_ours)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2043,5 +2313,247 @@ mod tests {
         assert_eq!(limit_to_sql(Some(0)), 0);
         assert_eq!(limit_to_sql(Some(100)), 100);
         assert_eq!(limit_to_sql(Some(usize::MAX)), i64::MAX);
+    }
+}
+
+/// EXPLAIN QUERY PLAN gates on the hot read statements (DESIGN.md
+/// Verification): each named statement above must run the plan it was
+/// designed for — per-item lookups SEARCH their index and never scan, the
+/// two attention sweeps ARE scans and the gate pins that intent so a future
+/// index cannot silently half-serve them. Plans are stable in CI because
+/// bundled SQLite pins the planner version to the lockfile, and the gate
+/// runs against an empty schema-true archive: with no ANALYZE statistics,
+/// plan choice is structural, not data-dependent.
+#[cfg(test)]
+mod explain_gates {
+    use super::*;
+    use crate::db;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct Scratch {
+        dir: PathBuf,
+    }
+
+    impl Scratch {
+        fn new() -> Scratch {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "ghgraph-eqp-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            Scratch { dir }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// All detail lines of the statement's query plan, joined. Parameters
+    /// are BOUND (to NULL), not textually replaced — a literal NULL would
+    /// let the planner constant-fold predicates like `?1 IS NULL OR ...`
+    /// into a plan the verb never runs.
+    fn plan(conn: &Connection, sql: &str) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        for i in 1..=stmt.parameter_count() {
+            stmt.raw_bind_parameter(i, None::<i64>).unwrap();
+        }
+        let mut rows = stmt.raw_query();
+        let mut out: Vec<String> = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            out.push(row.get::<_, String>(3).unwrap());
+        }
+        out.join("\n")
+    }
+
+    #[track_caller]
+    fn assert_plan(conn: &Connection, name: &str, sql: &str, must: &[&str], must_not: &[&str]) {
+        let p = plan(conn, sql);
+        for frag in must {
+            assert!(
+                p.contains(frag),
+                "{name}: plan must contain {frag:?}\nplan:\n{p}\nsql:\n{sql}"
+            );
+        }
+        for frag in must_not {
+            assert!(
+                !p.contains(frag),
+                "{name}: plan must NOT contain {frag:?}\nplan:\n{p}\nsql:\n{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn hot_reads_run_their_designed_plans() {
+        let s = Scratch::new();
+        let archive = db::open_rw(&s.dir.join("ghgraph.db")).unwrap();
+        let conn = archive.conn();
+
+        // The per-item lookups: SEARCH an index, never scan the table.
+        assert_plan(
+            conn,
+            "obs_head_flip",
+            HOT_OBS_HEAD_FLIP,
+            &["SEARCH observations USING COVERING INDEX idx_observations_pr_field"],
+            &["SCAN observations", "USE TEMP B-TREE"],
+        );
+        assert_plan(
+            conn,
+            "pr_by_repo_number",
+            HOT_PR_BY_REPO_NUMBER,
+            &["SEARCH prs USING INDEX"],
+            &["SCAN prs"],
+        );
+        assert_plan(
+            conn,
+            "reviews_by_pr",
+            HOT_REVIEWS_BY_PR,
+            &["SEARCH comments USING INDEX idx_comments_parent"],
+            &["SCAN comments"],
+        );
+        assert_plan(
+            conn,
+            "review_requests_by_pr",
+            HOT_REVIEW_REQUESTS_BY_PR,
+            &["SEARCH review_requests USING"],
+            &["SCAN review_requests"],
+        );
+        assert_plan(
+            conn,
+            "unresolved_threads_by_pr",
+            HOT_UNRESOLVED_THREADS_BY_PR,
+            &["SEARCH review_threads USING INDEX idx_threads_pr"],
+            &["SCAN review_threads"],
+        );
+        assert_plan(
+            conn,
+            "thread_signal_comments",
+            HOT_THREAD_SIGNAL_COMMENTS,
+            &["SEARCH comments USING INDEX idx_comments_thread"],
+            &["SCAN comments"],
+        );
+        assert_plan(
+            conn,
+            "thread_comments_display",
+            HOT_THREAD_COMMENTS_DISPLAY,
+            &["SEARCH comments USING INDEX idx_comments_thread"],
+            &["SCAN comments"],
+        );
+        assert_plan(
+            conn,
+            "viewer_last_activity",
+            HOT_VIEWER_LAST_ACTIVITY,
+            &["SEARCH comments USING INDEX idx_comments_parent"],
+            &["SCAN comments"],
+        );
+        assert_plan(
+            conn,
+            "other_last_activity",
+            HOT_OTHER_LAST_ACTIVITY,
+            &["SEARCH comments USING INDEX idx_comments_parent"],
+            &["SCAN comments"],
+        );
+        assert_plan(
+            conn,
+            "issue_speaker_assocs",
+            HOT_ISSUE_SPEAKER_ASSOCS,
+            &["SEARCH comments USING INDEX idx_comments_parent"],
+            &["SCAN comments"],
+        );
+        assert_plan(
+            conn,
+            "pr_top_comments",
+            HOT_PR_TOP_COMMENTS,
+            &["SEARCH comments USING INDEX idx_comments_parent"],
+            &["SCAN comments"],
+        );
+        assert_plan(
+            conn,
+            "threads_display",
+            HOT_THREADS_DISPLAY,
+            &["SEARCH review_threads USING INDEX idx_threads_pr"],
+            &["SCAN review_threads"],
+        );
+        // Aliased statements: the plan names the alias (r, t, i), not the
+        // table, so the fragments do too.
+        assert_plan(
+            conn,
+            "refs_by_src",
+            HOT_REFS_BY_SRC,
+            &[
+                "SEARCH r USING COVERING INDEX sqlite_autoindex_refs_1",
+                "SEARCH t USING COVERING INDEX sqlite_autoindex_prs_2",
+                "SEARCH t USING COVERING INDEX sqlite_autoindex_issues_2",
+            ],
+            &["SCAN"],
+        );
+        assert_plan(
+            conn,
+            "linked_issues",
+            HOT_LINKED_ISSUES,
+            &[
+                "SEARCH r USING COVERING INDEX sqlite_autoindex_refs_1",
+                "SEARCH i USING INDEX sqlite_autoindex_issues_2",
+            ],
+            &["SCAN"],
+        );
+
+        // The deliberate sweeps: attention reads EVERY open PR/issue and
+        // needs most of each row, so no index can cover it — the scan IS
+        // the design, pinned here so an accidental "optimization" (or an
+        // index that half-serves it) shows up as a failing gate and gets
+        // argued, not slipped in.
+        assert_plan(
+            conn,
+            "attention_pr_candidates",
+            HOT_ATTENTION_PR_CANDIDATES,
+            &["SCAN prs"],
+            &[],
+        );
+        assert_plan(
+            conn,
+            "attention_issue_candidates",
+            HOT_ATTENTION_ISSUE_CANDIDATES,
+            &["SCAN issues"],
+            &[],
+        );
+
+        // The prs listing: a filtered sweep. What matters is the page
+        // statement never needs a sort — (repo, number) order falls out of
+        // the UNIQUE(repo, number) index either way the planner goes.
+        assert_plan(
+            conn,
+            "prs_listing_page",
+            &format!(
+                "SELECT repo, number FROM prs WHERE {HOT_PRS_WHERE} \
+                 ORDER BY repo, number LIMIT ?4"
+            ),
+            &[],
+            &["USE TEMP B-TREE FOR ORDER BY"],
+        );
+
+        // Search: the FTS index drives; content rows resolve by rowid.
+        for (name, sql) in [
+            ("search_prs", search_sql_prs()),
+            ("search_issues", search_sql_issues()),
+            ("search_pr_comments", search_sql_pr_comments()),
+            ("search_issue_comments", search_sql_issue_comments()),
+        ] {
+            // The MATCH drive is the fts vtable's "SCAN f VIRTUAL TABLE
+            // INDEX"; the content tables (aliases p, i, c) must resolve by
+            // rowid, never scan.
+            assert_plan(
+                conn,
+                name,
+                &sql,
+                ["VIRTUAL TABLE INDEX"].as_slice(),
+                &["SCAN p", "SCAN i", "SCAN c"],
+            );
+        }
     }
 }

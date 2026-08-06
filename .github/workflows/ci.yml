@@ -1,0 +1,46 @@
+# CI: the pre-commit gate plus the supply-chain checks (DESIGN.md
+# Verification — Cargo.lock is committed; cargo vet and cargo audit run in
+# CI; the cargo-tree snapshot makes any dependency-graph movement a
+# reviewable diff, not a lockfile blur).
+#
+# Third-party actions are pinned by commit SHA, and there is exactly one
+# (checkout): the toolchain comes from the runner's own rustup, and the
+# audit tools install from crates.io with --locked — every remaining
+# moving part is one the dependency policy already governs. No cache
+# action: a few minutes of cargo install per run is cheaper than another
+# pinned third-party dependency to vet.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: toolchain
+        run: rustup update --no-self-update stable && rustup default stable
+      - name: fmt + clippy + check + test (the make check gate)
+        run: make check
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: toolchain
+        run: rustup update --no-self-update stable && rustup default stable
+      - name: install audit tools (locked)
+        run: cargo install cargo-audit --locked && cargo install cargo-vet --locked
+      - name: advisory scan
+        run: make audit
+      - name: vet the dependency tree
+        run: cargo vet --locked
+      - name: dependency-graph diff against the committed snapshot
+        run: make tree-check
