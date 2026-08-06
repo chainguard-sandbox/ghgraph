@@ -90,12 +90,53 @@
 //!                     people is served by the archive (search, query,
 //!                     observations), never by attention — attention is for
 //!                     demands. Not drafts (the demand starts when the PR
-//!                     asks for review — the milestone-4 needs_reviewer
-//!                     rule, applied early), and never the viewer's own row
-//!                     (a self-tracked viewer is config noise, not a
+//!                     asks for review — the needs_reviewer rule, applied
+//!                     early), and never the viewer's own row (a
+//!                     self-tracked viewer is config noise, not a
 //!                     collaboration demand).
 //!
-//! Bucket scope, all four: state OPEN and not upstream-deleted. A deleted
+//! The maintainer buckets (DESIGN.md, project scope) follow, gated on
+//! `project_scope`: a READ-time fact of the LOADED config, computed by
+//! report.rs and carried in as a structural signal — never the archive's
+//! stored fingerprint, so archive contents cannot create a bucket, and the
+//! judgment (with its oracle) still lives here. For a config with no
+//! project-scope repo the buckets are absent from output entirely, not
+//! empty: an empty array is the "checked, nothing" disclosure, and no
+//! maintainer sweep was asked for or performed (report.rs serializes;
+//! the gate is [`Bucket::maintainer`]).
+//!   needs_reviewer  — open, not draft, nobody asked (no review_requests
+//!                     row at all — an undeclared team is still somebody)
+//!                     and nobody has reviewed (any kind='review' row, any
+//!                     verdict: a COMMENTED review is a reviewer already
+//!                     engaging). The maintainer demand is "find this PR a
+//!                     reviewer", so the viewer's own PRs qualify — at
+//!                     project scope the viewer is the one who can assign.
+//!                     Ordered after people_prs: a tracked person's
+//!                     unreviewed PR is the operator's collaboration demand
+//!                     first (one bucket per PR; the maintainer sweep
+//!                     catches everyone else's).
+//!   untriaged       — the one issue-shaped bucket. Open issue, no labels,
+//!                     no assignees, no maintainer reply. Judged by
+//!                     [`untriaged`] over [`IssueSignals`]; [`bucket`]
+//!                     never returns it (a PR is not an issue; the oracle
+//!                     test pins the impossibility). "Maintainer reply" is
+//!                     structural — a non-deleted, non-minimized issue
+//!                     comment whose author_assoc is proven affiliation
+//!                     ([`is_maintainer_assoc`]): GitHub's own association
+//!                     enum, never a judgment derived from text. Labels and
+//!                     assignees are stored JSON read by
+//!                     [`json_array_nonempty`]; NULL (a linked-cache or
+//!                     masked-labels row that never witnessed them), an
+//!                     empty array, and text that will not read as an array
+//!                     all count as ABSENT — absence of proof of triage
+//!                     keeps the demand standing. A stale fill-only row can
+//!                     therefore over-fill this bucket; that is the
+//!                     fail-open price, and the reversing evidence is a
+//!                     real operator drowning in rows whose upstream issues
+//!                     are in fact triaged.
+//!
+//! Bucket scope, all four operator buckets: state OPEN and not
+//! upstream-deleted. A deleted
 //! PR's demands died with it; a reply on a merged/closed PR is excluded as
 //! out of the working set — the narrowing to reverse on the first real
 //! demand it hides (the evidence would be an operator missing a post-merge
@@ -353,23 +394,30 @@ pub fn waiting_on(
     }
 }
 
-/// The four attention buckets, in output-and-priority order (module docs).
+/// The attention buckets, in output-and-priority order (module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bucket {
     WaitingOnMe,
     TheyReplied,
     ReadyToMerge,
     PeoplePrs,
+    NeedsReviewer,
+    Untriaged,
 }
 
 impl Bucket {
     /// The fixed order: serialization order AND classification priority —
-    /// one constant so the two cannot drift.
-    pub const ALL: [Bucket; 4] = [
+    /// one constant so the two cannot drift. The first four predate
+    /// schema_version 1 and their relative order is frozen; the maintainer
+    /// pair was appended (additive-only), and any future bucket appends
+    /// here too.
+    pub const ALL: [Bucket; 6] = [
         Bucket::WaitingOnMe,
         Bucket::TheyReplied,
         Bucket::ReadyToMerge,
         Bucket::PeoplePrs,
+        Bucket::NeedsReviewer,
+        Bucket::Untriaged,
     ];
 
     /// The wire spelling (`attention` verb).
@@ -379,7 +427,16 @@ impl Bucket {
             Bucket::TheyReplied => "they_replied",
             Bucket::ReadyToMerge => "ready_to_merge",
             Bucket::PeoplePrs => "people_prs",
+            Bucket::NeedsReviewer => "needs_reviewer",
+            Bucket::Untriaged => "untriaged",
         }
+    }
+
+    /// A maintainer bucket exists in output only when the loaded config has
+    /// a project-scope repo (module docs carry the absent-vs-empty
+    /// argument); report.rs gates serialization on this.
+    pub fn maintainer(self) -> bool {
+        matches!(self, Bucket::NeedsReviewer | Bucket::Untriaged)
     }
 }
 
@@ -422,6 +479,16 @@ pub struct PrSignals<'a> {
     /// Any kind='review' row by the viewer, any verdict: a COMMENTED review
     /// is still "a review from viewer" for people_prs.
     pub viewer_reviewed: bool,
+    /// The repo is at project scope in the LOADED config — a read-time
+    /// fact computed by report.rs from config, never from the archive
+    /// (archive contents never create a bucket — DESIGN.md).
+    pub project_scope: bool,
+    /// Any review_requests row at all, anyone, user or team, declared or
+    /// not: an undeclared team request still means somebody was asked.
+    pub has_review_requests: bool,
+    /// Any kind='review' row at all, any verdict, anyone (module docs:
+    /// a COMMENTED review is a reviewer already engaging).
+    pub has_reviews: bool,
 }
 
 /// (signals) → at most one bucket, the first qualifying in [`Bucket::ALL`]
@@ -445,7 +512,59 @@ pub fn bucket(s: &PrSignals<'_>) -> Option<Bucket> {
     if s.person_pr && !s.viewers_pr && !s.draft && !s.viewer_reviewed {
         return Some(Bucket::PeoplePrs);
     }
+    if s.project_scope && !s.draft && !s.has_review_requests && !s.has_reviews {
+        return Some(Bucket::NeedsReviewer);
+    }
     None
+}
+
+/// One open, not-upstream-deleted issue, reduced to the structural signals
+/// [`untriaged`] may see — the issue-shaped mirror of [`PrSignals`], and the
+/// same fence: the caller (report.rs) queries, the judgment lives here.
+pub struct IssueSignals {
+    /// The repo is at project scope in the LOADED config (see
+    /// [`PrSignals::project_scope`] — same fact, same source).
+    pub project_scope: bool,
+    /// issues.labels holds a non-empty array ([`json_array_nonempty`]).
+    pub labeled: bool,
+    /// issues.assignees holds a non-empty array ([`json_array_nonempty`]).
+    pub assigned: bool,
+    /// Some non-deleted, non-minimized comment on the issue carries a
+    /// proven maintainer association ([`is_maintainer_assoc`]).
+    pub maintainer_replied: bool,
+}
+
+/// (signals) → does the issue land in `untriaged`? The only issue bucket,
+/// so this returns bool where [`bucket`] returns an enum. A demand: every
+/// input that cannot PROVE triage leaves the issue in (module docs).
+pub fn untriaged(s: &IssueSignals) -> bool {
+    s.project_scope && !s.labeled && !s.assigned && !s.maintainer_replied
+}
+
+/// Is a stored JSON value a non-empty array? The triage-mark reading for
+/// issues.labels / issues.assignees: NULL (never witnessed — the
+/// linked-cache and masked-labels shapes), an empty array, and text this
+/// function cannot read as an array all read FALSE, because only a
+/// witnessed non-empty array PROVES triage — the demand stands on anything
+/// less. Re-parsed here like every derivation input: `query` proves the
+/// archive is reachable by arbitrary SQL, so the input is validated where
+/// it is consumed, not assumed from the writer.
+pub fn json_array_nonempty(raw: Option<&str>) -> bool {
+    raw.and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|a| !a.is_empty())
+}
+
+/// A proven maintainer association — GitHub's own CommentAuthorAssociation,
+/// a structural fact, never derived from comment text. Only the three
+/// proven-affiliation values count; CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR,
+/// FIRST_TIMER, NONE, MANNEQUIN, a ghost author's NULL, and any value this
+/// module does not recognize all read FALSE — a maintainer reply must be
+/// proven to clear the untriaged demand, so unrecognized association drift
+/// escalates (keeps the issue in) rather than silently triaging it.
+pub fn is_maintainer_assoc(assoc: Option<&str>) -> bool {
+    matches!(assoc, Some("OWNER" | "MEMBER" | "COLLABORATOR"))
 }
 
 /// Did another party act after the viewer's last act? False without both
@@ -864,7 +983,7 @@ mod tests {
         );
     }
 
-    // ---- bucket: the four-way classification -----------------------------
+    // ---- bucket: the PR-side classification -------------------------------
 
     const B_V1: &str = "2026-03-01T00:00:00Z";
     const B_BEFORE: &str = "2026-02-01T00:00:00Z";
@@ -894,8 +1013,8 @@ mod tests {
         assert!(replied_since(Some(B_V1), Some("junk")));
     }
 
-    /// ∀ by enumeration over the full signal cube: 8 bools × 4 effective
-    /// states × 4 decision values × 8 activity classes = 32,768 cases,
+    /// ∀ by enumeration over the full signal cube: 11 bools × 4 effective
+    /// states × 4 decision values × 8 activity classes = 262,144 cases,
     /// against an oracle that restates the per-bucket doc rules
     /// order-INDEPENDENTLY (collect every qualifying bucket, take the first
     /// in Bucket::ALL order) where the implementation short-circuits — a
@@ -929,7 +1048,7 @@ mod tests {
             (Some("junk"), Some(B_AFTER), true),
             (Some(B_V1), Some("junk"), true),
         ];
-        for bits in 0u32..256 {
+        for bits in 0u32..2048 {
             let f = |i: u32| bits & (1 << i) != 0;
             for effective in effectives {
                 for decision in decisions {
@@ -947,6 +1066,9 @@ mod tests {
                             effective,
                             has_unresolved_threads: f(6),
                             viewer_reviewed: f(7),
+                            project_scope: f(8),
+                            has_review_requests: f(9),
+                            has_reviews: f(10),
                         };
                         let got = bucket(&s);
                         let waiting =
@@ -958,18 +1080,21 @@ mod tests {
                             && !s.has_unresolved_threads
                             && matches!(s.review_decision, None | Some("APPROVED"));
                         let people = s.person_pr && !s.viewers_pr && !s.draft && !s.viewer_reviewed;
+                        let needs =
+                            s.project_scope && !s.draft && !s.has_review_requests && !s.has_reviews;
                         let want = [
                             (waiting, Bucket::WaitingOnMe),
                             (*replied, Bucket::TheyReplied),
                             (ready, Bucket::ReadyToMerge),
                             (people, Bucket::PeoplePrs),
+                            (needs, Bucket::NeedsReviewer),
                         ]
                         .into_iter()
                         .find(|(q, _)| *q)
                         .map(|(_, b)| b);
                         assert_eq!(
                             got, want,
-                            "bits={bits:08b} effective={effective:?} decision={decision:?} \
+                            "bits={bits:011b} effective={effective:?} decision={decision:?} \
                              viewer_last={viewer_last:?} other_last={other_last:?}"
                         );
                         // Polarity, independent of either formulation:
@@ -988,6 +1113,15 @@ mod tests {
                                     && s.effective == E::Approved
                                     && !s.has_unresolved_threads,
                                 "ready_to_merge admitted incomplete or unapproved state"
+                            );
+                        }
+                        // A PR is not an issue: the issue bucket is
+                        // unreachable from PR signals, over the whole cube.
+                        assert_ne!(got, Some(Bucket::Untriaged));
+                        if got == Some(Bucket::NeedsReviewer) {
+                            assert!(
+                                s.project_scope,
+                                "a maintainer bucket leaked outside project scope"
                             );
                         }
                     }
@@ -1013,6 +1147,9 @@ mod tests {
             effective: EffectiveReviewState::Unreviewed,
             has_unresolved_threads: false,
             viewer_reviewed: false,
+            project_scope: false,
+            has_review_requests: false,
+            has_reviews: false,
         };
         // A request on a tracked person's PR is MY demand, not a people row.
         let s = PrSignals {
@@ -1041,5 +1178,120 @@ mod tests {
         assert_eq!(bucket(&s), Some(Bucket::TheyReplied));
         // Third-party PR, no involvement: no bucket at all.
         assert_eq!(bucket(&base(false)), None);
+        // The same PR at project scope IS the maintainer's demand: nobody
+        // asked, nobody reviewed — find it a reviewer.
+        let s = PrSignals {
+            project_scope: true,
+            ..base(false)
+        };
+        assert_eq!(bucket(&s), Some(Bucket::NeedsReviewer));
+        // The viewer's own fresh PR qualifies too (the demand is
+        // assignment, not review — module docs).
+        let s = PrSignals {
+            project_scope: true,
+            ..base(true)
+        };
+        assert_eq!(bucket(&s), Some(Bucket::NeedsReviewer));
+        // A tracked person's unreviewed PR is the collaboration demand
+        // first — people_prs outranks needs_reviewer (one bucket per PR).
+        let s = PrSignals {
+            project_scope: true,
+            person_pr: true,
+            ..base(false)
+        };
+        assert_eq!(bucket(&s), Some(Bucket::PeoplePrs));
+        // Somebody was asked, or somebody reviewed (any verdict — a
+        // COMMENTED review is engagement): no needs_reviewer demand.
+        let s = PrSignals {
+            project_scope: true,
+            has_review_requests: true,
+            ..base(false)
+        };
+        assert_eq!(bucket(&s), None);
+        let s = PrSignals {
+            project_scope: true,
+            has_reviews: true,
+            ..base(false)
+        };
+        assert_eq!(bucket(&s), None);
+        // Drafts don't need a reviewer yet — the demand starts when the PR
+        // asks for review (the same rule people_prs applies).
+        let s = PrSignals {
+            project_scope: true,
+            draft: true,
+            ..base(false)
+        };
+        assert_eq!(bucket(&s), None);
+    }
+
+    // ---- untriaged: the issue-shaped judgment ----------------------------
+
+    /// ∀ by enumeration over the 4-bool signal space, against the doc rule
+    /// stated as implications rather than restated as a conjunction: the
+    /// bucket requires project scope, and each proof of triage
+    /// independently clears it.
+    #[test]
+    fn untriaged_exhaustive() {
+        for bits in 0u32..16 {
+            let f = |i: u32| bits & (1 << i) != 0;
+            let s = IssueSignals {
+                project_scope: f(0),
+                labeled: f(1),
+                assigned: f(2),
+                maintainer_replied: f(3),
+            };
+            let got = untriaged(&s);
+            assert_eq!(
+                got,
+                s.project_scope && !s.labeled && !s.assigned && !s.maintainer_replied,
+                "bits={bits:04b}"
+            );
+            if !s.project_scope {
+                assert!(!got, "a maintainer bucket leaked outside project scope");
+            }
+            if s.labeled || s.assigned || s.maintainer_replied {
+                assert!(!got, "a proven triage mark must clear the demand");
+            }
+        }
+    }
+
+    #[test]
+    fn json_array_nonempty_reads_only_proven_triage() {
+        // Proof of triage: a witnessed, non-empty array — element type is
+        // irrelevant (foreign SQL can store anything; presence is presence).
+        assert!(json_array_nonempty(Some(r#"["bug"]"#)));
+        assert!(json_array_nonempty(Some("[0]")));
+        // Everything short of proof keeps the demand: never witnessed
+        // (NULL — the linked-cache and masked-labels shapes), witnessed
+        // empty, JSON that is not an array, and text that is not JSON.
+        assert!(!json_array_nonempty(None));
+        assert!(!json_array_nonempty(Some("[]")));
+        assert!(!json_array_nonempty(Some("null")));
+        assert!(!json_array_nonempty(Some("{}")));
+        assert!(!json_array_nonempty(Some(r#""bug""#)));
+        assert!(!json_array_nonempty(Some("junk")));
+    }
+
+    /// ∀ over GitHub's CommentAuthorAssociation enum plus the null and
+    /// drift cases — the domain is small enough that the loop is the spec.
+    #[test]
+    fn maintainer_assoc_exhaustive() {
+        for (assoc, expected) in [
+            (Some("OWNER"), true),
+            (Some("MEMBER"), true),
+            (Some("COLLABORATOR"), true),
+            (Some("CONTRIBUTOR"), false),
+            (Some("FIRST_TIME_CONTRIBUTOR"), false),
+            (Some("FIRST_TIMER"), false),
+            (Some("NONE"), false),
+            (Some("MANNEQUIN"), false),
+            // A ghost author proves nothing; unrecognized drift (or a
+            // case-mangled value — the API enum is exact) must not triage.
+            (None, false),
+            (Some("owner"), false),
+            (Some("ADMIN"), false),
+        ] {
+            assert_eq!(is_maintainer_assoc(assoc), expected, "assoc={assoc:?}");
+        }
     }
 }

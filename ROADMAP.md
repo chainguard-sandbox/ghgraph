@@ -109,11 +109,22 @@ The maintainer half of the tool, additive on top of the frozen contract:
 - The stream filters with their defensive defaults: bot-authored PRs out
   unless opted in, `exclude_authors`, per-repo lookback; filtered counts in
   the summary, and discovery-side skips so filtered PRs never cost a
-  hydration. Once the newtypes exist, `exclude_authors` moves server-side
-  (`-author:x`) with the tradeoff recorded where the term is built:
-  `filtered` counts degrade to a lower bound, and "configured absence is
-  visible" is served by the fingerprint disclosure instead. `bots` stays
-  client-side forever — structural `Bot` has no search qualifier.
+  hydration. The planned server-side move (`-author:x`) is REJECTED on
+  live probes (this milestone): GitHub search silently returns ZERO
+  results — no error — when any negated author qualifier fails to
+  resolve, which happens for a deleted or renamed account (the natural
+  lifecycle of an excluded author) and for the `-author:app/x` spelling
+  of any login without a matching GitHub App — and a bare pattern needs
+  that spelling for parity with the client rule (bare matches either
+  kind), so excluding any human zeroes the stream. A zeroed window is
+  indistinguishable from a quiet repo: discovery starves silently, and
+  the replay detector cannot see items that were never discovered.
+  queries.rs records the mechanism at the term builder. Reversing
+  evidence: search erroring (or excluding nothing) on unresolvable
+  authors. The client-side skip already delivers the material half —
+  filtered PRs never cost a hydration, and `filtered` counts stay exact.
+  `bots` stays client-side forever — structural `Bot` has no search
+  qualifier.
 - Volume proof-out: cap splitting and quarantine were designed for the
   project-scope load; this milestone is where their tests meet a large
   active repo's real cold start.
