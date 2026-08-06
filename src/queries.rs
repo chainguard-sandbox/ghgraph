@@ -214,16 +214,16 @@ query($id: ID!) {
       reviewDecision
       createdAt updatedAt mergedAt closedAt
       commits(last: 1) { nodes { commit { oid committedDate } } }
-      reviewRequests(first: 20) {
+      reviewRequests(first: 100) {
         totalCount
         nodes { requestedReviewer { ... on User { login } ... on Team { name } } }
       }
-      latestOpinionatedReviews(first: 20) {
+      latestOpinionatedReviews(first: 100) {
         totalCount
         nodes { id state submittedAt body url authorAssociation
                 author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
       }
-      closingIssuesReferences(first: 10) {
+      closingIssuesReferences(first: 100) {
         totalCount
         nodes { id number title state body updatedAt
                 author { login __typename ... on User { databaseId } ... on Bot { databaseId } }
@@ -314,20 +314,25 @@ query($id: ID!, $after: String) {
 ///     without a consumer is waste (the telemetry rule's sibling). The
 ///     re-verify closed tier bounds by updated_at instead (sync.rs records
 ///     the containment argument).
-///   * labels and assignees are small counted connections, first: 20 with
-///     totalCount, like reviewRequests on the PR side: no follow-up
+///   * labels and assignees are small counted connections, first: 100
+///     with totalCount, like reviewRequests on the PR side: no follow-up
 ///     document — an overflow withholds the witness and the row lands
-///     truncated, disclosed, like every other incompleteness. assignees
-///     cannot overflow (GitHub caps assignees at 10); labels can on a
-///     heavy-triage repo, and such a row is unhealable by design until a
-///     page document exists — never-verified, so the re-verify tier
-///     refetches it every run, one of the REVERIFY_CAP slots. That cost
-///     is the accepted interim (disclosed via health.truncated each run);
-///     a repo that routinely overflows 20 is the evidence that would add
-///     the page document. labels is also schema-nullable (error-masking,
-///     unlike assignees/comments — live-introspected): parse.rs carries
-///     it Option, and a masked connection withholds the witness while
-///     the writer carries the stored value forward (upsert_issue_stream).
+///     truncated, disclosed, like every other incompleteness. 100 is the
+///     free maximum: GitHub's rate-cost formula buckets requested nodes
+///     by hundreds, so a counted connection under 100 costs the same as
+///     under 20 while covering the fan-out real repos produce (a
+///     monorepo's CODEOWNERS put >20 reviewRequests on routine deps PRs
+///     — hydration-witnessed, permanently truncated under the old page).
+///     assignees cannot overflow (GitHub caps assignees at 10); labels
+///     past 100 would be unhealable by design until a page document
+///     exists — never-verified, so the re-verify tier refetches it every
+///     run, one of the REVERIFY_CAP slots, disclosed via
+///     health.truncated each run; a repo that routinely overflows 100 is
+///     the evidence that would add the page document. labels is also
+///     schema-nullable (error-masking, unlike assignees/comments —
+///     live-introspected): parse.rs carries it Option, and a masked
+///     connection withholds the witness while the writer carries the
+///     stored value forward (upsert_issue_stream).
 ///   * No refresh/tail layer: every issue hydration is a full walk. The
 ///     tail exists because PR hydration pays for review threads; an issue
 ///     is one comments connection, and a single-page issue costs exactly
@@ -351,7 +356,7 @@ query($id: ID!) {
       authorAssociation
       repository { nameWithOwner }
       createdAt updatedAt
-      labels(first: 20) {
+      labels(first: 100) {
         totalCount
         nodes { name }
       }
@@ -447,16 +452,16 @@ query($id: ID!) {
       reviewDecision
       createdAt updatedAt mergedAt closedAt
       commits(last: 1) { nodes { commit { oid committedDate } } }
-      reviewRequests(first: 20) {
+      reviewRequests(first: 100) {
         totalCount
         nodes { requestedReviewer { ... on User { login } ... on Team { name } } }
       }
-      latestOpinionatedReviews(first: 20) {
+      latestOpinionatedReviews(first: 100) {
         totalCount
         nodes { id state submittedAt body url authorAssociation
                 author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
       }
-      closingIssuesReferences(first: 10) {
+      closingIssuesReferences(first: 100) {
         totalCount
         nodes { id number title state body updatedAt
                 author { login __typename ... on User { databaseId } ... on Bot { databaseId } }

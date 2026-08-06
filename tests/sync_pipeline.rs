@@ -85,7 +85,7 @@ case "$doc" in
     resp="$dir/icpage-$id-$after.json"
     [ -f "$resp" ] || resp="$dir/icpage-$id.json"
     ;;
-  *'labels(first: 20'*)
+  *'labels(first: 100'*)
     echo "IHYD|run=$run|id=$id" >> "$dir/calls.log"
     if [ -f "$dir/stderr-$id" ]; then cat "$dir/stderr-$id" >&2; exit 1; fi
     resp="$dir/ihyd-$id.json"

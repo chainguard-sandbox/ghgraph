@@ -136,8 +136,8 @@ writes nothing.
 
 ## 5 — hardening
 
-Committed Cargo.lock; cargo vet, cargo audit, and a `cargo tree` diff in CI;
-a written policy for SQLite CVEs arriving through rusqlite; a fuzz harness
+Committed Cargo.lock; cargo vet, cargo audit, and a `cargo tree` diff in
+CI; a fuzz harness
 for `refs::extract` outside the default build. Best-effort WAL truncate at
 writer close. The `sync_runs` health row — one flat row per run, no child
 tables, so trends are a `query` away without a telemetry store growing

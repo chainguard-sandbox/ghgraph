@@ -4,7 +4,8 @@ ghgraph: local GitHub work memory in SQLite — the operator's working set, or
 a whole project's PR and issue stream, chosen per repo in config. The `gh`
 CLI is the only transport. Unix only, enforced by a `compile_error!`.
 Read DESIGN.md before changing anything; ROADMAP.md sequences the build.
-Currently a scaffold — the contracts are final-draft, the bodies are stubs.
+Working through milestone 4; the output contract is frozen at
+`schema_version: 1`, additive-only.
 
 ## The discipline
 
@@ -20,9 +21,9 @@ Currently a scaffold — the contracts are final-draft, the bodies are stubs.
 - DESIGN.md carries architecture and the arguments between modules; module
   comments carry mechanism and its rationale. Don't restate one in the
   other — add a pointer.
-- This repo is contract prose over stub bodies. Never assert an unbuilt
-  mechanism in the present tense: mark it `PLANNED (milestone N)` — as
-  db.rs does — and remove the marker in the change that builds it.
+- Never assert an unbuilt mechanism in the present tense: mark it
+  `PLANNED (milestone N)` — as db.rs does — and remove the marker in the
+  change that builds it.
 - Proofs have preconditions. "Watermark never leads data" holds only if
   every discovered id resolves to a defined outcome (hydrated, filtered,
   quarantined-with-a-durable-row, deferred) and the watermark folds over
