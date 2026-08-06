@@ -79,14 +79,15 @@
 //!   `author_id` stays internal everywhere: identity plumbing, not a display
 //!   field (ROADMAP, freeze batch). `head_committed_at` also stays internal:
 //!   the derived staleness fields carry its meaning.
-//!   * `attention` emits the four buckets as an ARRAY — the one place key
+//!   * `attention` emits the buckets as an ARRAY — the one place key
 //!     order matters (fixed order IS priority, attention.rs) and sorted-key
 //!     objects cannot carry it:
 //!
 //! ```text
 //! { "_meta": ...,
 //!   "attention": [ { "bucket": "waiting_on_me" | "they_replied" |
-//!                              "ready_to_merge" | "people_prs",
+//!                              "ready_to_merge" | "people_prs" |
+//!                              "needs_reviewer" | "untriaged",
 //!                    "total", "returned",
 //!                    "prs": [ { repo, number, title, draft, author,
 //!                               author_assoc, updated_at, url, truncated,
@@ -96,8 +97,16 @@
 //! ```
 //!
 //!   Rows are locators (search's argument), recency-ordered (updated_at
-//!   DESC, tiebroken total by repo, number); every bucket appears even
-//!   when empty — an empty array IS the "checked, nothing" disclosure.
+//!   DESC, tiebroken total by repo, number); every emitted bucket appears
+//!   even when empty — an empty array IS the "checked, nothing"
+//!   disclosure. The maintainer pair (needs_reviewer, untriaged) is
+//!   emitted only when the loaded config has a project-scope repo, and is
+//!   ABSENT otherwise — "checked, nothing" would claim a sweep the config
+//!   never asked for (attention.rs owns the argument and the per-row
+//!   project_scope gate). untriaged rows are issues and ride under an
+//!   "issues" key — same locator fields minus `draft`, which an issue does
+//!   not have. Both additions are additive under schema_version 1: no
+//!   pre-existing bucket, field, or ordering moved.
 //!   `--fail-if-any` never reaches this module: main.rs derives the exit
 //!   code from [`attention_has_demands`] over the emitted document, built
 //!   with no flag in scope — gate flags change the exit code, never a
@@ -162,6 +171,21 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
     let conn = read_snapshot(&archive)?;
     let conn = &*conn;
     let viewer = cfg.viewer.as_str();
+
+    // The maintainer-bucket gate: repos the LOADED config puts at project
+    // scope. Config, never the archive's stored fingerprint — archive
+    // contents never create a bucket (DESIGN.md; attention.rs module docs
+    // carry the absent-vs-empty output argument). Repo names are folded to
+    // lowercase on both sides of this lookup (RepoName at the config
+    // boundary, ingest folding to match — config.rs).
+    let project_repos: std::collections::BTreeSet<String> = cfg
+        .repos
+        .iter()
+        .map(|e| e.resolved())
+        .filter(|rc| rc.scope == crate::config::Scope::Project)
+        .map(|rc| rc.repo.as_str().to_string())
+        .collect();
+    let maintainer_scope = !project_repos.is_empty();
 
     // Candidates: every open, not-upstream-deleted PR (the bucket scope —
     // attention.rs module docs own the argument). Iteration order (repo,
@@ -393,6 +417,12 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
             effective,
             has_unresolved_threads: !unresolved.is_empty(),
             viewer_reviewed,
+            project_scope: project_repos.contains(&cand.repo),
+            // Anyone asked / anyone reviewed — the raw row sets, before the
+            // viewer-specific narrowings above (attention.rs owns why an
+            // undeclared team or a COMMENTED review still counts here).
+            has_review_requests: !requests.is_empty(),
+            has_reviews: !reviews.is_empty(),
         });
         let Some(placed) = placed else { continue };
 
@@ -434,7 +464,12 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
             attention::Bucket::TheyReplied => {
                 obj.insert("last_other_activity_at".into(), json!(other_last));
             }
-            attention::Bucket::ReadyToMerge | attention::Bucket::PeoplePrs => {}
+            attention::Bucket::ReadyToMerge
+            | attention::Bucket::PeoplePrs
+            | attention::Bucket::NeedsReviewer => {}
+            // bucket() never returns the issue bucket for a PR — pinned
+            // over the whole signal cube (attention.rs oracle test).
+            attention::Bucket::Untriaged => unreachable!("bucket() is PR-only"),
         }
         let idx = attention::Bucket::ALL
             .iter()
@@ -443,25 +478,133 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
         buckets[idx].push((cand.updated_at.clone(), cand.repo.clone(), cand.number, row));
     }
 
+    // The issue sweep — untriaged, the one issue-shaped bucket. Same
+    // candidate scope as the PR loop (OPEN, not upstream-deleted), any
+    // hydration_source: a fill-only linked row's NULL labels read as
+    // unwitnessed and fail open (attention.rs owns that argument). Skipped
+    // entirely when no repo is at project scope: the gate is per-row
+    // anyway (project_scope in the signals), so the skip only saves the
+    // scan — it can't change the outcome.
+    if maintainer_scope {
+        let mut issue_stmt = conn
+            .prepare(
+                "SELECT pk, repo, number, title, author, author_assoc, labels, assignees, \
+                        updated_at, url, truncated, verified_at \
+                 FROM issues WHERE state = 'OPEN' AND deleted_at IS NULL ORDER BY repo, number",
+            )
+            .map_err(classify_ours)?;
+        // Association values of everyone who substantively spoke; the
+        // maintainer judgment over them is attention.rs's
+        // (is_maintainer_assoc), so the WHERE stays structural — deleted
+        // and minimized rows are not speech, everything else is.
+        let mut assoc_stmt = conn
+            .prepare(
+                "SELECT DISTINCT author_assoc FROM comments \
+                 WHERE parent_kind = 'issue' AND parent = ?1 AND deleted_at IS NULL \
+                   AND is_minimized = 0 ORDER BY author_assoc",
+            )
+            .map_err(classify_ours)?;
+        struct IssueCand {
+            pk: i64,
+            repo: String,
+            number: i64,
+            title: String,
+            author: Option<String>,
+            author_assoc: Option<String>,
+            labels: Option<String>,
+            assignees: Option<String>,
+            updated_at: String,
+            url: String,
+            truncated: bool,
+            verified_at: Option<String>,
+        }
+        let issues: Vec<IssueCand> = issue_stmt
+            .query_map([], |r| {
+                Ok(IssueCand {
+                    pk: r.get(0)?,
+                    repo: r.get(1)?,
+                    number: r.get(2)?,
+                    title: r.get(3)?,
+                    author: r.get(4)?,
+                    author_assoc: r.get(5)?,
+                    labels: r.get(6)?,
+                    assignees: r.get(7)?,
+                    updated_at: r.get(8)?,
+                    url: r.get(9)?,
+                    truncated: r.get(10)?,
+                    verified_at: r.get(11)?,
+                })
+            })
+            .map_err(classify_ours)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(classify_ours)?;
+        let untriaged_idx = attention::Bucket::ALL
+            .iter()
+            .position(|b| *b == attention::Bucket::Untriaged)
+            .expect("ALL enumerates every bucket");
+        for issue in issues {
+            let assocs: Vec<Option<String>> = assoc_stmt
+                .query_map([issue.pk], |r| r.get(0))
+                .map_err(classify_ours)?
+                .collect::<std::result::Result<_, _>>()
+                .map_err(classify_ours)?;
+            let placed = attention::untriaged(&attention::IssueSignals {
+                project_scope: project_repos.contains(&issue.repo),
+                labeled: attention::json_array_nonempty(issue.labels.as_deref()),
+                assigned: attention::json_array_nonempty(issue.assignees.as_deref()),
+                maintainer_replied: assocs
+                    .iter()
+                    .any(|a| attention::is_maintainer_assoc(a.as_deref())),
+            });
+            if !placed {
+                continue;
+            }
+            let row = json!({
+                "repo": issue.repo,
+                "number": issue.number,
+                "title": issue.title,
+                "author": issue.author,
+                "author_assoc": issue.author_assoc,
+                "updated_at": issue.updated_at,
+                "url": issue.url,
+                "truncated": issue.truncated,
+                "verified_at": issue.verified_at,
+            });
+            buckets[untriaged_idx].push((issue.updated_at.clone(), issue.repo, issue.number, row));
+        }
+    }
+
     // Per-bucket recency order (updated_at DESC — search's argument for the
     // meaningful work-memory axis), tiebroken to total by (repo, number).
     // --limit caps rows per bucket; totals stay disclosed (limits govern
-    // presentation, polarity governs derivation — attention.rs).
+    // presentation, polarity governs derivation — attention.rs). The
+    // maintainer buckets exist in the document only when some repo is at
+    // project scope (attention.rs, Bucket::maintainer — absent, not empty:
+    // an empty array claims "checked, nothing", and no maintainer sweep
+    // was configured). untriaged rows are issues and serialize under an
+    // "issues" key — calling them "prs" would be a quiet lie in the frozen
+    // contract's vocabulary.
     let cap = limit.unwrap_or(usize::MAX);
     let out: Vec<Value> = attention::Bucket::ALL
         .iter()
         .zip(buckets)
+        .filter(|(b, _)| maintainer_scope || !b.maintainer())
         .map(|(b, mut rows)| {
             rows.sort_by(|(ua, ra, na, _), (ub, rb, nb, _)| {
                 ub.cmp(ua).then_with(|| ra.cmp(rb)).then_with(|| na.cmp(nb))
             });
             let total = rows.len();
-            let prs: Vec<Value> = rows.into_iter().take(cap).map(|(_, _, _, v)| v).collect();
+            let items: Vec<Value> = rows.into_iter().take(cap).map(|(_, _, _, v)| v).collect();
+            let key = if *b == attention::Bucket::Untriaged {
+                "issues"
+            } else {
+                "prs"
+            };
             json!({
                 "bucket": b.as_str(),
                 "total": total,
-                "returned": prs.len(),
-                "prs": prs,
+                "returned": items.len(),
+                key: items,
             })
         })
         .collect();

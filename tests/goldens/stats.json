@@ -71,8 +71,8 @@
   "stats": {
     "archive_schema_version": 3,
     "counts": {
-      "comments": 14,
-      "issues": 2,
+      "comments": 16,
+      "issues": 6,
       "observations": 3,
       "prs": 10,
       "quarantine": 1,

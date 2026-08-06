@@ -574,6 +574,75 @@ fn seed(s: &Scratch) {
         &[],
     );
 
+    // ---- untriaged fixtures (milestone 4 / D2): the issue bucket's wiring
+    // pins. beta#3 above is labeled → absent (the labels-JSON wire); the
+    // alpha linked-cache issue (pk 100) is at WORKING scope → absent (the
+    // per-row config gate). Each row here discriminates one signal wire.
+
+    // beta#4 — bare: no labels, no assignees, no comments → untriaged.
+    exec(
+        "INSERT INTO issues (pk, id, repo, number, title, state, body, author, author_assoc, \
+                             labels, assignees, url, created_at, updated_at, hydration_source, \
+                             synced_at) \
+         VALUES (102, 'IS_b4', 'octo/beta', 4, 'Crash on empty config', 'OPEN', '', 'frank', \
+                 'NONE', NULL, NULL, 'https://github.com/octo/beta/issues/4', \
+                 '2026-01-03T00:00:00Z', '2026-01-05T06:00:00Z', 'stream', \
+                 '2026-01-05T06:30:00Z')",
+        &[],
+    );
+    // beta#5 — a COLLABORATOR replied → cleared by the maintainer-reply
+    // wire alone (no labels, no assignees).
+    exec(
+        "INSERT INTO issues (pk, id, repo, number, title, state, body, author, author_assoc, \
+                             labels, assignees, url, created_at, updated_at, hydration_source, \
+                             synced_at) \
+         VALUES (103, 'IS_b5', 'octo/beta', 5, 'Docs typo in the install guide', 'OPEN', '', \
+                 'grace', 'NONE', NULL, NULL, 'https://github.com/octo/beta/issues/5', \
+                 '2026-01-03T00:00:00Z', '2026-01-04T18:00:00Z', 'stream', \
+                 '2026-01-05T06:30:00Z')",
+        &[],
+    );
+    exec(
+        "INSERT INTO comments (id, parent_kind, parent, kind, author, author_assoc, body, \
+                               created_at, url) \
+         VALUES ('C_b5_erin', 'issue', 103, 'comment', 'erin', 'COLLABORATOR', \
+                 'taking a look', '2026-01-04T18:00:00Z', \
+                 'https://github.com/octo/beta/issues/5#c1')",
+        &[],
+    );
+    // beta#6 — the only maintainer comment is MINIMIZED: not speech, so
+    // the demand stands (untriaged; the structural filter's pin).
+    exec(
+        "INSERT INTO issues (pk, id, repo, number, title, state, body, author, author_assoc, \
+                             labels, assignees, url, created_at, updated_at, hydration_source, \
+                             synced_at) \
+         VALUES (104, 'IS_b6', 'octo/beta', 6, 'Wrong exit code on EPIPE', 'OPEN', '', \
+                 'mallory', 'NONE', NULL, NULL, 'https://github.com/octo/beta/issues/6', \
+                 '2026-01-04T00:00:00Z', '2026-01-05T09:00:00Z', 'stream', \
+                 '2026-01-05T09:30:00Z')",
+        &[],
+    );
+    exec(
+        "INSERT INTO comments (id, parent_kind, parent, kind, author, author_assoc, body, \
+                               is_minimized, created_at, url) \
+         VALUES ('C_b6_erin', 'issue', 104, 'comment', 'erin', 'COLLABORATOR', \
+                 'duplicate spam', 1, '2026-01-05T00:00:00Z', \
+                 'https://github.com/octo/beta/issues/6#c1')",
+        &[],
+    );
+    // beta#7 — assigned (no labels, no reply) → cleared by the assignees
+    // wire alone.
+    exec(
+        "INSERT INTO issues (pk, id, repo, number, title, state, body, author, author_assoc, \
+                             labels, assignees, url, created_at, updated_at, hydration_source, \
+                             synced_at) \
+         VALUES (105, 'IS_b7', 'octo/beta', 7, 'Tune the backoff curve', 'OPEN', '', 'frank', \
+                 'NONE', NULL, '[\"erin\"]', 'https://github.com/octo/beta/issues/7', \
+                 '2026-01-04T00:00:00Z', '2026-01-04T20:00:00Z', 'stream', \
+                 '2026-01-05T06:30:00Z')",
+        &[],
+    );
+
     // One quarantined hydration, for stats.
     exec(
         "INSERT INTO quarantine (id, repo, attempts, next_retry_at, error_class) \
@@ -1075,16 +1144,37 @@ fn attention_fail_if_any_gates_exit_never_bytes() {
     mask(&mut b);
     assert_eq!(a, b, "the gate flag must never change a byte of JSON");
 
-    // All clear: a viewer with no demands and no people exits 0 under the
-    // flag, with every bucket disclosed empty.
+    // Maintainer demands are viewer-INDEPENDENT: a hermit viewer with no
+    // involvement anywhere still trips the gate while a project repo has
+    // unreviewed PRs or untriaged issues — the maintainer sweep is a
+    // property of the scope, not the seat.
     s.write_config(&json!({
         "viewer": "hermit",
         "repos": ["octo/alpha", {"repo": "octo/beta", "scope": "project"}],
     }));
     let (code, doc, stderr) = s.run(&["attention", "--fail-if-any"]);
+    assert_eq!(
+        code, 1,
+        "maintainer demands trip the gate; stderr:\n{stderr}"
+    );
+    let buckets = doc.unwrap()["attention"].as_array().unwrap().clone();
+    assert_eq!(buckets.len(), 6, "project scope emits the maintainer pair");
+
+    // All clear: the same hermit with beta back at working scope — the
+    // operator buckets are empty and the maintainer pair is ABSENT, not
+    // empty (no maintainer sweep was configured; report.rs module docs).
+    s.write_config(&json!({
+        "viewer": "hermit",
+        "repos": ["octo/alpha", "octo/beta"],
+    }));
+    let (code, doc, stderr) = s.run(&["attention", "--fail-if-any"]);
     assert_eq!(code, 0, "all-clear exits 0; stderr:\n{stderr}");
     let buckets = doc.unwrap()["attention"].as_array().unwrap().clone();
-    assert_eq!(buckets.len(), 4, "every bucket appears even when empty");
+    assert_eq!(
+        buckets.len(),
+        4,
+        "every operator bucket appears even when empty"
+    );
     for b in &buckets {
         assert_eq!(b["total"], json!(0), "{b}");
         assert_eq!(b["prs"], json!([]));
@@ -1275,7 +1365,7 @@ fn query_reads_stdin_when_dashed() {
     };
     assert_eq!(out.status.code(), Some(0));
     let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(doc["rows"], json!([[2]]));
+    assert_eq!(doc["rows"], json!([[6]]));
 }
 
 #[test]
