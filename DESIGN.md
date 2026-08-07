@@ -9,9 +9,10 @@ project. Between them, working-scope repos can track named **people**:
 collaborators or contributors the operator opts in, whose involvement is
 archived alongside the operator's own without widening to the whole repo.
 
-Status: working, built through milestone 5 (hardening); the output
-contract is frozen at `schema_version: 1`. ROADMAP.md sequences what
-remains (MCP).
+Status: working, built through milestone 6 (MCP) — the roadmap's numbered
+milestones are complete; ROADMAP.md keeps the deferred items and the
+evidence that decides each. The output contract is frozen at
+`schema_version: 1`.
 Mechanism and its rationale live as module comments where the code is
 (src/sync.rs, src/schema.sql, src/gh.rs, src/queries.rs); this document
 carries the architecture and the arguments between modules, deliberately
@@ -57,9 +58,13 @@ invariant is process-group SIGINT semantics and archive protection is mode
 bits, neither of which has a Windows expression — a port would mean two
 mechanisms and two proofs where the design wants one.
 
-A future MCP server starts as an external per-call wrapper spawning the CLI —
-zero new dependencies, inherits every CLI invariant. A feature-gated resident
-binary lands only on measured spawn latency, never before.
+The MCP server (`ghgraph-mcp`, src/bin/mcp.rs) is an external per-call
+wrapper spawning the CLI — zero new dependencies, every CLI invariant
+inherited by construction: a tool result carries the verb's stdout document
+byte-for-byte, proven by test against the live CLI. The wrapper owns only
+protocol decisions, recorded in its module docs (exit-code→isError mapping,
+gate flags off the tool surface, argv injection-proofing). A feature-gated
+resident binary lands only on measured spawn latency, never before.
 
 ## Sync
 
@@ -228,8 +233,8 @@ silent write.
 ## Command surface
 
 The verbs — sync, attention, prs, pr, search, query, stats — are the whole
-surface, and each is one operation on the archive that maps 1:1 to a future
-MCP tool. The mapping is the constraint, not the count: the CLI and the MCP
+surface, and each is one operation on the archive that maps 1:1 to an MCP
+tool (src/bin/mcp.rs). The mapping is the constraint, not the count: the CLI and the MCP
 server are one surface, so there is one contract to specify, test, and reason
 about rather than two that can diverge. A verb is an archive operation an
 agent would call; the count is incidental, and an additional verb is
