@@ -221,6 +221,13 @@ CREATE TABLE IF NOT EXISTS observations (
   new         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_observations_at ON observations (observed_at);
+-- The head_sha flip lookup (report.rs HOT_OBS_HEAD_FLIP) runs once per open
+-- PR under `attention` and once per `pr` view; without this index each is a
+-- full observations scan — the EXPLAIN gate that found it now pins it. seq
+-- is the rowid, so it rides every entry and the (observed_at DESC, seq
+-- DESC) order falls out of a backward index scan, no sort.
+CREATE INDEX IF NOT EXISTS idx_observations_pr_field
+  ON observations (pr, field, observed_at);
 
 -- Watermarks are server-side time — max updatedAt over items hydrated OR
 -- deliberately filtered (filtered is declined, not unfetched; a bot-only
@@ -268,6 +275,79 @@ CREATE TABLE IF NOT EXISTS quarantine (
   attempts      INTEGER NOT NULL DEFAULT 0,
   next_retry_at TEXT NOT NULL,
   error_class   TEXT NOT NULL
+);
+
+-- Run-level telemetry: one flat row per COMPLETED discovery run, no child
+-- tables ever — per-repo history stays ephemeral in the sync summary
+-- (src/sync.rs owns the telemetry rule and the field/consumer pairing;
+-- DESIGN.md Verification owns the two-homes fence). Trends are a `query`
+-- away without a telemetry store growing underneath. A run that dies before
+-- the writer finishes leaves NO row: sync_runs describes completed runs, and
+-- an aborted run's absence here is disclosed by its sync_state
+-- runs_since_advance increment, not by a partial row. One stated
+-- precondition: that holds for writer-side errors; a worker PANIC (a
+-- ghgraph bug by policy) drops its Sender, ends the recv loop normally,
+-- and can leave a row missing that worker's counters before the panic
+-- re-raises. The targeted form (`sync --pr`) writes no row either — it is
+-- one hydration, not a run. A zero-repo run writes none as well
+-- (sync.rs record_run): an all-zero row per cron tick of an empty config
+-- would dilute the trailing window without informing any consumer.
+--
+-- Every column names its consumer (the telemetry rule: a field with no
+-- consumer is deleted). Omitted on that rule, recorded so the cut is not
+-- re-proposed: `filtered`, `masked_hits`, `bodies_skipped`, and the
+-- per-reason `escalations` map are per-repo summary disclosures with no
+-- run-level decision reading them — and escalations is a map, which a flat
+-- row would have to encode as JSON, the child-table smell by other means.
+CREATE TABLE IF NOT EXISTS sync_runs (
+  seq                   INTEGER PRIMARY KEY,
+  started_at            TEXT NOT NULL,         -- run identity; trailing-window
+  finished_at           TEXT NOT NULL,         --   selection orders on seq
+  -- Replay-idempotence detector: an unchanged remote with nonzero deltas
+  -- here is replay idempotence failing live.
+  fetched               INTEGER NOT NULL,
+  upserted              INTEGER NOT NULL,
+  unchanged             INTEGER NOT NULL,
+  observations          INTEGER NOT NULL,
+  soft_deleted          INTEGER NOT NULL,
+  -- Re-verify tier tuning: quiet_mutations_found makes the tier defaults
+  -- falsifiable; reverified vs reverify_shed is what would promote
+  -- REVERIFY_CAP to a config (sync.rs, at the constant).
+  reverified            INTEGER NOT NULL,
+  reverify_shed         INTEGER NOT NULL,
+  quiet_mutations_found INTEGER NOT NULL,
+  -- Tail-size decision: the tail_hits : full_walks ratio sizes TAIL_K.
+  tail_hits             INTEGER NOT NULL,
+  full_walks            INTEGER NOT NULL,
+  -- Batching decision (ROADMAP, deferred `nodes(ids:)` hydration): batch
+  -- only if spawn overhead dominates. The intercept is computed per run
+  -- from the run's per-call (stdout bytes, wall ms) pairs (gh.rs
+  -- Telemetry::samples — intra-run only, so the intercept is NOT
+  -- recomputable from the stored totals); the decision reads a MEDIAN
+  -- over trailing rows, never one run. NULL when the run had too few or
+  -- degenerate samples for a regression — unknown is disclosed, never
+  -- zero-filled.
+  subprocess_count      INTEGER NOT NULL,
+  subprocess_ms         INTEGER NOT NULL,
+  bytes_parsed          INTEGER NOT NULL,
+  overhead_intercept_ms INTEGER,
+  -- Retry and floor defaults (ROADMAP, deferred tuning): conservative
+  -- ships, revised from these.
+  rate_cost             INTEGER NOT NULL,
+  sleeps                INTEGER NOT NULL,
+  sleep_ms              INTEGER NOT NULL,
+  deferred_at_floor     INTEGER NOT NULL,      -- 0/1: the floor is run-wide
+  rate_remaining        INTEGER,               -- NULL: envelope never seen
+  -- Health trend: `stats` sums these over its trailing window
+  -- (report.rs sync_runs_trends "health") so incompleteness over recent
+  -- runs is visible, not inferred; rate_limit_unknown nonzero detects the
+  -- rateLimit envelope regressing (gh.rs names that consumer).
+  truncated             INTEGER NOT NULL,
+  quarantined           INTEGER NOT NULL,
+  discovery_truncated   INTEGER NOT NULL,
+  watchdog_kills        INTEGER NOT NULL,
+  rate_limit_unknown    INTEGER NOT NULL,
+  errors                INTEGER NOT NULL       -- count of per-repo failures
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS prs_fts USING fts5(

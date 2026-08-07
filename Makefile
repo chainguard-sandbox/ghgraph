@@ -4,7 +4,7 @@
 # ghgraph is a design scaffold — function bodies are `todo!()` stubs, so
 # `build` compiles but `run` will panic until the bodies land. See DESIGN.md.
 
-.PHONY: help doctor config build release run test check-heavy fuzz mutants fmt lint check check-full audit clean install setup setup-vet
+.PHONY: help doctor config build release run test check-heavy fuzz mutants fmt lint check check-full audit vet tree tree-check clean install setup
 
 BINARY_NAME := ghgraph
 
@@ -94,21 +94,45 @@ check: ## Fast pre-commit gate: format, clippy, check, test
 check-heavy: ## The ignored heavy tests (e.g. the 120s live watchdog stall)
 	cargo test -- --ignored --skip capture_
 
-check-full: check audit ## check, plus the dependency advisory scan
+check-full: check audit vet tree-check ## check, plus the supply-chain checks CI runs
 
 #
-# Supply chain (dependency policy — see DESIGN.md)
+# Supply chain (dependency policy — see DESIGN.md; all four run in CI)
 #
 
 audit: ## Scan dependencies for known advisories (needs cargo-audit; make setup)
 	@command -v cargo-audit >/dev/null 2>&1 || { echo "cargo-audit not found — run 'make setup' (or: cargo install cargo-audit)"; exit 1; }
 	cargo audit
 
-setup: ## Install the dev tools the quality targets need (cargo-audit)
-	cargo install cargo-audit
+vet: ## Vet the dependency tree against supply-chain/ (needs cargo-vet; make setup)
+	@command -v cargo-vet >/dev/null 2>&1 || { echo "cargo-vet not found — run 'make setup' (or: cargo install cargo-vet)"; exit 1; }
+	cargo vet --locked
 
-setup-vet: ## Initialize the cargo-vet store (one-time; hardening milestone)
-	cargo vet init
+# The snapshot's first line embeds the local checkout path (cargo prints the
+# root package's manifest dir); sed strips it so the snapshot is
+# host-portable — CI checkouts and contributor clones live elsewhere. Both
+# targets write to a temp file first: a plain redirect would truncate the
+# committed snapshot before a failing cargo runs, and a pipe into diff would
+# let diff's exit status mask cargo's.
+TREE_CMD := cargo tree --locked --edges normal --target all
+
+tree: ## Regenerate the dependency-graph snapshot (run after any Cargo.toml/lock change)
+	@t=$$(mktemp); $(TREE_CMD) > $$t || { rm -f $$t; echo "cargo tree failed (lockfile drift?)"; exit 1; }; \
+		sed -E -i.bak '1s| \(.*\)$$||' $$t && rm -f $$t.bak; \
+		mv $$t supply-chain/cargo-tree.txt && \
+		echo "wrote supply-chain/cargo-tree.txt — review the diff like code"
+
+tree-check: ## Fail if the dependency graph moved without a snapshot update
+	@t=$$(mktemp); $(TREE_CMD) > $$t || { rm -f $$t; echo "cargo tree failed (lockfile drift?)"; exit 1; }; \
+		sed -E -i.bak '1s| \(.*\)$$||' $$t && rm -f $$t.bak; \
+		diff -u supply-chain/cargo-tree.txt $$t || \
+		{ rm -f $$t; echo "dependency graph diverged from supply-chain/cargo-tree.txt — run 'make tree' and review"; exit 1; }; \
+		rm -f $$t
+
+# Versions match .github/workflows/ci.yml — bump both together, by diff.
+setup: ## Install the dev tools the quality targets need (cargo-audit, cargo-vet)
+	cargo install cargo-audit --version 0.22.2 --locked
+	cargo install cargo-vet --version 0.10.2 --locked
 
 #
 # Housekeeping

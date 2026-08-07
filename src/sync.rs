@@ -274,8 +274,8 @@ const PAGE_BATCH: usize = 8;
 
 /// Re-verify hydrations per repo per run. A cap, not a config: it exists so
 /// a cold archive's backlog cannot starve discovery, and the jitter spreads
-/// the steady state; sync_runs telemetry (milestone 5) is what would
-/// promote it.
+/// the steady state; sync_runs' reverified/reverify_shed trend is what
+/// would promote it.
 const REVERIFY_CAP: usize = 25;
 
 /// node:null must repeat this many attempts before draining to
@@ -2828,6 +2828,13 @@ fn writer(
     for repo in repos {
         tallies.insert(repo.clone(), RepoTally::default());
     }
+    // Run-level, not per-repo: the overhead-intercept regression pools every
+    // completed call's (bytes, ms) pair — spawn overhead is a property of
+    // the machine and the gh binary, not of any one repo. Pool ORDER is
+    // Msg::Stats arrival order, nondeterministic across workers; licensed
+    // because only the rounded per-run intercept is stored, nothing ever
+    // compares it byte-identical, and its consumer is a 20-run median.
+    let mut samples: Vec<(u64, u64)> = Vec::new();
     // A message can only name a configured repo, but stay total.
     fn tally<'a>(t: &'a mut BTreeMap<String, RepoTally>, repo: &str) -> &'a mut RepoTally {
         t.entry(repo.to_string()).or_default()
@@ -2982,6 +2989,7 @@ fn writer(
                     *t.escalations.entry(reason).or_default() += n;
                 }
                 t.bodies_skipped += bodies_skipped;
+                samples.extend(&tel.samples);
                 t.subprocess_count += tel.subprocess_count;
                 t.subprocess_ms += tel.subprocess_ms;
                 t.bytes_parsed += tel.bytes_parsed;
@@ -2998,7 +3006,137 @@ fn writer(
         }
     }
 
+    record_run(archive, now, &tallies, &samples)?;
     Ok(summary(&tallies))
+}
+
+/// The sync_runs row: one flat INSERT per completed run, after the recv loop
+/// and before the summary returns — a run that errors out of the loop above
+/// leaves NO row (schema.sql records why absence is the honest shape for an
+/// aborted run). Written outside any long transaction, like every other
+/// writer commit. Failure here is a real error, not best-effort: the archive
+/// just took a whole run of writes on this same connection, so a failing
+/// telemetry INSERT means something is genuinely wrong with the archive.
+fn record_run(
+    archive: &RwArchive,
+    started_at: &Rfc3339Utc,
+    tallies: &BTreeMap<String, RepoTally>,
+    samples: &[(u64, u64)],
+) -> Result<()> {
+    // A zero-repo run records nothing: no discovery ran, and an all-zero
+    // row per cron tick of an empty config would dilute the trailing
+    // window (stats) without informing any consumer.
+    if tallies.is_empty() {
+        return Ok(());
+    }
+    // u64 tallies land in i64 columns; saturate rather than wrap — both
+    // the per-repo fold (saturating_add) and the final cast, so the stated
+    // posture is the whole path's, not just the last step's (a tally near
+    // i64::MAX is already nonsense, but it must not become a negative
+    // trend row).
+    fn s(v: u64) -> i64 {
+        i64::try_from(v).unwrap_or(i64::MAX)
+    }
+    let sum = |f: fn(&RepoTally) -> u64| -> i64 {
+        s(tallies.values().fold(0u64, |a, t| a.saturating_add(f(t))))
+    };
+    archive
+        .conn()
+        .execute(
+            "INSERT INTO sync_runs (\
+               started_at, finished_at, \
+               fetched, upserted, unchanged, observations, soft_deleted, \
+               reverified, reverify_shed, quiet_mutations_found, \
+               tail_hits, full_walks, \
+               subprocess_count, subprocess_ms, bytes_parsed, overhead_intercept_ms, \
+               rate_cost, sleeps, sleep_ms, deferred_at_floor, rate_remaining, \
+               truncated, quarantined, discovery_truncated, watchdog_kills, \
+               rate_limit_unknown, errors) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+            rusqlite::params![
+                started_at.as_str(),
+                Rfc3339Utc::now().as_str(),
+                sum(|t| t.fetched),
+                sum(|t| t.upserted),
+                sum(|t| t.unchanged),
+                sum(|t| t.observations),
+                sum(|t| t.soft_deleted),
+                sum(|t| t.reverified),
+                sum(|t| t.reverify_shed),
+                sum(|t| t.quiet_mutations_found),
+                sum(|t| t.tail_hits),
+                sum(|t| t.full_walks),
+                sum(|t| t.subprocess_count),
+                sum(|t| t.subprocess_ms),
+                sum(|t| t.bytes_parsed),
+                overhead_intercept_ms(samples),
+                sum(|t| t.rate_cost),
+                sum(|t| t.sleeps),
+                sum(|t| t.sleep_ms),
+                tallies.values().any(|t| t.deferred_at_floor),
+                // Same fold as the summary's rate_remaining: the tightest
+                // budget any repo saw.
+                tallies.values().filter_map(|t| t.remaining).min(),
+                sum(|t| t.truncated),
+                sum(|t| t.quarantined),
+                sum(|t| t.discovery_truncated),
+                sum(|t| t.watchdog_kills),
+                sum(|t| t.rate_limit_unknown),
+                s(tallies.values().map(|t| t.errors.len() as u64).sum()),
+            ],
+        )
+        .map_err(|e| classify_sql(&e))?;
+    Ok(())
+}
+
+/// Least-squares intercept, in ms, over per-call (bytes, ms) pairs: the
+/// per-call cost at zero payload, i.e. spawn overhead. Stored per run;
+/// the batching decision reads a MEDIAN over trailing sync_runs rows, never
+/// one run (module docs). None — disclosed as NULL, never zero-filled —
+/// when a regression cannot exist: fewer than two samples, or zero variance
+/// in x (every call the same size, the intercept unidentifiable). A noisy
+/// run can put the intercept below zero; stored honestly rather than
+/// clamped — "statistically indistinguishable from zero" and "zero" read
+/// the same to the batching median, and clamping would hide the noise from
+/// anyone auditing the regression itself. Floats stay internal (the output
+/// rule is no floats PRINTED; the stored value is a rounded integer).
+fn overhead_intercept_ms(samples: &[(u64, u64)]) -> Option<i64> {
+    if samples.len() < 2 {
+        return None;
+    }
+    let n = samples.len() as f64;
+    let mx = samples.iter().map(|&(x, _)| x as f64).sum::<f64>() / n;
+    let my = samples.iter().map(|&(_, y)| y as f64).sum::<f64>() / n;
+    let sxx: f64 = samples
+        .iter()
+        .map(|&(x, _)| {
+            let d = x as f64 - mx;
+            d * d
+        })
+        .sum();
+    // Exact compare on purpose, not an epsilon: all-equal integer inputs
+    // give exactly-0.0 deviations under IEEE 754 subtraction, and a small
+    // NONZERO sxx is a well-defined regression an epsilon would wrongly
+    // discard.
+    if sxx == 0.0 {
+        return None;
+    }
+    // Mutation note: flipping either `-` inside this map to `+` is an
+    // equivalent mutant, by algebra rather than by luck — Σ(x+mx)(y−my) =
+    // Σ(x−mx)(y−my) + 2·mx·Σ(y−my), and Σ(y−my) is identically zero by the
+    // definition of the mean (symmetrically for the y side). Only float
+    // rounding distinguishes them; a test pinning that residue would
+    // assert noise. Documented per the triage rule, not chased.
+    let sxy: f64 = samples
+        .iter()
+        .map(|&(x, y)| (x as f64 - mx) * (y as f64 - my))
+        .sum();
+    let intercept = my - (sxy / sxx) * mx;
+    // `as` saturates on overflow — with finite inputs the value is finite,
+    // and a pathological one lands on the i64 rails, not UB. (NaN would
+    // cast to 0, but the sxx > 0 guard above blocks the only NaN route.)
+    Some(intercept.round() as i64)
 }
 
 /// One repo's rows in one transaction (the Page path).
@@ -4734,6 +4872,36 @@ mod tests {
     fn fp(cfg_json: &str) -> Value {
         let c = cfg(cfg_json);
         fingerprint(&c, &c.repos[0].resolved())
+    }
+
+    // --- overhead intercept: the sync_runs batching input ---
+
+    #[test]
+    fn intercept_recovers_known_line() {
+        // y = 5 + 2x exactly: the discriminating inputs are three collinear
+        // points, so any perturbation of the least-squares arithmetic (a
+        // swapped mean, a dropped term) moves the intercept off 5.
+        assert_eq!(overhead_intercept_ms(&[(0, 5), (1, 7), (2, 9)]), Some(5));
+    }
+
+    #[test]
+    fn intercept_is_none_when_unidentifiable() {
+        // Fewer than two samples, or zero x-variance: no regression exists,
+        // and the disclosure is NULL, never a zero-filled guess.
+        assert_eq!(overhead_intercept_ms(&[]), None);
+        assert_eq!(overhead_intercept_ms(&[(100, 7)]), None);
+        assert_eq!(
+            overhead_intercept_ms(&[(100, 5), (100, 9), (100, 13)]),
+            None,
+            "identical byte counts leave the intercept unidentifiable"
+        );
+    }
+
+    #[test]
+    fn intercept_stores_negative_honestly() {
+        // y = -10 + 10x: a noisy run can regress below zero; the value is
+        // stored, not clamped (the fn doc carries the argument).
+        assert_eq!(overhead_intercept_ms(&[(1, 0), (2, 10)]), Some(-10));
     }
 
     // --- fingerprint + transition: the config-change contract ---

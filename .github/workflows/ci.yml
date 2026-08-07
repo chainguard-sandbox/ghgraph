@@ -1,0 +1,72 @@
+# CI: the pre-commit gate plus the supply-chain checks (DESIGN.md
+# Verification — Cargo.lock is committed; cargo vet and cargo audit run in
+# CI; the cargo-tree snapshot makes any dependency-graph movement a
+# reviewable diff, not a lockfile blur).
+#
+# Third-party actions are pinned by commit SHA, and there is exactly one
+# (checkout, with persist-credentials off: both jobs compile dozens of
+# third-party build scripts via cargo, which must never find a token on
+# disk — read access to public code needs none). The toolchain comes from
+# the runner's own rustup, and the audit tools install from crates.io
+# version-pinned with --locked — every remaining moving part is one the
+# dependency policy already governs. No cache action: a few minutes of
+# cargo install per run is cheaper than another pinned third-party
+# dependency to vet. The toolchain FLOATS on stable by decision: the MSRV
+# floor lives in Cargo.toml (rust-version), and catching a new stable's
+# breakage in CI is the point, not a hazard.
+#
+# Deployment dependency, not expressible here: both jobs must be listed
+# as required status checks in branch protection, or a red supply-chain
+# job cannot block a merge. The jobs are parallel on purpose (no needs:).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# One run per ref: a force-push or rapid PR update cancels the superseded
+# run instead of queueing behind it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: toolchain
+        run: rustup update --no-self-update stable && rustup default stable
+      - name: fmt + clippy + check + test (the make check gate)
+        run: make check
+
+  supply-chain:
+    name: supply-chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: toolchain
+        run: rustup update --no-self-update stable && rustup default stable
+      - name: install audit tools (version-pinned, locked)
+        # Pinned versions, bumped by diff like any dependency — an unpinned
+        # install would let a new tool release change vet/audit semantics
+        # with no reviewable change in this repo.
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-vet --version 0.10.2 --locked
+      - name: advisory scan
+        run: make audit
+      - name: vet the dependency tree
+        run: cargo vet --locked
+      - name: dependency-graph diff against the committed snapshot
+        run: make tree-check

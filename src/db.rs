@@ -30,17 +30,32 @@
 //! process umask (we cannot set their mode at their creation without a libc dep
 //! we do not take).
 //!
-//! Two preconditions of the mode guarantee, stated rather than papered over:
-//!   * It covers only directories ghgraph creates. A pre-existing archive
-//!     directory (an operator's custom `db_path` pointed at a shared or
-//!     world-readable dir) keeps its own mode; the -wal/-shm confidentiality
-//!     boundary is then absent. Refusing a group/other-writable parent is
-//!     PLANNED (milestone 5, hardening) — the enforcement is a mechanism, and
-//!     until it exists this is a documented gap, not a silent one.
+//! Two preconditions of the mode guarantee, and their enforcement:
+//!   * A pre-existing archive directory (an operator's custom `db_path`
+//!     pointed at a shared dir) keeps its own mode — but open_rw REFUSES a
+//!     group/other-WRITABLE parent unless it is root-owned AND sticky (the
+//!     /tmp shape): a writable parent is exactly the access the symlink-swap
+//!     defense assumes the attacker lacks; sticky denies NON-OWNERS the
+//!     unlink+replace a swap needs, and the root-owned narrowing keeps a
+//!     user-owned 1777 dir (whose owner retains both) refused. The residue
+//!     sticky cannot cover — planting a symlink at a not-yet-existing
+//!     archive path needs only create — is closed by an lstat refusal of a
+//!     symlink at the path itself (refuse_symlink_archive). Immediate
+//!     parent only, with the limit stated: a writable ANCESTOR can rename
+//!     the parent dir itself aside and substitute one that passes every
+//!     check here — the same unsafe-traversal exposure the module accepts
+//!     by rejecting NOFOLLOW/openat chains, and an operator's path choice,
+//!     not a mode this code can vet. Write bits only, decided: a
+//!     world-READABLE parent weakens the -wal/-shm confidentiality
+//!     boundary but forges nothing — refusing it would false-refuse every
+//!     home directory more open than 0700, so readability stays the
+//!     operator's call and integrity does not.
 //!   * mode() is masked by the process umask, so 0700/0600 is a ceiling, not a
 //!     floor. umask can only tighten, never loosen, so confidentiality is never
 //!     regressed; an exotic umask that clears owner bits could make the archive
-//!     unwritable, which surfaces as a CONFIGURATION open error.
+//!     unwritable, which surfaces as a CONFIGURATION open error. The tests
+//!     re-exec themselves under `sh -c 'umask 0; ...'` to prove the explicit
+//!     .mode() calls carry the guarantee rather than an inherited umask.
 //!
 //! Versioning: PRAGMA user_version. 0 → apply schema.sql (always the CURRENT
 //! shape) → SCHEMA_VERSION, schema apply and the version bump in ONE
@@ -81,22 +96,34 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// v3: quarantine.stream — retry dispatch by hydration document (schema.sql
 /// records why an opaque node id cannot carry that fact itself).
 ///
-/// MIGRATION POLICY, decided here so the machinery is not re-proposed every
-/// schema change: migrations begin at the first RELEASED binary — an
-/// archive someone cannot cheaply rebuild. Until then the archive is a
-/// disposable cache (that is already the corruption remedy's prose), so a
-/// pre-release schema change bumps this version and REFUSES older stamps
-/// with the remove-and-resync remedy, rather than carrying ALTER TABLE
-/// steps, their column-order constraints (an appended column must then stay
-/// last forever or `query` SELECT * forks by archive provenance), and the
-/// fixture archaeology their tests need. The bump itself is NOT optional:
-/// amending the schema in place under an unchanged version would let an
-/// old archive pass the version gate and then fail mid-verb with "no such
-/// column" classified INTERNAL — a lie about the actor. A v1→v2 ALTER
-/// TABLE migration existed briefly and was verified correct; it was deleted
-/// by this policy, not by a defect (the git history holds it if the first
-/// release ever needs the pattern back).
-pub const SCHEMA_VERSION: i64 = 3;
+/// v4: the sync_runs run-telemetry table and idx_observations_pr_field
+/// (hardening milestone) — one flat row per completed run, so trends are a
+/// `query` away without a telemetry store growing underneath. An archive
+/// fact only; no emitted field changed shape (`stats` gained additive keys
+/// under the additive-only contract). MIGRATES from v3 (see `migrate`):
+/// the bump is purely additive — no v3 object changes shape — so the
+/// idempotent schema batch IS the migration.
+///
+/// MIGRATION POLICY, decided here so the machinery is not re-proposed
+/// every schema change, and NARROWED at v4: schema.sql is written as
+/// idempotent CREATE IF NOT EXISTS statements, so a PURELY ADDITIVE bump
+/// (new tables/indexes only, nothing existing reshaped) migrates by
+/// re-applying that batch — the same crash-safe transaction a fresh
+/// archive gets, no new machinery, each version's arm justified
+/// individually in `migrate`. SHAPE-CHANGING bumps remain refused with
+/// the remove-and-resync remedy until the first RELEASED binary — an
+/// archive someone cannot cheaply rebuild — because they would carry
+/// ALTER TABLE steps, their column-order constraints (an appended column
+/// must then stay last forever or `query` SELECT * forks by archive
+/// provenance), and the fixture archaeology their tests need. The bump
+/// itself is NOT optional either way: amending the schema in place under
+/// an unchanged version would let an old archive pass the version gate
+/// and then fail mid-verb with "no such column" classified INTERNAL — a
+/// lie about the actor. A v1→v2 ALTER TABLE migration existed briefly
+/// and was verified correct; it was deleted by this policy, not by a
+/// defect (the git history holds it if the first release ever needs the
+/// pattern back).
+pub const SCHEMA_VERSION: i64 = 4;
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 
@@ -116,9 +143,31 @@ impl RwArchive {
         &mut self.0
     }
 
-    /// Consume the wrapper for code that needs to own the `Connection`.
-    pub fn into_inner(self) -> Connection {
-        self.0
+    // No into_inner, DECIDED: an escaped Connection would outlive the
+    // truncate-on-close mechanism below, making "the WAL is truncated at
+    // writer close" hold on some paths and not others. Nothing needs to own
+    // the raw Connection; if something ever does, it must also own the close
+    // behavior it is opting out of.
+}
+
+/// Best-effort WAL truncate at writer close (hardening milestone): a busy
+/// steady-state sync can leave a WAL comparable to the archive itself, and
+/// the next writer may be days away. TRUNCATE (not PASSIVE) returns the disk
+/// space. Best-effort is load-bearing: a reader holding a WAL snapshot makes
+/// the truncate report busy — after the connection's busy handler waits out
+/// its window, so this close can stall up to BUSY_TIMEOUT (bounded, ~5s;
+/// never indefinite) — and a run that synced correctly must not turn
+/// into an error over housekeeping, so the result is deliberately ignored
+/// (the next close retries by existing). Drop, not an explicit close method:
+/// every writer path — sync's run, the targeted form, a mid-run error unwind,
+/// every test — closes through here, so the mechanism cannot be forgotten.
+impl Drop for RwArchive {
+    fn drop(&mut self) {
+        // wal_checkpoint returns a (busy, log, checkpointed) row; both the
+        // row and any error are non-actionable here by the argument above.
+        let _ = self
+            .0
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
     }
 }
 
@@ -135,6 +184,21 @@ impl RoArchive {
     }
 }
 
+/// The `stats`-audit connection: SQLITE_OPEN_READ_ONLY, deliberately WITHOUT
+/// query_only — see [`open_ro_audit`] for the argument and its bounds. A
+/// distinct type so the weakened belt cannot be handed to a verb that runs
+/// operator SQL by accident of sharing [`RoArchive`]'s signature.
+pub struct RoAuditArchive(Connection);
+
+impl RoAuditArchive {
+    /// The underlying connection. Archive writes fail at runtime via the
+    /// READ_ONLY open flag; temp-schema writes (the fts5vocab audit tables)
+    /// succeed, which is this type's whole reason to exist.
+    pub fn conn(&self) -> &Connection {
+        &self.0
+    }
+}
+
 /// Open (creating if absent) the read-write archive and migrate it to
 /// [`SCHEMA_VERSION`].
 ///
@@ -144,22 +208,25 @@ impl RoArchive {
 pub fn open_rw(path: &Path) -> Result<RwArchive> {
     if let Some(parent) = path.parent() {
         ensure_dir_0700(parent)?;
+        refuse_writable_parent(parent)?;
     }
     create_0600_if_absent(path)?;
+    refuse_symlink_archive(path)?;
 
     // create_0600_if_absent already birthed the file at 0600, so in the normal
     // path SQLITE_OPEN_CREATE never sets a mode. It is kept only to survive the
     // vanishing-file race between our create and this open — and in that race
-    // branch O_CREAT recreates the file at umask-default (not 0600). That narrow
-    // gap is undefended (PLANNED milestone 5: re-verify the fd's mode after
-    // open), but reaching it requires already controlling the 0700 archive
-    // directory. No NOFOLLOW — it false-refuses archives under symlinked parent
-    // dirs; the 0700 directory is the symlink-swap defense (module docs).
+    // branch O_CREAT recreates the file at umask-default (not 0600). The mode
+    // re-check after open (below) closes that branch: whatever file this open
+    // landed on must still be owner-only. No NOFOLLOW — it false-refuses
+    // archives under symlinked parent dirs; the 0700 directory is the
+    // symlink-swap defense (module docs).
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let mut conn = Connection::open_with_flags(path, flags)
         .map_err(|e| sqlite_err(path, "cannot open archive", e))?;
+    refuse_loose_archive_mode(path)?;
     configure_conn(&conn, path)?;
     set_wal(&conn, path)?;
     conn.pragma_update(None, "synchronous", "NORMAL")
@@ -218,10 +285,66 @@ pub fn open_ro(path: &Path) -> Result<RoArchive> {
     Ok(RoArchive(conn))
 }
 
+/// Open the archive for the `stats` audits: SQLITE_OPEN_READ_ONLY but NO
+/// PRAGMA query_only, because the FTS integrity audit introspects the index
+/// through `fts5vocab` TEMP virtual tables — the only read-only ENUMERATION
+/// of the index's per-rowid contents (a plain fts5 full scan answers from
+/// the CONTENT table so it cannot witness a desync, and a MATCH reads the
+/// index but only for terms you already know) — and query_only refuses even
+/// temp-schema writes. What this trades, precisely: archive write-immunity
+/// remains a mechanism (the VFS-level READ_ONLY flag), but the belt
+/// query_only adds — refusing ATTACH-based writes to OTHER files — is off.
+/// Admissible only because stats executes exclusively its own literal SQL;
+/// the `query` verb, which runs operator SQL, keeps the full pair and must
+/// never move to this open. The guard is at the OPEN, not at execute():
+/// RoAuditArchive::conn is a raw &Connection like every wrapper here, so
+/// the type prevents handing the weakened connection around, not misusing
+/// one already held. Same existence and version gates as [`open_ro`].
+/// Reversal evidence: an fts5 mechanism that lets a query_only connection
+/// enumerate index rowids would retire this open.
+pub fn open_ro_audit(path: &Path) -> Result<RoAuditArchive> {
+    match path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(Error::config(format!(
+                "no archive at {} — run `ghgraph sync` first",
+                path.display()
+            )));
+        }
+        Err(e) => {
+            return Err(Error::config(format!(
+                "cannot access archive {}: {e}",
+                path.display()
+            )));
+        }
+    }
+    // Mutation notes, shared with open_ro's identical lines: the flag `|`
+    // has an equivalent `^` mutant (the two flags are disjoint bit sets, so
+    // OR and XOR coincide); the hook's `== "1"` has an equivalent `!=`
+    // mutant under the test suite, because for contract-correct queries the
+    // reversal pragma is observably a no-op either way — the hook exists to
+    // catch INCORRECT queries, and a test that could see the flip would
+    // have to ship one. Documented per the triage rule, not chased.
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)
+        .map_err(|e| sqlite_err(path, "cannot open archive", e))?;
+    configure_conn(&conn, path)?;
+    // The same determinism hook as open_ro: the audit statements are
+    // contract output too and must hold under reversed unordered selects.
+    if std::env::var_os("GHGRAPH_TEST_REVERSE_SELECTS").is_some_and(|v| v == "1") {
+        conn.pragma_update(None, "reverse_unordered_selects", true)
+            .map_err(|e| sqlite_err(path, "cannot set reverse_unordered_selects on", e))?;
+    }
+    let version = user_version(&conn, path)?;
+    if version != SCHEMA_VERSION {
+        return Err(wrong_version(path, version));
+    }
+    Ok(RoAuditArchive(conn))
+}
+
 /// Create the parent chain, with any directory WE create born 0700. A
-/// pre-existing directory is left as-is — its mode is the operator's (see the
-/// precondition in the module docs; enforcing 0700 on a pre-existing parent is
-/// PLANNED milestone 5).
+/// pre-existing directory keeps its mode — the integrity floor it must still
+/// meet is `refuse_writable_parent`, checked by open_rw right after this.
 fn ensure_dir_0700(dir: &Path) -> Result<()> {
     if dir.as_os_str().is_empty() {
         return Ok(());
@@ -243,6 +366,106 @@ fn ensure_dir_0700(dir: &Path) -> Result<()> {
         .mode(0o700)
         .create(dir)
         .map_err(|e| Error::config(format!("cannot create archive dir {}: {e}", dir.display())))
+}
+
+/// Refuse a group/other-WRITABLE archive directory without the sticky bit
+/// (module docs carry the full argument): the 0700-directory symlink-swap
+/// defense is void exactly when someone else can write the directory, so
+/// that state is a refusal, not a footnote. Sticky (the /tmp shape) is
+/// exempt — non-owners cannot unlink or rename our entries there, which is
+/// the operation a swap needs. Checked on the IMMEDIATE parent only: an
+/// ancestor's mode governs reaching the directory, not replacing entries
+/// inside it. RW-side only: the reader creates nothing and inherits a
+/// directory the writer already vetted; refusing reads of an archive that
+/// synced fine yesterday would punish the reader for the writer's problem.
+fn refuse_writable_parent(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // A bare-filename db_path ("ghgraph.db") has parent Some("") — that is
+    // the current directory, so check it as such rather than ENOENT-ing on
+    // the empty path (ensure_dir_0700 early-returns on the same input).
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let meta = std::fs::metadata(dir)
+        .map_err(|e| Error::config(format!("cannot access archive dir {}: {e}", dir.display())))?;
+    let mode = meta.permissions().mode();
+    // The sticky exemption is narrowed to ROOT-owned dirs (the actual /tmp
+    // shape): sticky denies non-owners the unlink+rename a swap needs, but
+    // the directory's OWNER keeps both — so a user-owned 1777 dir is still
+    // a swap venue for its owner and is refused (its owner can chmod go-w;
+    // the remedy applies). The plant-before-create residue a sticky dir
+    // still permits (anyone may CREATE a symlink at a path that does not
+    // exist yet) is closed by refuse_symlink_archive, not here.
+    //
+    // Mutation note: the sticky-mask operators (& 0o1000) have surviving
+    // mutants (|, ^) whose only discriminating fixture is a ROOT-owned
+    // writable NON-sticky directory — unprivileged tests cannot create
+    // one. The testable arms are covered: user-owned sticky refused,
+    // root-owned sticky (/tmp itself) exempt, plain writable refused.
+    if mode & 0o022 != 0 && !(mode & 0o1000 != 0 && meta.uid() == 0) {
+        return Err(Error::config(format!(
+            "archive dir {} is group/other-writable (mode {:03o}) — anyone with write \
+             access could swap the archive through a symlink; chmod go-w the directory \
+             or point db_path somewhere private",
+            dir.display(),
+            mode & 0o7777
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a symlink at the archive path itself, checked with lstat AFTER
+/// `create_0600_if_absent` and immediately before the SQLite open. This is
+/// the plant-before-create defense for shared sticky dirs (/tmp): anyone
+/// may create a symlink at a not-yet-existing path — no unlink needed, so
+/// the sticky bit does not help — and the open (deliberately NOFOLLOW-less,
+/// module docs) would follow it. Post-create ordering bounds the race: if
+/// WE created the file, a non-owner cannot replace it under sticky; if it
+/// pre-existed, whatever is there is what lstat sees.
+fn refuse_symlink_archive(path: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| Error::config(format!("cannot stat archive {}: {e}", path.display())))?;
+    if meta.file_type().is_symlink() {
+        return Err(Error::config(format!(
+            "archive path {} is a symlink — ghgraph does not follow one where the \
+             archive should be; remove it and resync",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse an archive file with group/other permission bits, re-checked AFTER
+/// the SQLite open so it covers whatever file the open actually landed on —
+/// this closes the vanishing-file race in open_rw (a file recreated by
+/// O_CREAT at umask default between our 0600 birth and the open) and, the
+/// common case, a pre-existing archive born looser than ghgraph ever creates
+/// (a chmod'd file, or one copied in from elsewhere). A refusal with the
+/// remedy, never a repair chmod: modes are set at creation by design, and a
+/// silent chmod here would paper over whoever loosened it. Path re-stat, not
+/// literally the fd (rusqlite does not expose it): a swap between open and
+/// stat requires writing the parent, which `refuse_writable_parent` already
+/// bounds. One known benign trigger: a Linux directory with a default POSIX
+/// ACL can surface ACL-mask bits in st_mode group bits at creation despite
+/// our 0600 request — the refusal and its remedy still apply (the archive
+/// really is group-accessible there), it is just the operator's ACL rather
+/// than a chmod that loosened it.
+fn refuse_loose_archive_mode(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| Error::config(format!("cannot stat archive {}: {e}", path.display())))?;
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(Error::config(format!(
+            "archive {} has group/other permission bits (mode {:03o}) — ghgraph creates \
+             it 0600; chmod 600 the file, or remove it and resync",
+            path.display(),
+            mode & 0o7777
+        )));
+    }
+    Ok(())
 }
 
 /// Birth the db file at 0600 if it does not exist. create_new is O_CREAT|O_EXCL:
@@ -307,21 +530,30 @@ fn user_version(conn: &Connection, path: &Path) -> Result<i64> {
 fn migrate(conn: &mut Connection, path: &Path) -> Result<()> {
     match user_version(conn, path)? {
         0 => apply_full(conn, path),
+        // v3 → v4 is purely additive (sync_runs, idx_observations_pr_field;
+        // no v3 object changes shape), so re-applying the idempotent schema
+        // batch creates exactly the missing objects and stamps v4 — the
+        // additive-migration arm of the policy at SCHEMA_VERSION. This arm
+        // is valid for v3 SPECIFICALLY, argued there; a future bump must
+        // justify its own arm, because IF NOT EXISTS silently skips an
+        // object whose DEFINITION changed.
+        3 => apply_full(conn, path),
         v if v == SCHEMA_VERSION => Ok(()),
-        // Everything else — an older pre-release stamp (refused with the
-        // remove-and-resync remedy; migrations begin at the first release,
-        // see SCHEMA_VERSION), a newer archive, or a negative/foreign
-        // sentinel (SQLite accepts any i64 user_version) — is refused,
-        // never guessed.
+        // Everything else — an older shape-changing stamp (refused with the
+        // remove-and-resync remedy; see the policy at SCHEMA_VERSION), a
+        // newer archive, or a negative/foreign sentinel (SQLite accepts any
+        // i64 user_version) — is refused, never guessed.
         v => Err(wrong_version(path, v)),
     }
 }
 
 /// The CONFIGURATION error for an archive whose `user_version` is not the
-/// current [`SCHEMA_VERSION`] and cannot be migrated to it. Shared by `open_ro`
-/// (any non-current version) and `migrate` (its refusal arms) so the two never
-/// drift. `migrate` handles v == 0 by applying the schema, so the v == 0 message
-/// here is reached only from `open_ro`.
+/// current [`SCHEMA_VERSION`] and which THIS PATH cannot bring there. Shared
+/// by `open_ro` (any non-current version — the read path never writes, so
+/// even migratable versions land here with the run-sync remedy) and
+/// `migrate` (its refusal arms) so the two never drift. `migrate` consumes
+/// v == 0 and v == 3 by applying the schema, so those messages are reached
+/// only from `open_ro`.
 fn wrong_version(path: &Path, v: i64) -> Error {
     // Mutation note: the < and > below have equivalent mutants (<= / >=):
     // their boundary values are unreachable — v == 0 is consumed by the arm
@@ -339,8 +571,13 @@ fn wrong_version(path: &Path, v: i64) -> Error {
         "a negative sentinel — the archive is corrupt or not a ghgraph archive".to_string()
     } else if v > SCHEMA_VERSION {
         format!("newer than this ghgraph (v{SCHEMA_VERSION}); upgrade ghgraph")
+    } else if v == 3 {
+        // Reached only from open_ro: the read path cannot write, but the
+        // write path migrates v3 additively (see `migrate`), so the remedy
+        // is one sync, not a rebuild.
+        "one additive version behind — run `ghgraph sync` once to migrate".to_string()
     } else {
-        // 0 < v < SCHEMA_VERSION: a pre-release schema. Not migrated,
+        // 0 < v < 3: a shape-changing pre-release schema. Not migrated,
         // by policy (SCHEMA_VERSION) — the archive is a disposable cache.
         format!(
             "a pre-release schema this ghgraph (v{SCHEMA_VERSION}) does not migrate — \
@@ -353,14 +590,15 @@ fn wrong_version(path: &Path, v: i64) -> Error {
     ))
 }
 
-/// Apply the full current schema and stamp user_version=[`SCHEMA_VERSION`]
-/// atomically (schema.sql always describes the CURRENT shape; migrations exist
-/// for archives born under older ones). The schema apply and the version bump
-/// run inside ONE rusqlite-managed transaction (schema.sql carries no
-/// BEGIN/COMMIT of its own; the only BEGINs there are trigger bodies), and
-/// PRAGMA user_version is transactional — so a crash between the last CREATE
-/// and the stamp rolls back to user_version=0 and the next open retries from
-/// clean.
+/// Apply the current schema and stamp user_version=[`SCHEMA_VERSION`]
+/// atomically. Serves two arms of `migrate`: a fresh archive (v0 — every
+/// statement creates) and an additively-migratable one (v3 — the idempotent
+/// IF NOT EXISTS batch creates exactly the missing objects and touches
+/// nothing else). The schema apply and the version bump run inside ONE
+/// rusqlite-managed transaction (schema.sql carries no BEGIN/COMMIT of its
+/// own; the only BEGINs there are trigger bodies), and PRAGMA user_version
+/// is transactional — so a crash between the last CREATE and the stamp
+/// rolls back to the pre-open version and the next open retries from clean.
 fn apply_full(conn: &mut Connection, path: &Path) -> Result<()> {
     let cannot = |e: rusqlite::Error| sqlite_err(path, "cannot initialize archive", e);
     let tx = conn.transaction().map_err(cannot)?;
@@ -470,10 +708,202 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(dir_mode, 0o700, "archive dir should be 0700");
-        // Note: this reads back the final bits under the ambient umask; since
-        // umask only clears bits, an unset .mode() call could still pass here
-        // under a benign umask. The explicit-mode guarantee is argued in the
-        // module docs; a umask-injecting harness is PLANNED (milestone 5).
+        // This reads back the final bits under the ambient umask; since umask
+        // only clears bits, an unset .mode() call could still pass here under
+        // a benign umask. umask_zero_still_births_0700_0600 below closes that
+        // hole by re-running the creation under `umask 0`.
+    }
+
+    /// The umask-injection harness: re-exec this test binary under
+    /// `sh -c 'umask 0'` and prove creation is STILL 0700/0600 — under a
+    /// zero umask an unset .mode() would leak 0755/0644, so this test dies
+    /// exactly when the explicit-mode call is dropped. Re-exec because umask
+    /// is process-global: setting it in-process would race sibling tests,
+    /// and std exposes no umask API anyway (the libc dep is off the floor).
+    #[test]
+    fn umask_zero_still_births_0700_0600() {
+        let s = Scratch::new();
+        std::fs::create_dir_all(&s.dir).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"umask 0; exec "$0" --exact db::tests::umask_child_open_rw --ignored"#)
+            .arg(&exe)
+            .env("GHGRAPH_TEST_UMASK_DIR", &s.dir)
+            .output()
+            .expect("re-exec test binary under umask 0");
+        assert!(
+            out.status.success(),
+            "umask-0 child failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Assert from the parent side too — the child ran under umask 0, so
+        // these bits can only be here because .mode() put them here.
+        let db = s.dir.join("sub/ghgraph.db");
+        let file_mode = std::fs::metadata(&db).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(file_mode, 0o600, "db must be 0600 even under umask 0");
+        let dir_mode = std::fs::metadata(db.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "archive dir must be 0700 even under umask 0"
+        );
+    }
+
+    /// Child half of umask_zero_still_births_0700_0600 — ignored so the
+    /// normal sweep never runs it directly; when it IS invoked without the
+    /// parent's env (e.g. `make check-heavy` runs everything ignored), it
+    /// has nothing to assert and exits clean.
+    #[test]
+    #[ignore = "child of umask_zero_still_births_0700_0600, spawned by it"]
+    fn umask_child_open_rw() {
+        let Some(dir) = std::env::var_os("GHGRAPH_TEST_UMASK_DIR") else {
+            return;
+        };
+        let path = PathBuf::from(dir).join("sub/ghgraph.db");
+        let _arc = open_rw(&path).unwrap();
+    }
+
+    #[test]
+    fn refuses_group_writable_parent_dir() {
+        let s = Scratch::new();
+        std::fs::create_dir_all(&s.dir).unwrap();
+        std::fs::set_permissions(&s.dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let err = open_rw(&s.join("ghgraph.db"))
+            .err()
+            .expect("a group-writable parent must be refused");
+        assert_eq!(err.code, crate::error::Code::Configuration);
+        assert!(
+            err.message.contains("chmod go-w"),
+            "message must carry the remedy, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn user_owned_sticky_writable_parent_is_refused() {
+        // Sticky alone is not the exemption: the directory's OWNER keeps
+        // unlink+rename, so a user-owned 1777 dir is still a swap venue
+        // for its owner. Only root-owned sticky (the real /tmp) is exempt.
+        let s = Scratch::new();
+        std::fs::create_dir_all(&s.dir).unwrap();
+        std::fs::set_permissions(&s.dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let err = open_rw(&s.join("ghgraph.db"))
+            .err()
+            .expect("a user-owned sticky writable dir must be refused");
+        assert_eq!(err.code, crate::error::Code::Configuration);
+    }
+
+    #[test]
+    fn root_owned_sticky_dir_is_allowed() {
+        // The exemption itself, exercised against the real thing: /tmp is
+        // root-owned 1777 on every supported platform. Skip (not fail) if
+        // some exotic host shapes /tmp differently — the exemption is then
+        // simply untested here, and the refusal tests above still hold.
+        use std::os::unix::fs::MetadataExt;
+        let tmp = Path::new("/tmp");
+        let meta = std::fs::metadata(tmp).unwrap();
+        if meta.uid() != 0 || meta.permissions().mode() & 0o1000 == 0 {
+            eprintln!("skipping: /tmp is not root-owned sticky on this host");
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "ghgraph-sticky-{}-{}.db",
+            std::process::id(),
+            line!()
+        ));
+        // temp_dir may not be /tmp (macOS): target /tmp explicitly.
+        let path = tmp.join(path.file_name().unwrap());
+        let _ = std::fs::remove_file(&path);
+        open_rw(&path).expect("root-owned sticky /tmp must open");
+        // SQLite removes -wal/-shm on the last close; the db file is ours
+        // to clean (open_rw takes no run lock — that is sync.rs's).
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn refuses_symlink_at_archive_path() {
+        // The plant-before-create vector: a symlink waiting at the archive
+        // path (create needs no unlink, so sticky dirs permit it) must be
+        // refused by the lstat check, never followed by the open.
+        let s = Scratch::new();
+        std::fs::create_dir_all(&s.dir).unwrap();
+        let target = s.join("elsewhere.db");
+        let path = s.join("ghgraph.db");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let err = open_rw(&path)
+            .err()
+            .expect("a symlink at the archive path must be refused");
+        assert_eq!(err.code, crate::error::Code::Configuration);
+        assert!(
+            err.message.contains("symlink"),
+            "message must name the finding, got: {}",
+            err.message
+        );
+        assert!(!target.exists(), "the symlink target must never be created");
+    }
+
+    #[test]
+    fn refuses_loose_archive_file_mode() {
+        // A pre-existing archive with group/other bits — chmod'd, or copied
+        // in — is refused with the remedy on the next writer open; the same
+        // check is what closes open_rw's vanishing-file race branch.
+        let s = Scratch::new();
+        let path = s.join("ghgraph.db");
+        {
+            let _a = open_rw(&path).unwrap();
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let err = open_rw(&path)
+            .err()
+            .expect("a group-readable archive must be refused");
+        assert_eq!(err.code, crate::error::Code::Configuration);
+        assert!(
+            err.message.contains("chmod 600"),
+            "message must carry the remedy, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn wal_truncates_at_writer_close() {
+        // The discriminating setup is the SECOND, idle connection held open
+        // across the writer's drop: with it, SQLite's own last-connection
+        // close checkpoint never runs (it needs exclusive access), so an
+        // empty -wal afterward can only be OUR Drop-side TRUNCATE — the
+        // very case the mechanism exists for (an MCP reader keeping the
+        // archive open between syncs). Without the reader, a no-op Drop
+        // passes this test by riding SQLite's close behavior.
+        let s = Scratch::new();
+        let path = s.join("ghgraph.db");
+        let reader = {
+            let arc = open_rw(&path).unwrap();
+            let reader = open_ro(&path).unwrap();
+            arc.conn()
+                .execute_batch(
+                    "CREATE TABLE _bulk(x); \
+                     INSERT INTO _bulk (x) \
+                       WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n LIMIT 500) \
+                       SELECT zeroblob(1024) FROM n",
+                )
+                .unwrap();
+            let wal = std::fs::metadata(path.with_extension("db-wal"))
+                .expect("-wal exists while the writer is open");
+            assert!(wal.len() > 0, "WAL must be non-empty before close");
+            reader
+        };
+        // The reader outlives the writer, so the -wal file must still
+        // exist — expect() rather than a defaulted 0, or a deleted file
+        // would pass as truncated.
+        let wal_len = std::fs::metadata(path.with_extension("db-wal"))
+            .expect("-wal persists while a reader holds the archive")
+            .len();
+        assert_eq!(wal_len, 0, "writer close must truncate the WAL");
+        drop(reader);
     }
 
     #[test]
@@ -606,6 +1036,80 @@ mod tests {
             .err()
             .expect("a version-0 foreign db must be refused");
         assert_eq!(err.code, crate::error::Code::Configuration);
+    }
+
+    /// A faithful v3 archive is the current schema minus exactly what v4
+    /// added (sync_runs, idx_observations_pr_field) under a v3 stamp —
+    /// that identity is what licenses building the fixture by subtraction.
+    fn make_v3_archive(path: &Path) {
+        {
+            let arc = open_rw(path).unwrap();
+            arc.conn()
+                .execute_batch(
+                    "INSERT INTO prs (id, repo, number, title, state, created_at, \
+                                      updated_at, url) \
+                     VALUES ('PR_m', 'o/n', 1, 'kept', 'OPEN', \
+                             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'u'); \
+                     DROP TABLE sync_runs; \
+                     DROP INDEX idx_observations_pr_field",
+                )
+                .unwrap();
+        }
+        set_raw_user_version(path, 3);
+    }
+
+    #[test]
+    fn migrates_v3_archive_additively() {
+        // The write path brings a v3 archive to v4 by re-applying the
+        // idempotent schema: the two missing objects appear, the stamp
+        // moves, and existing data (and its FTS index — the triggers must
+        // not re-fire) survives untouched.
+        let s = Scratch::new();
+        let path = s.join("ghgraph.db");
+        make_v3_archive(&path);
+        let arc = open_rw(&path).expect("v3 must migrate on the write path");
+        assert_eq!(user_version(arc.conn(), &path).unwrap(), SCHEMA_VERSION);
+        for (kind, name) in [
+            ("table", "sync_runs"),
+            ("index", "idx_observations_pr_field"),
+        ] {
+            let n: i64 = arc
+                .conn()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type=?1 AND name=?2",
+                    (kind, name),
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{kind} {name} must exist after migration");
+        }
+        let (title, fts_hits): (String, i64) = arc
+            .conn()
+            .query_row(
+                "SELECT title, (SELECT count(*) FROM prs_fts WHERE prs_fts MATCH 'kept') \
+                 FROM prs WHERE repo='o/n' AND number=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "kept", "data must survive migration");
+        assert_eq!(fts_hits, 1, "the FTS index must survive migration intact");
+    }
+
+    #[test]
+    fn ro_tells_v3_to_sync_not_rebuild() {
+        // The read path cannot migrate; its remedy for v3 is one sync, and
+        // saying "remove and resync" here would cost an operator hours.
+        let s = Scratch::new();
+        let path = s.join("ghgraph.db");
+        make_v3_archive(&path);
+        let err = open_ro(&path).err().expect("open_ro must refuse v3");
+        assert_eq!(err.code, crate::error::Code::Configuration);
+        assert!(
+            err.message.contains("run `ghgraph sync`") && !err.message.contains("remove"),
+            "v3's read-path remedy is a sync, not a rebuild, got: {}",
+            err.message
+        );
     }
 
     #[test]

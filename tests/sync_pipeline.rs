@@ -254,7 +254,10 @@ impl Fake {
     /// FTS index blobs, with the wall-clock columns masked (verified_at,
     /// observed_at, synced_at, next_retry_at, deleted_at) — the enumerated
     /// nondeterminism, nothing else. sync_state is dumped separately by the
-    /// tests that assert on it.
+    /// tests that assert on it. sync_runs is EXCLUDED on purpose: it gains
+    /// one row per run BY DESIGN, so it can never sit inside a "replay
+    /// writes nothing" comparison — the replay test asserts its delta
+    /// columns are zero instead.
     fn dump(&self) -> String {
         let conn = self.db();
         let mut out = String::new();
@@ -756,6 +759,36 @@ fn replay_of_unchanged_remote_writes_nothing() {
     let starved: i64 = fake
         .query_one("SELECT runs_since_advance FROM sync_state WHERE repo='o/n' AND stream='pr'");
     assert_eq!(starved, 0, "a completed stream is not starved");
+
+    // sync_runs: one flat row per completed run, and the second row IS the
+    // replay-idempotence detector at rest — an unchanged remote with any
+    // nonzero delta column here is the regression the table exists to catch.
+    let runs: i64 = fake.query_one("SELECT count(*) FROM sync_runs");
+    assert_eq!(runs, 2, "one sync_runs row per completed run");
+    let (upserted, unchanged, observations, errors, intercept): (i64, i64, i64, i64, Option<i64>) =
+        fake.db()
+            .query_row(
+                "SELECT upserted, unchanged, observations, errors, overhead_intercept_ms \
+             FROM sync_runs ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+    assert_eq!(
+        (upserted, unchanged, observations, errors),
+        (0, 2, 0, 0),
+        "the replay run's sync_runs row shows zero deltas"
+    );
+    // The intercept VALUE is wall-clock and unassertable, but its
+    // PRESENCE is structural: the run made three data-bearing calls
+    // whose response sizes differ (discovery page vs hydration docs),
+    // so a regression exists and the column must be non-NULL — a
+    // sample-collection regression (e.g. sampling only killed calls)
+    // yields zero samples and NULL here.
+    assert!(
+        intercept.is_some(),
+        "three differing-size fixture calls must yield an intercept"
+    );
 }
 
 // ---------------------------------------------------------------------------

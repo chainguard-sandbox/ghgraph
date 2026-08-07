@@ -13,7 +13,7 @@ work you want tracked alongside your own.
 Status: working. Both scopes sync and read end-to-end; the output contract
 is frozen at `schema_version: 1` (additive-only). [DESIGN.md](DESIGN.md)
 has the architecture; [ROADMAP.md](ROADMAP.md) sequences what remains
-(hardening, MCP).
+(MCP).
 
 Requires the [gh](https://cli.github.com) CLI — ghgraph carries no HTTP, TLS,
 or auth code by design (gh itself runs on Linux, macOS, and Windows). ghgraph

@@ -1228,6 +1228,184 @@ fn golden_stats() {
     golden_verb(&s, "stats.json", &["stats"]);
 }
 
+/// The audits' negative half: the golden proves an intact archive reads
+/// all-zeros; this corrupts one archive seven distinct ways — each a state
+/// the write path is supposed to make unrepresentable — and asserts every
+/// audit counts exactly its own violation. Corruption goes through a raw
+/// rusqlite connection: the point is to forge states ghgraph itself cannot
+/// write.
+#[test]
+fn audits_fire_on_a_corrupted_archive() {
+    let s = Scratch::new();
+    seed(&s);
+    standard_config(&s);
+    {
+        let conn = rusqlite::Connection::open(s.db_path()).unwrap();
+        // An orphaned comment: parent pk 9999 resolves nowhere. The insert
+        // trigger indexes it in FTS (consistently — this row must trip the
+        // orphan audit and ONLY the orphan audit).
+        conn.execute(
+            "INSERT INTO comments (pk, id, parent_kind, parent, body, created_at) \
+             VALUES (9001, 'C_orphan', 'pr', 9999, 'orphan body', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // An orphaned observation.
+        conn.execute(
+            "INSERT INTO observations (pr, observed_at, field, old, new) \
+             VALUES (9999, '2026-01-01T00:00:00Z', 'state', 'OPEN', 'CLOSED')",
+            [],
+        )
+        .unwrap();
+        // A chain break on a real PR: the second row's old ('MERGED') is
+        // not the first row's new ('CLOSED') — an observation against a
+        // value the archive never held.
+        conn.execute(
+            "INSERT INTO observations (pr, observed_at, field, old, new) \
+             VALUES (1, '2026-01-06T00:00:00Z', 'state', 'OPEN', 'CLOSED')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO observations (pr, observed_at, field, old, new) \
+             VALUES (1, '2026-01-07T00:00:00Z', 'state', 'MERGED', 'OPEN')",
+            [],
+        )
+        .unwrap();
+        // A break AFTER a NULL-new predecessor (review_decision reverting
+        // to null is a legitimate observation): LAG(new) is NULL here just
+        // like a first row's, so a prev-IS-NOT-NULL formulation would
+        // silently exempt this one — the ROW_NUMBER exemption must not.
+        conn.execute(
+            "INSERT INTO observations (pr, observed_at, field, old, new) \
+             VALUES (2, '2026-01-06T00:00:00Z', 'review_decision', 'APPROVED', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO observations (pr, observed_at, field, old, new) \
+             VALUES (2, '2026-01-07T00:00:00Z', 'review_decision', 'CHANGES_REQUESTED', NULL)",
+            [],
+        )
+        .unwrap();
+        // FTS 'missing': remove PR #1's index entry through fts5's special
+        // delete command, leaving the content row in place — the desync the
+        // triggers exist to prevent, forged directly.
+        conn.execute(
+            "INSERT INTO prs_fts(prs_fts, rowid, title, body) \
+             SELECT 'delete', pk, title, body FROM prs WHERE pk = 1",
+            [],
+        )
+        .unwrap();
+        // FTS 'index_orphans': an index entry whose rowid has no content
+        // row (the VACUUM-renumber signature).
+        conn.execute(
+            "INSERT INTO prs_fts(rowid, title, body) VALUES (8888, 'ghost', 'ghost body')",
+            [],
+        )
+        .unwrap();
+        // An unlicensed quarantine row: no sync_state row for its
+        // (repo, stream) means no watermark whose advance it licensed.
+        conn.execute(
+            "INSERT INTO quarantine (id, repo, stream, attempts, next_retry_at, error_class) \
+             VALUES ('Q_x', 'octo/nowhere', 'pr', 1, '2026-01-01T00:00:00Z', 'transient')",
+            [],
+        )
+        .unwrap();
+        // A watermark our own RFC 3339 parser refuses.
+        conn.execute(
+            "INSERT INTO sync_state (repo, stream, last_item_updated_at, fingerprint) \
+             VALUES ('octo/bad', 'pr', 'not-a-timestamp', '{}')",
+            [],
+        )
+        .unwrap();
+        // The remaining orphan counters, one forgery each: a ref, a review
+        // request, and a review thread whose parent pk resolves nowhere.
+        conn.execute(
+            "INSERT INTO refs (src_pr, kind, source, target_repo, target_number) \
+             VALUES (9999, 'mentions', 'body', 'octo/alpha', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO review_requests (pr, reviewer, kind) VALUES (9999, 'ghost', 'user')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO review_threads (id, pr) VALUES ('RT_orphan', 9999)",
+            [],
+        )
+        .unwrap();
+        // The comments and issues FTS pairs, same two desyncs as prs: a
+        // deindexed content row (pick deterministically among rows the
+        // ASCII gate covers) and a ghost index entry.
+        conn.execute(
+            "INSERT INTO comments_fts(comments_fts, rowid, body) \
+             SELECT 'delete', pk, body FROM comments \
+             WHERE body GLOB '*[a-zA-Z0-9]*' ORDER BY pk LIMIT 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO comments_fts(rowid, body) VALUES (8887, 'ghost comment body')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issues_fts(issues_fts, rowid, title, body) \
+             SELECT 'delete', pk, title, body FROM issues \
+             WHERE title GLOB '*[a-zA-Z0-9]*' OR body GLOB '*[a-zA-Z0-9]*' \
+             ORDER BY pk LIMIT 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issues_fts(rowid, title, body) VALUES (8886, 'ghost issue', 'x')",
+            [],
+        )
+        .unwrap();
+    }
+    let doc = s.run_ok(&["stats"]);
+    let a = &doc["stats"]["audits"];
+    // Every counter, exactly its own forgery's count — attribution is the
+    // point: a matrix where each corruption moves one number proves the
+    // audits distinguish, not merely detect.
+    assert_eq!(a["orphans"]["comments"], 1, "comment orphan: {a}");
+    assert_eq!(a["orphans"]["observations"], 1, "observation orphan: {a}");
+    assert_eq!(a["orphans"]["refs"], 1, "ref orphan: {a}");
+    assert_eq!(
+        a["orphans"]["review_requests"], 1,
+        "review-request orphan: {a}"
+    );
+    assert_eq!(
+        a["orphans"]["review_threads"], 1,
+        "review-thread orphan: {a}"
+    );
+    assert_eq!(
+        a["observation_chain_breaks"], 2,
+        "one plain break, one behind a NULL-new predecessor: {a}"
+    );
+    for kind in ["prs", "comments", "issues"] {
+        assert_eq!(
+            a["fts"][kind]["missing"], 1,
+            "{kind}: deindexed content row: {a}"
+        );
+        assert_eq!(
+            a["fts"][kind]["index_orphans"], 1,
+            "{kind}: ghost index entry: {a}"
+        );
+    }
+    assert_eq!(
+        a["watermark"]["quarantine_unlicensed"], 1,
+        "unlicensed quarantine: {a}"
+    );
+    assert_eq!(
+        a["watermark"]["malformed_watermarks"], 1,
+        "unparseable watermark: {a}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Meta behaviors the fixed-past seed cannot golden
 

@@ -9,9 +9,9 @@ project. Between them, working-scope repos can track named **people**:
 collaborators or contributors the operator opts in, whose involvement is
 archived alongside the operator's own without widening to the whole repo.
 
-Status: working, built through milestone 4 (project scope); the output
+Status: working, built through milestone 5 (hardening); the output
 contract is frozen at `schema_version: 1`. ROADMAP.md sequences what
-remains (hardening, MCP).
+remains (MCP).
 Mechanism and its rationale live as module comments where the code is
 (src/sync.rs, src/schema.sql, src/gh.rs, src/queries.rs); this document
 carries the architecture and the arguments between modules, deliberately
