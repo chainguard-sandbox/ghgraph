@@ -835,6 +835,19 @@ fn seed(s: &Scratch) {
 /// silently added here.
 fn mask(doc: &mut Value) {
     if let Some(meta) = doc.get_mut("_meta") {
+        // Assert-then-mask: index-assignment INSERTS a missing key (and the
+        // BTreeMap sorts it into place), so masking blind would let a
+        // regression that DROPS generated_at — or emits it as a non-string —
+        // pass every golden. Presence and shape are the contract; only the
+        // value is nondeterministic.
+        let stamp = meta
+            .get("generated_at")
+            .and_then(Value::as_str)
+            .expect("_meta.generated_at present and a string");
+        assert!(
+            stamp.len() == 20 && stamp.ends_with('Z'),
+            "generated_at is RFC 3339 UTC: {stamp:?}"
+        );
         meta["generated_at"] = json!("<TIME>");
         if let Some(archive) = meta.get_mut("archive").and_then(Value::as_array_mut) {
             for entry in archive {
@@ -1068,6 +1081,55 @@ fn attention_probes_polarity_edges() {
             [],
         )
         .unwrap();
+        // #14/#15 — the LATEST-flip pin, as a pair. Both are the viewer's
+        // approvable PRs with TWO head_sha observations; only the approval
+        // time differs. #14's approval sits BETWEEN the pushes: proven
+        // against the newest flip it is stale, so ready_to_merge is out —
+        // but proven against the OLDEST (the row an unordered or reversed
+        // read would surface) it looks fresh, which is exactly the
+        // stale-approval-qualifies inversion the bucket rule forbids. #15's
+        // approval follows both pushes: fresh, ready — the control proving
+        // #14 fails on staleness, not on a missing column. Every fixture
+        // elsewhere carries exactly one flip, so this pair is the only
+        // witness that "latest" means latest.
+        for (pk, approved_at) in [(14, "2026-01-04T00:00:00Z"), (15, "2026-01-06T00:00:00Z")] {
+            c.execute(
+                &format!(
+                    "INSERT INTO prs (pk, id, repo, number, title, state, is_draft, author, \
+                                      review_decision, created_at, updated_at, url, \
+                                      verified_at, head_committed_at, head_sha) \
+                     VALUES ({pk}, 'PR_a{pk}', 'octo/alpha', {pk}, 'Probe flip order', \
+                             'OPEN', 0, 'me', 'APPROVED', '2026-01-02T00:00:00Z', \
+                             '2026-01-06T00:00:00Z', 'u{pk}', '2026-01-06T00:00:00Z', \
+                             '2026-01-02T12:00:00Z', 'f{pk}')"
+                ),
+                [],
+            )
+            .unwrap();
+            for (at, old_sha, new_sha) in [
+                ("2026-01-03T00:00:00Z", "e", "m"),
+                ("2026-01-05T00:00:00Z", "m", "f"),
+            ] {
+                c.execute(
+                    &format!(
+                        "INSERT INTO observations (pr, observed_at, field, old, new) \
+                         VALUES ({pk}, '{at}', 'head_sha', '{old_sha}{pk}', '{new_sha}{pk}')"
+                    ),
+                    [],
+                )
+                .unwrap();
+            }
+            c.execute(
+                &format!(
+                    "INSERT INTO comments (id, parent_kind, parent, kind, state, author, \
+                                           author_assoc, body, created_at) \
+                     VALUES ('RV_a{pk}', 'pr', {pk}, 'review', 'APPROVED', 'bob', \
+                             'MEMBER', '', '{approved_at}')"
+                ),
+                [],
+            )
+            .unwrap();
+        }
     }
     attention_config(&s, &[]);
     let doc = s.run_ok(&["attention"]);
@@ -1080,6 +1142,18 @@ fn attention_probes_polarity_edges() {
             .map(|p| p["number"].as_i64().unwrap())
             .collect()
     };
+    assert!(
+        !numbers("ready_to_merge").contains(&14),
+        "an approval BETWEEN two pushes is proven against the LATEST flip \
+         and reads stale — never ready_to_merge (the freshness bound is the \
+         newest head_sha observation, not whichever row an unordered read \
+         returns first)"
+    );
+    assert!(
+        numbers("ready_to_merge").contains(&15),
+        "the positive control: an approval after BOTH pushes is fresh, so \
+         #14's absence above is the stale approval, not a missing column"
+    );
     assert!(
         numbers("they_replied").contains(&11),
         "a verdict-less review row is a reply — only a PROVEN approval is excluded"
@@ -1098,6 +1172,31 @@ fn attention_probes_polarity_edges() {
             !numbers(name).contains(&13),
             "a merged PR is outside the working set (recorded narrowing): {name}"
         );
+    }
+}
+
+/// --help and --version are the two licensed non-JSON stdout carve-outs
+/// (main.rs intercepts clap's DisplayHelp/DisplayVersion): exit 0, usage
+/// text, never an error envelope. Deleting that match arm regresses both
+/// to USER_INPUT envelopes at exit 2 — the one real gap a whole-crate
+/// mutation sweep found in the previously unscoped files.
+#[test]
+fn help_and_version_are_exit_zero_carve_outs() {
+    for flag in ["--help", "--version"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_ghgraph"))
+            .arg(flag)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{flag} exits 0");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !text.trim_start().starts_with('{'),
+            "{flag} is prose, not a JSON envelope: {text:.60}"
+        );
+        assert!(!text.trim().is_empty(), "{flag} says something");
     }
 }
 
@@ -1250,6 +1349,17 @@ fn audits_fire_on_a_corrupted_archive() {
             [],
         )
         .unwrap();
+        // A comment whose parent_kind is outside the enum: the orphan
+        // audit's third disjunct (its comment advertises it; this row is
+        // its witness). No trigger conflict: comments_ai indexes it, and
+        // the FTS pair stays consistent.
+        conn.execute(
+            "INSERT INTO comments (pk, id, parent_kind, parent, body, created_at) \
+             VALUES (9002, 'C_weird', 'discussion', 1, 'weird parent kind', \
+                     '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
         // An orphaned observation.
         conn.execute(
             "INSERT INTO observations (pr, observed_at, field, old, new) \
@@ -1371,7 +1481,10 @@ fn audits_fire_on_a_corrupted_archive() {
     // Every counter, exactly its own forgery's count — attribution is the
     // point: a matrix where each corruption moves one number proves the
     // audits distinguish, not merely detect.
-    assert_eq!(a["orphans"]["comments"], 1, "comment orphan: {a}");
+    assert_eq!(
+        a["orphans"]["comments"], 2,
+        "one dangling parent, one out-of-enum parent_kind: {a}"
+    );
     assert_eq!(a["orphans"]["observations"], 1, "observation orphan: {a}");
     assert_eq!(a["orphans"]["refs"], 1, "ref orphan: {a}");
     assert_eq!(

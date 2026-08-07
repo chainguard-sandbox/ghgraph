@@ -318,13 +318,17 @@ pub fn open_ro_audit(path: &Path) -> Result<RoAuditArchive> {
             )));
         }
     }
-    // Mutation notes, shared with open_ro's identical lines: the flag `|`
-    // has an equivalent `^` mutant (the two flags are disjoint bit sets, so
-    // OR and XOR coincide); the hook's `== "1"` has an equivalent `!=`
-    // mutant under the test suite, because for contract-correct queries the
-    // reversal pragma is observably a no-op either way — the hook exists to
-    // catch INCORRECT queries, and a test that could see the flip would
-    // have to ship one. Documented per the triage rule, not chased.
+    // Mutation note, shared with open_ro's identical line: the flag `|`
+    // has an equivalent `^` mutant — an arithmetic identity while the two
+    // flag constants stay disjoint bit sets, which is its precondition.
+    // (An earlier note also claimed the reverse-selects hook's `== "1"`
+    // was equivalent under the suite; that claim ROTTED — the pragma is
+    // introspectable through `query`, and both `!=` mutants are now
+    // caught, by harness_reverse_selects_pragma_is_live on this path and
+    // by the replay/metadata FTS tests on open_ro_audit's. Kept as the
+    // recorded example that equivalence notes expire in the
+    // secretly-killable direction too; `make mutants-equiv` re-tests the
+    // ones that remain.)
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)
         .map_err(|e| sqlite_err(path, "cannot open archive", e))?;
@@ -378,6 +382,20 @@ fn ensure_dir_0700(dir: &Path) -> Result<()> {
 /// inside it. RW-side only: the reader creates nothing and inherits a
 /// directory the writer already vetted; refusing reads of an archive that
 /// synced fine yesterday would punish the reader for the writer's problem.
+/// The sticky swap-exemption, narrowed to ROOT-owned dirs (the actual /tmp
+/// shape): sticky denies NON-owners the unlink+rename a swap needs, but the
+/// directory's owner keeps both — so a user-owned 1777 dir is still a swap
+/// venue for its owner and is refused (its owner can chmod go-w; the remedy
+/// applies). The plant-before-create residue a sticky dir still permits
+/// (anyone may CREATE a symlink at a path that does not exist yet) is
+/// closed by refuse_symlink_archive, not here. A pure function of
+/// (mode, owner) so every quadrant is unit-testable — the filesystem
+/// fixture for "root-owned writable non-sticky" cannot be built
+/// unprivileged, but the judgment can be pinned without it.
+fn sticky_swap_exempt(mode: u32, owner_uid: u32) -> bool {
+    mode & 0o1000 != 0 && owner_uid == 0
+}
+
 fn refuse_writable_parent(dir: &Path) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     // A bare-filename db_path ("ghgraph.db") has parent Some("") — that is
@@ -391,20 +409,7 @@ fn refuse_writable_parent(dir: &Path) -> Result<()> {
     let meta = std::fs::metadata(dir)
         .map_err(|e| Error::config(format!("cannot access archive dir {}: {e}", dir.display())))?;
     let mode = meta.permissions().mode();
-    // The sticky exemption is narrowed to ROOT-owned dirs (the actual /tmp
-    // shape): sticky denies non-owners the unlink+rename a swap needs, but
-    // the directory's OWNER keeps both — so a user-owned 1777 dir is still
-    // a swap venue for its owner and is refused (its owner can chmod go-w;
-    // the remedy applies). The plant-before-create residue a sticky dir
-    // still permits (anyone may CREATE a symlink at a path that does not
-    // exist yet) is closed by refuse_symlink_archive, not here.
-    //
-    // Mutation note: the sticky-mask operators (& 0o1000) have surviving
-    // mutants (|, ^) whose only discriminating fixture is a ROOT-owned
-    // writable NON-sticky directory — unprivileged tests cannot create
-    // one. The testable arms are covered: user-owned sticky refused,
-    // root-owned sticky (/tmp itself) exempt, plain writable refused.
-    if mode & 0o022 != 0 && !(mode & 0o1000 != 0 && meta.uid() == 0) {
+    if mode & 0o022 != 0 && !sticky_swap_exempt(mode, meta.uid()) {
         return Err(Error::config(format!(
             "archive dir {} is group/other-writable (mode {:03o}) — anyone with write \
              access could swap the archive through a symlink; chmod go-w the directory \
@@ -555,6 +560,14 @@ fn migrate(conn: &mut Connection, path: &Path) -> Result<()> {
 /// v == 0 and v == 3 by applying the schema, so those messages are reached
 /// only from `open_ro`.
 fn wrong_version(path: &Path, v: i64) -> Error {
+    // The `>` arm's `>=` mutant is equivalent only while every caller
+    // consumes v == SCHEMA_VERSION before calling here; this assert is
+    // that precondition as a mechanism, so a future third caller that
+    // forgets the guard dies in tests instead of minting a lying message.
+    debug_assert_ne!(
+        v, SCHEMA_VERSION,
+        "wrong_version called on the current version"
+    );
     // Mutation note: the < and > below have equivalent mutants (<= / >=):
     // their boundary values are unreachable — v == 0 is consumed by the arm
     // above, and v == SCHEMA_VERSION never reaches this function (open_ro
@@ -766,6 +779,24 @@ mod tests {
         };
         let path = PathBuf::from(dir).join("sub/ghgraph.db");
         let _arc = open_rw(&path).unwrap();
+    }
+
+    #[test]
+    fn sticky_swap_exemption_quadrants() {
+        // The pure predicate over all four (sticky, root-owned) quadrants —
+        // including root-owned NON-sticky, whose filesystem fixture no
+        // unprivileged test can create. Only root-owned AND sticky is
+        // exempt; each single condition alone is not.
+        assert!(sticky_swap_exempt(0o1777, 0), "/tmp: root-owned sticky");
+        assert!(
+            !sticky_swap_exempt(0o1777, 501),
+            "user-owned sticky: the owner keeps unlink+rename"
+        );
+        assert!(
+            !sticky_swap_exempt(0o0777, 0),
+            "root-owned but non-sticky: any writer can swap"
+        );
+        assert!(!sticky_swap_exempt(0o0777, 501), "plain writable dir");
     }
 
     #[test]

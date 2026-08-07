@@ -368,10 +368,12 @@ fn graphql_once(
     })?;
     let call_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     tel.subprocess_count += 1;
-    // Mutation note: the subprocess_ms accumulation has surviving
-    // arithmetic mutants (+= → *=) by design — wall-clock values are the
-    // contract's enumerated nondeterminism, masked in every deterministic
-    // test, so no test may assert them without asserting noise.
+    // Wall-clock values are the contract's enumerated nondeterminism —
+    // no test may PIN them — but a lower bound is contract-safe:
+    // Instant::elapsed can never undershoot a child's sleep, and the
+    // subprocess_ms_accumulates test asserts exactly that bound (killing
+    // the *=-from-zero mutant deliberately; the -= sibling already dies
+    // by debug underflow, now on purpose rather than by luck).
     tel.subprocess_ms += call_ms;
     tel.bytes_parsed += out.stdout.len() as u64;
     if out.killed {
@@ -960,6 +962,24 @@ mod tests {
         assert_eq!(
             node.author.expect("ghost, not null").login.as_str(),
             "ghost"
+        );
+    }
+
+    // Timing telemetry carries no pinnable value (enumerated
+    // nondeterminism), but its ACCUMULATION direction is a contract: a
+    // child that provably slept 50ms must leave at least 50ms behind —
+    // Instant::elapsed cannot undershoot the sleep — so a broken
+    // accumulator (stuck at zero, or subtracting) fails here without any
+    // test asserting noise.
+    #[test]
+    fn subprocess_ms_accumulates_a_wall_clock_lower_bound() {
+        let fake = FakeGh::new("sleep 0.05\ncat > /dev/null\nprintf '%s' '{\"data\":{}}'");
+        let mut ctx = GhCtx::single();
+        graphql_ctx(&fake.bin(), deadline(), "q", &[], &mut ctx).unwrap();
+        assert!(
+            ctx.tel.subprocess_ms >= 50,
+            "a 50ms child sleep must accumulate >= 50ms, got {}",
+            ctx.tel.subprocess_ms
         );
     }
 

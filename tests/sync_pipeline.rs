@@ -858,6 +858,66 @@ fn metadata_only_flip_updates_rows_but_never_fts() {
     );
 }
 
+// 2b. The WHEN guards' OTHER arm: a content edit MUST reindex. The
+// metadata test above pins "quiet stays quiet"; this pins "an edit moves
+// the index" — dropping a trigger (or one disjunct of its guard) makes
+// search serve stale tokens forever, and the stats audits are structurally
+// blind to it (the rowid stays indexed; only its tokens rot).
+#[test]
+fn body_edits_reindex_fts_both_tables() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    a.body = "original searchable prose".into();
+    install_prs(&fake, &[&a]);
+    fake.sync_ok();
+    let hits = |q: &str| -> i64 {
+        fake.query_one(&format!(
+            "SELECT count(*) FROM prs_fts WHERE prs_fts MATCH '{q}'"
+        ))
+    };
+    let chits = |q: &str| -> i64 {
+        fake.query_one(&format!(
+            "SELECT count(*) FROM comments_fts WHERE comments_fts MATCH '{q}'"
+        ))
+    };
+    assert_eq!(hits("searchable"), 1);
+    assert_eq!(chits("rewritten"), 0);
+
+    // Run 2: the PR body changes (title byte-identical — the body disjunct
+    // alone must fire the guard), and the comment body is quiet-edited in
+    // the hydration document.
+    a.body = "amended prose entirely".into();
+    a.updated_at = "2026-07-20T12:00:00Z";
+    install_prs(&fake, &[&a]);
+    // PR_1 carries a witnessed baseline, so run 2 walks the REFRESH form.
+    // A real comment edit announces itself via lastEditedAt (schema.sql:
+    // comments.updated_at "keeps the FTS copy honest"); without the bump
+    // the refresh rightly resolves the body from the archive.
+    let mut refresh: Value = serde_json::from_str(&a.refresh()).unwrap();
+    refresh["data"]["node"]["comments"]["nodes"][0]["body"] = json!("rewritten comment text");
+    refresh["data"]["node"]["comments"]["nodes"][0]["lastEditedAt"] = json!("2026-07-20T11:30:00Z");
+    fake.write("refresh-PR_1.json", &refresh.to_string());
+    fake.sync_ok();
+
+    assert_eq!(hits("amended"), 1, "the edited PR body must be searchable");
+    assert_eq!(
+        hits("searchable"),
+        0,
+        "the OLD tokens must be gone — delete-then-insert, not append"
+    );
+    assert_eq!(
+        chits("rewritten"),
+        1,
+        "the edited comment body must be searchable"
+    );
+    let stored: String = fake.query_one("SELECT body FROM comments WHERE id='C_PR_1'");
+    assert_eq!(
+        stored, "rewritten comment text",
+        "the row moved with the index"
+    );
+}
+
 // A comment deleted upstream sweeps (soft) under the completeness witness.
 #[test]
 fn upstream_comment_deletion_sweeps_softly() {
@@ -2725,6 +2785,17 @@ fn failed_run_increments_only_the_configured_streams() {
         .query_one("SELECT runs_since_advance FROM sync_state WHERE repo='o/n' AND stream='issue'");
     assert_eq!(pr_runs, 1, "the walked stream failed to complete");
     assert_eq!(issue_runs, 0, "the unconfigured stream is not starving");
+
+    // Recovery: a run that COMPLETES the stream must reset the counter —
+    // the ON CONFLICT arm writing runs_since_advance = 0 is what
+    // starved-first scheduling and the stats starvation line read; without
+    // this pin, dropping that arm reads a recovered stream as starving
+    // forever.
+    fake.write("disc-3-0.json", &discovery_nodes(vec![], None, 4000));
+    fake.sync_ok();
+    let pr_runs: i64 = fake
+        .query_one("SELECT runs_since_advance FROM sync_state WHERE repo='o/n' AND stream='pr'");
+    assert_eq!(pr_runs, 0, "a completed stream is no longer starved");
 }
 
 // 17m. Issue re-verify: the tier's complete refetch catches quiet
