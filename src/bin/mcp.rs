@@ -40,6 +40,14 @@
 //! caring drops the session, stdin EOFs, and in-flight children finish
 //! against an archive whose writers are crash-safe anyway.
 //!
+//! Accepted trades for a LOCAL, single-client transport, recorded: per-call
+//! concurrency is uncapped (N pipelined calls = N threads and N children —
+//! the client end of a stdio pipe is one process pacing itself), stdin
+//! lines buffer unbounded (the client is the operator's own agent, not a
+//! network peer), and EOF shutdown waits on in-flight children without a
+//! deadline (a hung child would be ghgraph's own bug; killing it here
+//! would trade a visible hang for a hidden one).
+//!
 //! Untrusted input is data, here too: tool arguments become argv VALUES,
 //! never argv grammar — flag-shaped values cannot become flags because
 //! every option is passed as one `--flag=value` token and positionals sit
@@ -119,7 +127,26 @@ fn serve(server: Server) {
 
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
+        let line = match line {
+            Ok(line) => line,
+            // Non-UTF8 on the wire is a broken frame, not a shutdown:
+            // lines() has already consumed through the newline, so the
+            // session continues at the next frame — silently treating
+            // this as EOF would drop everything after one flipped byte.
+            // A genuine read error (the pipe itself failing) ends the
+            // session like EOF does. Mutation note: widening this guard to
+            // all errors survives the suite — the discriminating input is
+            // a non-InvalidData stdin failure (EIO) no portable harness
+            // constructs; held by review, the main.rs BrokenPipe precedent.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                respond(
+                    &stdout,
+                    &rpc_error(Value::Null, -32700, "parse error: frame is not UTF-8"),
+                );
+                continue;
+            }
+            Err(_) => break,
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -156,10 +183,16 @@ fn serve(server: Server) {
             // notifications/cancelled deliberately so (module docs).
             (_, None) => {}
             ("initialize", Some(id)) => {
+                // Echo the requested revision only when it does not
+                // POSTDATE this code (date-form versions compare
+                // lexicographically): claiming support for a future
+                // revision would be a promise nobody checked. Older
+                // published revisions are fine — everything this server
+                // uses is stable across them (PROTOCOL_VERSION docs).
                 let requested = msg
                     .pointer("/params/protocolVersion")
                     .and_then(Value::as_str)
-                    .filter(|v| v.starts_with("20"))
+                    .filter(|v| v.starts_with("20") && *v <= PROTOCOL_VERSION)
                     .unwrap_or(PROTOCOL_VERSION);
                 respond(
                     &stdout,
@@ -253,11 +286,12 @@ fn tools_table() -> &'static [Tool] {
         Tool {
             name: "attention",
             description: "What needs the operator's attention, derived from archive \
-                          state: PRs waiting on you, yours awaiting review, tracked \
-                          people's PRs, ready-to-merge — plus maintainer buckets \
-                          (needs_reviewer, untriaged issues) for project-scope repos. \
-                          Uncertainty only escalates: it can add to waiting_on_me, \
-                          never qualify ready_to_merge.",
+                          state. Buckets: waiting_on_me, they_replied (activity by \
+                          another party since your last, on PRs you participate \
+                          in), ready_to_merge, people_prs (tracked people's open \
+                          PRs) — plus needs_reviewer and untriaged issues for \
+                          project-scope repos. Uncertainty only escalates: it can \
+                          add to waiting_on_me, never qualify ready_to_merge.",
             schema: || {
                 obj_schema(
                     json!({
@@ -295,8 +329,20 @@ fn tools_table() -> &'static [Tool] {
             argv: |args| {
                 let mut v = vec![];
                 push_uint(&mut v, args, "max_body_bytes")?;
+                let reference = req_string(args, "reference")?;
+                // The description's "bare numbers do not exist here" is
+                // this refusal, not a hope: the CLI resolves a bare number
+                // through --repo and then the CWD GIT REMOTE — and the
+                // wrapper's cwd is wherever the MCP client launched it, an
+                // input no tool argument controls. Qualified forms only.
+                if !reference.contains('#') && !reference.contains("://") {
+                    return Err("reference: pass the qualified form — owner/name#123 or a \
+                         GitHub PR URL (bare numbers would resolve against the \
+                         server's launch directory)"
+                        .into());
+                }
                 v.push("--".into());
-                v.push(req_string(args, "reference")?);
+                v.push(reference);
                 Ok(v)
             },
         },
@@ -380,13 +426,9 @@ fn tools_table() -> &'static [Tool] {
                           run-trend telemetry, and the integrity audits (an intact \
                           archive reads all zeros).",
             schema: || obj_schema(json!({}), &[]),
-            argv: |args| {
-                if args.is_empty() {
-                    Ok(vec![])
-                } else {
-                    Err("stats takes no arguments".into())
-                }
-            },
+            // Unknown keys are already refused upstream against the empty
+            // schema (call()), so the builder has nothing to check.
+            argv: |_| Ok(vec![]),
         },
         Tool {
             name: "sync",
@@ -446,9 +488,24 @@ fn obj_schema(properties: Value, required: &[&str]) -> Value {
 // `--flag=value` token and positionals sit behind `--`, so a value shaped
 // like a flag stays a value (pinned by test against the live CLI).
 
+/// A NUL cannot travel in Unix argv: catching it here keeps the refusal a
+/// protocol-level invalid-params naming the argument, instead of a spawn
+/// error blamed on the binary path (the actor-honesty rule).
+fn no_nul(key: &str, s: &str) -> Result<(), String> {
+    if s.contains('\0') {
+        return Err(format!(
+            "{key}: contains a NUL byte, which argv cannot carry"
+        ));
+    }
+    Ok(())
+}
+
 fn req_string(args: &Args, key: &str) -> Result<String, String> {
     match args.get(key) {
-        Some(Value::String(s)) => Ok(s.clone()),
+        Some(Value::String(s)) => {
+            no_nul(key, s)?;
+            Ok(s.clone())
+        }
         Some(_) => Err(format!("{key}: expected a string")),
         None => Err(format!("{key}: required")),
     }
@@ -458,6 +515,7 @@ fn push_string(v: &mut Vec<String>, args: &Args, key: &str) -> Result<(), String
     match args.get(key) {
         None => Ok(()),
         Some(Value::String(s)) => {
+            no_nul(key, s)?;
             v.push(format!("--{}={s}", key.replace('_', "-")));
             Ok(())
         }
@@ -535,14 +593,32 @@ fn call(server: &Server, params: &Value) -> Result<Value, String> {
         .stderr(Stdio::inherit());
     let output = match cmd.output() {
         Ok(o) => o,
-        Err(e) => {
-            // Spawn failure is a CONFIGURATION problem (the binary path),
-            // reported as a tool result so the client sees the remedy.
+        // Spawn failures split by actor: a missing or unrunnable binary is
+        // CONFIGURATION with the install remedy; anything else (an argv
+        // the OS refuses — e.g. an argument list past ARG_MAX) traces to
+        // the CALL's inputs, and blaming the binary path would launder a
+        // client's oversized argument into a reinstall chase — the blanket-
+        // From rule, one code over.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
             return Ok(tool_result(
                 &json!({ "error": { "code": "CONFIGURATION", "message": format!(
                     "cannot run ghgraph at {}: {e} — install it beside ghgraph-mcp, \
                      put it on PATH, or pass --ghgraph",
                     server.ghgraph.display()
+                )}})
+                .to_string(),
+                true,
+            ));
+        }
+        Err(e) => {
+            return Ok(tool_result(
+                &json!({ "error": { "code": "USER_INPUT", "message": format!(
+                    "cannot spawn ghgraph with these arguments: {e}"
                 )}})
                 .to_string(),
                 true,
@@ -554,14 +630,23 @@ fn call(server: &Server, params: &Value) -> Result<Value, String> {
     if output.status.success() {
         return Ok(tool_result(doc, false));
     }
-    if doc.is_empty() {
+    if doc.is_empty() || serde_json::from_str::<Value>(doc).is_err() {
         // Empty stdout + abnormal exit reads as INTERNAL — the CLI's own
         // doctrine (DESIGN.md, command surface), synthesized here because
-        // the child never got to say it.
+        // the child never got to say it. A NON-document (a child killed
+        // mid-write leaves a fragment) gets the same treatment, fragment
+        // attached: passing it through as tool text would hand consumers
+        // the one thing the surface promises never to emit — partial JSON.
         return Ok(tool_result(
             &json!({ "error": { "code": "INTERNAL", "message": format!(
-                "ghgraph exited abnormally ({}) with no output — file a ghgraph bug",
-                output.status
+                "ghgraph exited abnormally ({}) without a JSON document — file a \
+                 ghgraph bug{}",
+                output.status,
+                if doc.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (partial output: {doc:.120})")
+                }
             )}})
             .to_string(),
             true,

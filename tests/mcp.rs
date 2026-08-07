@@ -75,7 +75,10 @@ fn seed(s: &Scratch) {
                               updated_at, url) \
              VALUES ('PR_1', 'octo/alpha', 1, 'Fix the frobnicator', 'searchable body', \
                      'OPEN', 'alice', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', \
-                     'https://github.com/octo/alpha/pull/1')",
+                     'https://github.com/octo/alpha/pull/1'), \
+                    ('PR_2', 'octo/alpha', 2, 'Old merged work', 'done', \
+                     'MERGED', 'alice', '2026-01-01T00:00:00Z', '2026-01-01T12:00:00Z', \
+                     'https://github.com/octo/alpha/pull/2')",
         )
         .unwrap();
 }
@@ -84,9 +87,23 @@ fn seed(s: &Scratch) {
 /// by id (null-id errors key under Value::Null). Returns the map and the
 /// server's exit status.
 fn drive(s: &Scratch, requests: &[Value]) -> (HashMap<String, Value>, std::process::ExitStatus) {
+    let lines: Vec<Vec<u8>> = requests
+        .iter()
+        .map(|r| r.to_string().into_bytes())
+        .collect();
+    drive_raw(s, env!("CARGO_BIN_EXE_ghgraph"), &lines)
+}
+
+/// The raw form: arbitrary bytes per line (malformed frames, non-UTF8) and
+/// a caller-chosen ghgraph path (spawn-failure coverage).
+fn drive_raw(
+    s: &Scratch,
+    ghgraph: &str,
+    lines: &[Vec<u8>],
+) -> (HashMap<String, Value>, std::process::ExitStatus) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ghgraph-mcp"))
         .arg("--ghgraph")
-        .arg(env!("CARGO_BIN_EXE_ghgraph"))
+        .arg(ghgraph)
         .arg("--config")
         .arg(s.config_path())
         .stdin(Stdio::piped())
@@ -96,8 +113,9 @@ fn drive(s: &Scratch, requests: &[Value]) -> (HashMap<String, Value>, std::proce
         .expect("spawn ghgraph-mcp");
     {
         let mut stdin = child.stdin.take().unwrap();
-        for req in requests {
-            writeln!(stdin, "{req}").unwrap();
+        for line in lines {
+            stdin.write_all(line).unwrap();
+            stdin.write_all(b"\n").unwrap();
         }
         // Dropping stdin closes it: the server drains in-flight calls and
         // exits — the whole shutdown contract.
@@ -134,16 +152,24 @@ fn tool_doc(resp: &Value) -> (Value, bool) {
 }
 
 /// Mask the contract's enumerated nondeterminism — generated_at and
-/// age_seconds, the same two fields the golden suite masks — so documents
-/// from two invocations compare byte-equal.
+/// age_seconds, the same two fields (and the same presence-guarded way) the
+/// golden suite masks — so documents from two invocations compare
+/// byte-equal. Guarded assignment matters: serde_json index-assignment
+/// INSERTS a missing key, so an unguarded mask would hide a presence
+/// difference between the two surfaces — the exact reshaping class the
+/// one-surface test exists to catch.
 fn mask(doc: &mut Value) {
     if let Some(meta) = doc.get_mut("_meta") {
-        meta["generated_at"] = json!("<TIME>");
+        if meta.get("generated_at").is_some() {
+            meta["generated_at"] = json!("<TIME>");
+        }
         if let Some(archive) = meta.get_mut("archive").and_then(Value::as_array_mut) {
             for repo in archive {
                 if let Some(streams) = repo.get_mut("streams").and_then(Value::as_array_mut) {
                     for s in streams {
-                        s["age_seconds"] = json!("<AGE>");
+                        if s["age_seconds"].is_number() {
+                            s["age_seconds"] = json!("<AGE>");
+                        }
                     }
                 }
             }
@@ -198,10 +224,20 @@ fn tool_result_is_the_cli_document() {
     // the CLI prints, byte-for-byte after masking the two enumerated
     // timing fields. Any wrapper reshaping — reordering, renumbering,
     // "helpfully" summarizing — fails this.
+    // `sync` is the one absent verb: its document depends on a live gh
+    // and network effects, while the wrapper's mapping code path is the
+    // same one these six exercise — the spawn, the argv table, and the
+    // pass-through are shared, so transport-dependent coverage would
+    // re-test gh, not the wrapper.
     let s = Scratch::new();
     seed(&s);
     for (name, arguments, argv) in [
         ("stats", json!({}), vec!["stats"]),
+        (
+            "pr",
+            json!({"reference": "octo/alpha#1"}),
+            vec!["pr", "--", "octo/alpha#1"],
+        ),
         (
             "attention",
             json!({"limit": 5}),
@@ -250,7 +286,9 @@ fn typed_envelope_rides_is_error_with_actor_intact() {
         &[
             init_request(1),
             call(2, "query", json!({"sql": "DELETE FROM prs"})),
-            call(3, "pr", json!({"reference": "not-a-ref"})),
+            // Qualified enough to pass the wrapper's bare-number gate,
+            // malformed enough that the CLI's own parser refuses it.
+            call(3, "pr", json!({"reference": "owner/name#not-a-number"})),
         ],
     );
     let (doc, is_error) = tool_doc(&resp["2"]);
@@ -324,6 +362,10 @@ fn protocol_edges_answer_by_the_book() {
             call(5, "attention", json!({"limit": "five"})),
             call(6, "pr", json!({})),
             json!({"jsonrpc":"2.0","id":7,"method":"ping"}),
+            call(8, "attention", json!({"limit": 5.5})),
+            json!({"jsonrpc":"2.0","id":9}),
+            call(10, "pr", json!({"reference": "1"})),
+            call(11, "query", json!({"sql": "SELECT '\u{0}'"})),
         ],
     );
     assert!(status.success());
@@ -333,28 +375,162 @@ fn protocol_edges_answer_by_the_book() {
     assert_eq!(resp["5"]["error"]["code"], -32602, "mistyped argument");
     assert_eq!(resp["6"]["error"]["code"], -32602, "missing required arg");
     assert_eq!(resp["7"]["result"], json!({}), "ping pongs");
+    assert_eq!(
+        resp["8"]["error"]["code"], -32602,
+        "a non-integer number is refused, never truncated"
+    );
+    assert_eq!(
+        resp["9"]["error"]["code"], -32600,
+        "an id without a method is an invalid request, not a notification"
+    );
+    let msg = resp["10"]["error"]["message"].as_str().unwrap();
+    assert_eq!(
+        resp["10"]["error"]["code"], -32602,
+        "bare PR numbers are refused: the CLI would resolve them against \
+         the SERVER's launch directory"
+    );
+    assert!(
+        msg.contains("owner/name#123"),
+        "remedy names the form: {msg}"
+    );
+    assert_eq!(
+        resp["11"]["error"]["code"], -32602,
+        "a NUL cannot travel in argv and is named at the argument, not \
+         blamed on the binary path"
+    );
 }
 
 #[test]
-fn garbage_lines_get_parse_errors_and_never_kill_the_session() {
+fn initialize_version_negotiation_never_promises_the_future() {
     let s = Scratch::new();
     seed(&s);
-    let (resp, status) = drive(
-        &s,
-        &[
-            json!("this is a string, not a request"),
-            init_request(1),
-            json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
-        ],
+    for (requested, expect) in [
+        // Older published revision: echoed, so a conservative client is
+        // not false-refused.
+        ("2024-11-05", "2024-11-05"),
+        // A revision that postdates this code: answered with our own —
+        // echoing it would claim support nobody verified.
+        ("2099-01-01", "2025-06-18"),
+        // Garbage: our own.
+        ("banana", "2025-06-18"),
+    ] {
+        let (resp, _) = drive(
+            &s,
+            &[
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion": requested, "capabilities":{},
+                "clientInfo":{"name":"suite","version":"0"}}}),
+            ],
+        );
+        assert_eq!(
+            resp["1"]["result"]["protocolVersion"],
+            json!(expect),
+            "requested {requested}"
+        );
+    }
+}
+
+#[test]
+fn wrapper_failures_name_their_actor() {
+    let s = Scratch::new();
+    seed(&s);
+    // A missing binary is the operator's CONFIGURATION, with the remedy.
+    let req = vec![
+        init_request(1).to_string().into_bytes(),
+        call(2, "stats", json!({})).to_string().into_bytes(),
+    ];
+    let (resp, _) = drive_raw(&s, "/nonexistent/ghgraph", &req);
+    let (doc, is_error) = tool_doc(&resp["2"]);
+    assert!(is_error);
+    assert_eq!(doc["error"]["code"], "CONFIGURATION", "{doc}");
+    assert!(
+        doc["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--ghgraph"),
+        "remedy names the flag: {doc}"
     );
-    assert!(status.success());
-    // The string request has no usable id: JSON-RPC says id null. (A raw
-    // non-JSON line would do the same; the driver can only ship valid
-    // JSON, so the string stands in for malformed input.)
-    assert_eq!(
-        resp["null"]["error"]["code"],
-        json!(-32600),
-        "invalid request"
+    // A child that exits nonzero with no output is the synthesized
+    // INTERNAL — the CLI's own empty-stdout doctrine.
+    let (resp, _) = drive_raw(&s, "/usr/bin/false", &req);
+    let (doc, is_error) = tool_doc(&resp["2"]);
+    assert!(is_error);
+    assert_eq!(doc["error"]["code"], "INTERNAL", "{doc}");
+    // A child that dies mid-write leaves a FRAGMENT, not a document; the
+    // surface promises never to emit partial JSON, so the wrapper
+    // synthesizes INTERNAL with the fragment attached instead of passing
+    // the fragment off as tool text.
+    let fragment_child = s.dir.join("fragment.sh");
+    std::fs::write(
+        &fragment_child,
+        "#!/bin/sh\nprintf '{\"partial\":'\nexit 3\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&fragment_child).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&fragment_child, perms).unwrap();
+    let (resp, _) = drive_raw(&s, fragment_child.to_str().unwrap(), &req);
+    let (doc, is_error) = tool_doc(&resp["2"]);
+    assert!(is_error);
+    assert_eq!(doc["error"]["code"], "INTERNAL", "{doc}");
+    assert!(
+        doc["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("partial output"),
+        "the fragment is disclosed, not laundered: {doc}"
     );
-    assert!(resp.contains_key("2"), "the session survived");
+    // An argv the OS itself refuses (past ARG_MAX) traces to the call's
+    // input, not the binary path — USER_INPUT, never a reinstall chase.
+    let huge = "x".repeat(2 * 1024 * 1024);
+    let (resp, _) = drive(&s, &[call(3, "query", json!({"sql": huge}))]);
+    let (doc, is_error) = tool_doc(&resp["3"]);
+    assert!(is_error);
+    assert_eq!(doc["error"]["code"], "USER_INPUT", "{doc}");
+    assert!(
+        doc["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot spawn"),
+        "{doc}"
+    );
+}
+
+#[test]
+fn garbage_lines_get_typed_errors_and_never_kill_the_session() {
+    let s = Scratch::new();
+    seed(&s);
+    // Three distinct wrongnesses, each answered and none fatal: bytes that
+    // are not JSON (-32700), bytes that are not UTF-8 (-32700; the frame
+    // is consumed and the stream continues), and valid JSON that is not a
+    // request object (-32600). All three key under id null, so each runs
+    // in its own session and asserts its own code — a shared session's
+    // map would let the last frame shadow the others.
+    for (line, code) in [
+        (b"this is not json".to_vec(), -32700_i64),
+        (vec![0xff, 0xfe, 0x7b], -32700),
+        (
+            json!("a string, not a request").to_string().into_bytes(),
+            -32600,
+        ),
+    ] {
+        let lines = vec![
+            line,
+            json!({"jsonrpc":"2.0","id":2,"method":"ping"})
+                .to_string()
+                .into_bytes(),
+        ];
+        let (resp, status) = drive_raw(&s, env!("CARGO_BIN_EXE_ghgraph"), &lines);
+        assert!(status.success());
+        assert_eq!(
+            resp["null"]["error"]["code"],
+            json!(code),
+            "the broken frame draws its own code"
+        );
+        assert_eq!(
+            resp["2"]["result"],
+            json!({}),
+            "and the session survives to answer ping"
+        );
+    }
 }
