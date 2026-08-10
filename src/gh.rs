@@ -1229,6 +1229,14 @@ mod tests {
         assert_eq!(resp.data.get("ok"), Some(&serde_json::Value::Bool(true)));
         assert_eq!(ctx.tel.subprocess_count, 2, "one failure, one success");
         assert_eq!(ctx.tel.sleeps, 1);
+        // The one retry backed off >= 1s (backoff's floor); the sleep the
+        // suite already pays buys the accumulator's lower bound for free —
+        // a *=-from-zero (or dropped) accumulation reads 0 here.
+        assert!(
+            ctx.tel.sleep_ms >= 1_000,
+            "one Other-class retry sleeps >= 1s, got {}ms",
+            ctx.tel.sleep_ms
+        );
         assert_eq!(ctx.retry_budget, 9, "one retry consumed");
         // No rateLimit selected: the blind-call counter must say so.
         assert_eq!(ctx.tel.rate_limit_unknown, 1);

@@ -221,6 +221,13 @@ pub fn open_rw(path: &Path) -> Result<RwArchive> {
     // landed on must still be owner-only. No NOFOLLOW — it false-refuses
     // archives under symlinked parent dirs; the 0700 directory is the
     // symlink-swap defense (module docs).
+    // Mutation note: the flag combinators here carry three survivors —
+    // the two `^` forms are the disjoint-bitflag identity (see open_ro),
+    // and `|` → `&` on the CREATE half survives because
+    // create_0600_if_absent has ALREADY birthed the file on every path a
+    // test can reach: O_CREAT is the belt for the vanishing-file race,
+    // whose portable fixture does not exist (the mode re-check after open
+    // is the race's actual defense).
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
@@ -321,20 +328,27 @@ pub fn open_ro_audit(path: &Path) -> Result<RoAuditArchive> {
     // Mutation note, shared with open_ro's identical line: the flag `|`
     // has an equivalent `^` mutant — an arithmetic identity while the two
     // flag constants stay disjoint bit sets, which is its precondition.
-    // (An earlier note also claimed the reverse-selects hook's `== "1"`
+    // (An earlier note also claimed OPEN_RO's reverse-selects hook flip
     // was equivalent under the suite; that claim ROTTED — the pragma is
-    // introspectable through `query`, and both `!=` mutants are now
-    // caught, by harness_reverse_selects_pragma_is_live on this path and
-    // by the replay/metadata FTS tests on open_ro_audit's. Kept as the
-    // recorded example that equivalence notes expire in the
-    // secretly-killable direction too; `make mutants-equiv` re-tests the
-    // ones that remain.)
+    // introspectable through `query`, and harness_reverse_selects_
+    // pragma_is_live kills it. Kept as the recorded example that
+    // equivalence notes expire in the secretly-killable direction too;
+    // `make mutants-equiv` re-tests the ones that remain. This
+    // connection's OWN hook flip genuinely survives — the note at the
+    // hook below carries that argument.)
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)
         .map_err(|e| sqlite_err(path, "cannot open archive", e))?;
     configure_conn(&conn, path)?;
     // The same determinism hook as open_ro: the audit statements are
     // contract output too and must hold under reversed unordered selects.
+    // Mutation note: THIS hook's `== "1"` flip survives where open_ro's is
+    // killed — open_ro's pragma is introspectable through the `query`
+    // verb (harness_reverse_selects_pragma_is_live), but no verb can read
+    // a pragma back through the audit connection, and every audit
+    // statement is contract-correct, so the flip is observable only by
+    // shipping an incorrect audit query. Stubborn; retired if the audit
+    // connection ever grows an introspection path.
     if std::env::var_os("GHGRAPH_TEST_REVERSE_SELECTS").is_some_and(|v| v == "1") {
         conn.pragma_update(None, "reverse_unordered_selects", true)
             .map_err(|e| sqlite_err(path, "cannot set reverse_unordered_selects on", e))?;
@@ -487,6 +501,11 @@ fn create_0600_if_absent(path: &Path) -> Result<()> {
         .open(path)
     {
         Ok(_file) => Ok(()),
+        // Mutation note: widening this guard to all errors survives — the
+        // discriminating fixture is a create failure that is NOT
+        // AlreadyExists yet still yields an openable path (EINTR-class),
+        // which no portable test constructs. The refusal arms below stay
+        // pinned by the mode/permission tests.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) => Err(Error::config(format!(
             "cannot create archive {}: {e}",

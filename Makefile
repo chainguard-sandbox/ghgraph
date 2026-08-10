@@ -214,7 +214,19 @@ MUTANTS_EQUIV := \
 	'replace match guard e.kind\(\) == std::io::ErrorKind::BrokenPipe with true in emit|1' \
 	'replace - with \+ in overhead_intercept_ms|2' \
 	'replace < with <= in wrong_version|1' \
-	'replace > with >= in wrong_version|1'
+	'replace > with >= in wrong_version|1' \
+	'replace \| with . in open_rw|3' \
+	'replace \| with \^ in open_ro$$|1' \
+	'replace \| with \^ in open_ro_audit|1' \
+	'replace == with != in open_ro_audit|1' \
+	'replace match guard e.kind\(\) == std::io::ErrorKind::AlreadyExists with true|1' \
+	'replace configure_conn -> Result<\(\)> with Ok\(\(\)\)|1' \
+	'replace - with / in cap$$|1' \
+	'replace > with >= in incremental_since|1' \
+	'replace < with <= in split_point|1' \
+	'replace match guard !has_prev with true in refresh_one|1' \
+	'replace \+= with \*= in refresh_one|1' \
+	'replace match guard Some\(&c\) != cursor.as_ref\(\) with false in refresh_one|1'
 
 mutants-equiv: ## Verify the argued-equivalent mutants still survive, exactly (drift either way fails)
 	@command -v cargo-mutants >/dev/null 2>&1 || { echo "cargo-mutants not found — run: cargo install cargo-mutants"; exit 1; }

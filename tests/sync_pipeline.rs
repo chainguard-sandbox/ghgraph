@@ -765,15 +765,32 @@ fn replay_of_unchanged_remote_writes_nothing() {
     // nonzero delta column here is the regression the table exists to catch.
     let runs: i64 = fake.query_one("SELECT count(*) FROM sync_runs");
     assert_eq!(runs, 2, "one sync_runs row per completed run");
-    let (upserted, unchanged, observations, errors, intercept): (i64, i64, i64, i64, Option<i64>) =
-        fake.db()
-            .query_row(
-                "SELECT upserted, unchanged, observations, errors, overhead_intercept_ms \
+    let (upserted, unchanged, observations, errors, intercept, bytes): (
+        i64,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+        i64,
+    ) = fake
+        .db()
+        .query_row(
+            "SELECT upserted, unchanged, observations, errors, overhead_intercept_ms, \
+                    bytes_parsed \
              FROM sync_runs ORDER BY seq DESC LIMIT 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .unwrap();
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
     assert_eq!(
         (upserted, unchanged, observations, errors),
         (0, 2, 0, 0),
@@ -789,6 +806,9 @@ fn replay_of_unchanged_remote_writes_nothing() {
         intercept.is_some(),
         "three differing-size fixture calls must yield an intercept"
     );
+    // The exact byte count is fixture-sized and brittle; positivity is the
+    // accumulator's contract (a *=-from-zero accumulation reads 0 forever).
+    assert!(bytes > 0, "three data-bearing calls parsed bytes");
 }
 
 // ---------------------------------------------------------------------------
