@@ -351,6 +351,30 @@ version to the lockfile. Cargo.lock is committed; cargo vet and cargo audit
 run in CI. `stats` ships the same audits (orphans, observation chain, FTS
 integrity, watermark assertion), so every operator is a CI runner.
 
+Verification instruments are chosen per property, and the rejected ones are
+recorded so they aren't re-proposed. Exhaustive enumeration is the proof
+tier wherever a domain is finite (all ~3.65M civil dates, the 262,144-case
+bucket cube, the mode×uid sweep); coverage-guided fuzzing with
+independently restated oracles carries unbounded text; mutation testing
+polices the suite itself. Rejected: property-based testing crates (no niche
+left between enumeration and the fuzz workspace, and a dev-dependency still
+drags its tree into the vet surface for weaker generation than libFuzzer);
+Miri (under forbid(unsafe) with FFI-backed rusqlite, the subset it can
+execute is exactly the pure code where it has nothing to find); Loom (the
+concurrency is std mpsc plus scoped join — no hand-rolled synchronization
+to model); unbounded provers (Verus/Creusot — every proof-worthy domain
+here is bounded or finite, so a research toolchain buys nothing over
+enumeration); a chrono differential oracle for the RFC 3339 parser (its
+deliberate acceptances — offsets, lowercase markers, leap seconds — force
+the harness to restate our spec as filters, after which the reference
+contributes nothing). Bounded model checking (Kani) is the standing
+exception, deferred not rejected: adopted when its pinned toolchain clears
+our MSRV, scoped to properties whose domain is 2^64 or whose discriminating
+input a precondition forbids any test to construct (the wrong_version
+boundaries, from_epoch totality), and a harness lands only with a green
+pinned run in the same change, each carrying a killer patch and cover
+witnesses — a proof no toolchain runs is prose with a checkmark.
+
 Telemetry follows one rule: every measured field names the decision it
 feeds or the regression it detects, and a field with no consumer is deleted
 (the fields and their consumers live in src/sync.rs, beside the summary

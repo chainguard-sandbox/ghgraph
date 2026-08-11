@@ -57,5 +57,8 @@ Signal handlers (cancellation is the absence of a handler), an event system
 panic hook, run-long transactions for locking, views that encode judgment,
 org- or forge-wide discovery (every synced repo is named in the config), a
 Windows port, a CLI command with no MCP counterpart (human setup or config
-scaffolding is a flag or a Makefile target, not a verb). Each was argued
-down in DESIGN.md; meet the argument, not the absence.
+scaffolding is a flag or a Makefile target, not a verb), and a fifth
+verification instrument without a property that needs it — proptest, Miri,
+Loom, unbounded provers, a chrono oracle (per-instrument arguments in
+DESIGN.md Verification; Kani is deferred there, not rejected). Each was
+argued down in DESIGN.md; meet the argument, not the absence.
