@@ -85,6 +85,20 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "query_terms"
+path = "fuzz_targets/query_terms.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_incomplete"
+path = "fuzz_targets/sync_incomplete.rs"
+test = false
+doc = false
+bench = false
+
 # Own workspace so the root `cargo build` never descends into the fuzz crate.
 [workspace]
 

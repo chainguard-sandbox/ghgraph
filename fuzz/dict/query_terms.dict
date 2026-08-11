@@ -1,0 +1,29 @@
+# query_terms is gated behind THREE preconditions in series: a RepoConfig
+# that deserializes, a Login that validates, and an Rfc3339Utc that parses.
+# Without these tokens the target ran 20M execs at 0.00% coverage of
+# queries.rs — the builders under test were never called once.
+cfg_min="{\"repo\":\"owner/name\"}"
+cfg_proj="{\"repo\":\"owner/name\",\"scope\":\"project\"}"
+cfg_work="{\"repo\":\"owner/name\",\"scope\":\"working\"}"
+cfg_issues="{\"repo\":\"owner/name\",\"scope\":\"project\",\"issues\":true}"
+cfg_noissue="{\"repo\":\"owner/name\",\"scope\":\"project\",\"issues\":false}"
+cfg_excl="{\"repo\":\"owner/name\",\"exclude_authors\":[\"dependabot\"]}"
+k_repo="\"repo\""
+k_scope="\"scope\""
+k_issues="\"issues\""
+k_bots="\"bots\""
+v_project="\"project\""
+v_working="\"working\""
+r_ok="owner/name"
+r_mixed="Owner/Name"
+# Logins — the interpolated subjects.
+l_a="octocat"
+l_b="dependabot[bot]"
+l_hyphen="a-b-c"
+l_max="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+# Stamps: without one of these, discovery_terms/backfill_terms are dead code.
+t_mid="2026-07-24T13:59:00Z"
+t_epoch="1970-01-01T00:00:00Z"
+t_max="9999-12-31T23:59:59Z"
+t_min="0001-01-01T00:00:00Z"
+t_frac="2026-07-24T13:59:00.5Z"
