@@ -1,0 +1,26 @@
+# replied_since and effective_review_state compare RFC 3339 stamps, so their
+# ordering arms are unreachable until two parseable stamps coexist in one
+# input — the same gate that pinned review_freshness at 14.8% before
+# attention_inputs.dict. Ordered pairs, not just valid singletons: the
+# interesting arms are before/after/equal, and equality is its own branch.
+t_a="2026-07-24T13:59:00Z"
+t_b="2026-07-24T14:00:00Z"
+t_eq="2026-07-24T13:59:00Z"
+t_epoch="1970-01-01T00:00:00Z"
+t_max="9999-12-31T23:59:59Z"
+t_min="0001-01-01T00:00:00Z"
+t_frac="2026-07-24T13:59:00.500Z"
+t_leap="2000-02-29T23:59:59Z"
+# Unparseable-but-plausible: the fail-closed collapse must be reached too.
+t_noz="2026-07-24T13:59:00+00:00"
+t_short="2026-07-24"
+# effective_review_state dispatches on these exact review states.
+s_appr="APPROVED"
+s_chg="CHANGES_REQUESTED"
+s_comm="COMMENTED"
+s_dis="DISMISSED"
+s_pend="PENDING"
+# bucket dispatches on review_decision.
+d_appr="APPROVED"
+d_chg="CHANGES_REQUESTED"
+d_rev="REVIEW_REQUIRED"
