@@ -1,0 +1,24 @@
+{
+  "viewer": "your-github-login",
+  "repos": [
+    "owner/repo",
+    {
+      "repo": "owner/big-project-you-maintain",
+      "scope": "project",
+      "lookback_days": 30,
+      "exclude_authors": ["noisy-forge-account"]
+    }
+  ],
+  "people": [
+    "alice",
+    "bob"
+  ],
+  "teams": [
+    "a-team-you-are-on"
+  ],
+  "lookback_days": 90,
+  "reverify_open_days": 7,
+  "reverify_closed_days": 30,
+  "workers": 3,
+  "rate_limit_floor": 500
+}
