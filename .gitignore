@@ -4,6 +4,9 @@
 /fuzz/corpus
 /fuzz/artifacts
 /fuzz/Cargo.lock
+# llvm-cov profiles from `cargo fuzz coverage` — a measurement of the corpus,
+# regenerated from it, never an input to a run.
+/fuzz/coverage
 # cargo-mutants output.
 /mutants.out
 /mutants.out.old

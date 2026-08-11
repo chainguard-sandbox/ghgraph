@@ -1,0 +1,31 @@
+# review_freshness needs THREE simultaneously-valid RFC 3339 stamps
+# (text + one of head_committed_at / head_flip_observed_at) before it can
+# return anything but Unknown. Random mutation never lands that, so the
+# Fresh/Stale arms sat at 14.8% region coverage over 27M execs. These are
+# the shapes time::Rfc3339Utc::parse accepts (>=20 bytes, Zulu, optional
+# fractional seconds), plus the boundaries its range check keys on.
+stamp_mid="2026-07-24T13:59:00Z"
+stamp_epoch="1970-01-01T00:00:00Z"
+stamp_leap="2000-02-29T23:59:59Z"
+stamp_max="9999-12-31T23:59:59Z"
+stamp_min="0001-01-01T00:00:00Z"
+stamp_frac="2026-07-24T13:59:00.123456Z"
+# Off-by-one neighbours of the range guard — cheap edges next to valid ones.
+stamp_mon0="2026-00-01T00:00:00Z"
+stamp_day32="2026-01-32T00:00:00Z"
+stamp_hr24="2026-01-01T24:00:00Z"
+stamp_sec60="2026-01-01T00:00:60Z"
+stamp_noz="2026-07-24T13:59:00+00:00"
+# is_maintainer_assoc: exactly three accepted tokens.
+assoc_owner="OWNER"
+assoc_member="MEMBER"
+assoc_collab="COLLABORATOR"
+assoc_near="CONTRIBUTOR"
+# json_array_nonempty: the accept/reject boundary.
+arr_empty="[]"
+arr_obj="[{}]"
+arr_num="[0]"
+arr_nested="[[]]"
+arr_ws=" [ ] "
+arr_notarr="{}"
+arr_null="null"

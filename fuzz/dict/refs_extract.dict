@@ -1,0 +1,17 @@
+# refs.rs cross-reference syntax. extract() only yields a ref when the body
+# contains '#', so most random input dies at the first byte test.
+h_bare="#1"
+h_big="#999999"
+h_zero="#0"
+h_qual="owner/name#12"
+h_upper="Owner/Name#12"
+h_dotted="own.er/na_me#3"
+h_hyphen="own-er/na-me#4"
+h_kw_fixes="fixes #5"
+h_kw_closes="closes #6"
+h_kw_ref="refs #7"
+h_url="https://github.com/owner/name/pull/8"
+h_hash="#"
+h_slash="/"
+h_at="@"
+h_nl="\x0a"
