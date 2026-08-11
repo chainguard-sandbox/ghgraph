@@ -573,6 +573,44 @@ mod tests {
     }
 
     #[test]
+    fn parse_accepts_every_second_of_day_and_fences_each_field() {
+        // parse combines date and time-of-day additively from fixed
+        // positions (days * 86_400 + h*3600 + m*60 + s), so its canonical
+        // bare-Z accept path factors. The civil test above enumerates the
+        // date ARITHMETIC (days_from_civil directly, not parse's field
+        // reads); this test drives parse itself over the whole time factor
+        // — all 86,400 (h, m, s) triples on one date — so the canonical
+        // accept path is covered by composition. Not in the composition:
+        // the fractional tail (ends_in_zulu's '.' arm), carried by
+        // serde_validates_and_emits_canonical and the rfc3339_parse fuzz
+        // oracle. The fences pin this factor's boundary: hour 24, minute
+        // 60, and second 60 (a leap second — the module docs' deliberate
+        // rejection) are each OutOfRange, not silently wrapped.
+        for hour in 0..24i64 {
+            for minute in 0..60i64 {
+                for second in 0..60i64 {
+                    let s = format!("1970-01-01T{hour:02}:{minute:02}:{second:02}Z");
+                    let t = Rfc3339Utc::parse(&s)
+                        .unwrap_or_else(|e| panic!("{s} must parse, got {e:?}"));
+                    assert_eq!(t.epoch(), hour * 3_600 + minute * 60 + second);
+                    assert_eq!(t.as_str(), s, "canonical input must render unchanged");
+                }
+            }
+        }
+        for bad in [
+            "1970-01-01T24:00:00Z",
+            "1970-01-01T00:60:00Z",
+            "1970-01-01T00:00:60Z",
+        ] {
+            assert_eq!(
+                Rfc3339Utc::parse(bad),
+                Err(ParseError::OutOfRange),
+                "{bad} must be fenced"
+            );
+        }
+    }
+
+    #[test]
     fn serde_validates_and_emits_canonical() {
         // Deserialize goes through parse (a malformed API timestamp is
         // unrepresentable past a parse type) and normalizes; Serialize

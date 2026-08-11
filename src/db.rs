@@ -327,7 +327,10 @@ pub fn open_ro_audit(path: &Path) -> Result<RoAuditArchive> {
     }
     // Mutation note, shared with open_ro's identical line: the flag `|`
     // has an equivalent `^` mutant — an arithmetic identity while the two
-    // flag constants stay disjoint bit sets, which is its precondition.
+    // flag constants stay disjoint bit sets, which is its precondition —
+    // pinned by open_flag_sets_are_disjoint, so a rusqlite bump that
+    // overlaps the constants fails a named test instead of silently
+    // invalidating this argument.
     // (An earlier note also claimed OPEN_RO's reverse-selects hook flip
     // was equivalent under the suite; that claim ROTTED — the pragma is
     // introspectable through `query`, and harness_reverse_selects_
@@ -816,6 +819,57 @@ mod tests {
             "root-owned but non-sticky: any writer can swap"
         );
         assert!(!sticky_swap_exempt(0o0777, 501), "plain writable dir");
+    }
+
+    #[test]
+    fn sticky_swap_exemption_swept_against_an_independent_predicate() {
+        // The quadrant test above pins the named shapes; this sweep pins the
+        // frame the quadrants cannot state: over every 16-bit mode image
+        // (all permission bits plus the file-type bits st_mode carries) and
+        // an owner on each side of root, no bit but the sticky bit and no
+        // uid but 0 influence the verdict. The oracle restates the predicate
+        // by division instead of masking so implementation and oracle cannot
+        // share a typo.
+        for mode in 0..=0xFFFFu32 {
+            for uid in [0u32, 1, 501, u32::MAX] {
+                let want = (mode / 0o1000) % 2 == 1 && uid == 0;
+                assert_eq!(
+                    sticky_swap_exempt(mode, uid),
+                    want,
+                    "mode={mode:06o} uid={uid}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn open_flag_sets_are_disjoint() {
+        // The precondition of the `|`→`^` equivalence notes at the three
+        // opens: `a | b == a ^ b` exactly while the operands share no bits.
+        // Every flag set this module passes to open_with_flags, checked
+        // pairwise.
+        let rw = [
+            OpenFlags::SQLITE_OPEN_READ_WRITE,
+            OpenFlags::SQLITE_OPEN_CREATE,
+            OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ];
+        let ro = [
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ];
+        for set in [&rw[..], &ro[..]] {
+            for i in 0..set.len() {
+                for j in i + 1..set.len() {
+                    assert_eq!(
+                        set[i].bits() & set[j].bits(),
+                        0,
+                        "open flag constants must stay disjoint: {:?} and {:?}",
+                        set[i],
+                        set[j]
+                    );
+                }
+            }
+        }
     }
 
     #[test]

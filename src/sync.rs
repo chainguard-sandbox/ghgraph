@@ -2022,6 +2022,9 @@ fn split_point(since: &Rfc3339Utc, until: Option<&Rfc3339Utc>) -> Option<Rfc3339
         Some(u) => u.clone(),
         None => Rfc3339Utc::now(),
     };
+    // The subtraction cannot overflow: representable epochs are bounded by
+    // the year 1..=9999 domain (|epoch| < 2^38 — time.rs's range guard), a
+    // precondition this arithmetic inherits from the Rfc3339Utc type.
     let width = end.epoch() - since.epoch();
     // (The guard's own `<` → `<=` mutant declines to split at EXACTLY the
     // minimum width, whose halves are the degenerate 1s windows the
@@ -3134,7 +3137,10 @@ fn overhead_intercept_ms(samples: &[(u64, u64)]) -> Option<i64> {
     // Σ(x−mx)(y−my) + 2·mx·Σ(y−my), and Σ(y−my) is identically zero by the
     // definition of the mean (symmetrically for the y side). Only float
     // rounding distinguishes them; a test pinning that residue would
-    // assert noise. Documented per the triage rule, not chased.
+    // assert noise, and a bit-exact proof attempt would only rediscover
+    // the rounding (the identity holds over the reals, not IEEE 754 —
+    // don't send a model checker here). Documented per the triage rule,
+    // not chased.
     let sxy: f64 = samples
         .iter()
         .map(|&(x, y)| (x as f64 - mx) * (y as f64 - my))
