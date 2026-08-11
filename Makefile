@@ -4,7 +4,7 @@
 # ghgraph is a design scaffold — function bodies are `todo!()` stubs, so
 # `build` compiles but `run` will panic until the bodies land. See DESIGN.md.
 
-.PHONY: help doctor config build release run test check-heavy fuzz fuzz-all fuzz-replay fuzz-cmin dict dict-check mutants fmt lint check check-full audit vet tree tree-check clean install setup
+.PHONY: help doctor config build release run test check-heavy fuzz fuzz-all fuzz-replay fuzz-cmin fuzz-targets-check dict dict-check mutants fmt lint check check-full audit vet tree tree-check clean install setup
 
 BINARY_NAME := ghgraph
 
@@ -18,8 +18,12 @@ SECS ?= 60
 # the shared seed corpus so the Linux run starts warm (the sequencing is
 # deliberate).
 SAN ?= address
-# Every fuzz target, derived from the harness sources so the list cannot
-# drift from fuzz/Cargo.toml.
+# Every fuzz target, derived from the harness sources. Deriving from the
+# sources does not by itself prevent drift from fuzz/Cargo.toml — it picks
+# one of TWO sources of truth, and the build follows the other one. A .rs
+# added without its [[bin]] silently disappears from the build while
+# fuzz-all and fuzz-replay still try to run it; the reverse orphans a
+# [[bin]]. fuzz-targets-check pins the two together.
 FUZZ_TARGETS := $(notdir $(basename $(wildcard fuzz/fuzz_targets/*.rs)))
 # The nightly bin dir the fuzz targets need on PATH.
 NIGHTLY_BIN = $$(dirname "$$(rustup which --toolchain nightly cargo)")
@@ -174,7 +178,30 @@ check: ## Fast pre-commit gate: format, clippy, check, test
 check-heavy: ## The ignored heavy tests (e.g. the 120s live watchdog stall)
 	cargo test -- --ignored --skip capture_
 
-check-full: check audit vet tree-check ## check, plus the supply-chain checks CI runs
+# The harness has two lists of its targets — fuzz_targets/*.rs, which
+# fuzz-all and fuzz-replay sweep, and the [[bin]] tables in
+# fuzz/Cargo.toml, which the build follows. A sweep over a target that was
+# never registered is the failure this catches: it exits 0 per target and
+# reports coverage for a binary that does not exist, so the miss looks like
+# a pass. Same shape as tree-check and dict-check — a committed pair that
+# must agree, diffed rather than trusted. LC_ALL=C for the same reason the
+# dict recipe pins it: byte order, not the operator's locale.
+fuzz-targets-check: ## Fail if fuzz_targets/*.rs and fuzz/Cargo.toml [[bin]] disagree
+	@s=$$(mktemp); b=$$(mktemp); \
+	printf '%s\n' $(FUZZ_TARGETS) | LC_ALL=C sort > $$s; \
+	awk '/^\[\[bin\]\]/ { inbin = 1; next } \
+	     inbin && /^name[[:space:]]*=/ { match($$0, /"[^"]+"/); \
+	       print substr($$0, RSTART + 1, RLENGTH - 2); inbin = 0 }' \
+	  fuzz/Cargo.toml | LC_ALL=C sort > $$b; \
+	if ! diff -u $$s $$b > /dev/null; then \
+		echo "fuzz target drift — fuzz_targets/*.rs (-) vs fuzz/Cargo.toml [[bin]] (+):"; \
+		diff -u $$s $$b | tail -n +3 | grep -E '^[-+]' | sed 's/^/  /'; \
+		rm -f $$s $$b; exit 1; \
+	fi; \
+	echo "✓ $$(grep -c . $$s) fuzz targets — sources and manifest agree"; \
+	rm -f $$s $$b
+
+check-full: check audit vet tree-check fuzz-targets-check ## check, plus the supply-chain checks CI runs
 
 #
 # Supply chain (dependency policy — see DESIGN.md; all four run in CI)
