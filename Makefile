@@ -232,6 +232,7 @@ mutants-equiv: ## Verify the argued-equivalent mutants still survive, exactly (d
 	@command -v cargo-mutants >/dev/null 2>&1 || { echo "cargo-mutants not found — run: cargo install cargo-mutants"; exit 1; }
 	@for entry in $(MUTANTS_EQUIV); do \
 		re=$${entry%|*}; want=$${entry##*|}; \
+		rm -rf mutants.out; \
 		cargo mutants --no-config --re "$$re" --jobs $(JOBS) >/dev/null 2>&1; \
 		got=$$(wc -l < mutants.out/missed.txt | tr -d ' '); \
 		[ "$$got" -eq "$$want" ] || { echo "equiv ledger drift for $$re: expected $$want missed, got $$got — a stale note (fewer) or a new survivor (more)"; exit 1; }; \
