@@ -1,6 +1,16 @@
 //! Reference extraction from PR body text. Pure — no I/O, no allocation
-//! beyond the result. The natural first Kani harness if verification is ever
-//! wanted: no panic on arbitrary input, deterministic ordered output.
+//! beyond the result.
+//!
+//! An earlier version of this header nominated the module as "the natural
+//! first Kani harness". Withdrawn: the tractable symbolic-input bound
+//! (~10 bytes — `out.sort()` in [`extract`] drags slice-sort internals
+//! into the unwind scope) sits below the grammar's interesting diameter
+//! (a pair keyword needs 13 bytes, a cross-repo pair bind 16+), so a
+//! bounded proof would exhaustively sweep only the short-input arms the
+//! fuzz target and the discriminator tests already saturate, while
+//! silently excluding the arms where mutation testing found real bugs.
+//! Any future harness here must carry per-arm `kani::cover!` witnesses so
+//! that truncation fails loudly instead of shipping a vacuous green.
 //!
 //! Recognized grammar (case-insensitive keywords, `#N` or `owner/name#N`
 //! targets):
