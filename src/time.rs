@@ -574,15 +574,18 @@ mod tests {
 
     #[test]
     fn parse_accepts_every_second_of_day_and_fences_each_field() {
-        // The accept side of parse factors: date and time-of-day fields sit
-        // at fixed positions and combine additively (days * 86_400 + h*3600
-        // + m*60 + s), so the two factors are independent. The civil test
-        // above enumerates the date factor; this enumerates the time factor
-        // — all 86,400 (h, m, s) triples on a fixed date — making accept-
-        // side coverage total by composition. The fences pin this factor's
-        // boundary: hour 24, minute 60, and second 60 (a leap second — the
-        // module docs' deliberate rejection) are each OutOfRange, not
-        // silently wrapped.
+        // parse combines date and time-of-day additively from fixed
+        // positions (days * 86_400 + h*3600 + m*60 + s), so its canonical
+        // bare-Z accept path factors. The civil test above enumerates the
+        // date ARITHMETIC (days_from_civil directly, not parse's field
+        // reads); this test drives parse itself over the whole time factor
+        // — all 86,400 (h, m, s) triples on one date — so the canonical
+        // accept path is covered by composition. Not in the composition:
+        // the fractional tail (ends_in_zulu's '.' arm), carried by
+        // serde_validates_and_emits_canonical and the rfc3339_parse fuzz
+        // oracle. The fences pin this factor's boundary: hour 24, minute
+        // 60, and second 60 (a leap second — the module docs' deliberate
+        // rejection) are each OutOfRange, not silently wrapped.
         for hour in 0..24i64 {
             for minute in 0..60i64 {
                 for second in 0..60i64 {
