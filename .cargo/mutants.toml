@@ -1,0 +1,30 @@
+# cargo-mutants policy. Machine-sized knobs stay on the command line
+# (--jobs; see the Makefile OOM rationale); policy that should hold for
+# every invocation — local, scoped, or a future CI shard — lives here.
+#
+# Scope is the whole crate: an exclude-list (currently empty), not an
+# include-list. The old Makefile MUTANTS_FILES include-list was a
+# todo!()-scaffold artifact — mutating unimplemented bodies yielded only
+# false survivors — and once every module was implemented it had drifted
+# into silently skipping main.rs and error.rs: 21 mutants that are exactly
+# the error-envelope and exit-code contract, one of them a real miss
+# (--help/--version handling). Whole-crate-by-default means a new file
+# (src/bin/mcp.rs is next) is mutation-tested the day it lands, not the day
+# someone remembers a Makefile variable.
+
+# The suite is ~25s today and will grow. A multiplier keeps the timeout —
+# and with it the window in which a runaway-allocation mutant can eat
+# memory before being killed — proportional to the suite, instead of a
+# fixed 60s that goes stale in either direction.
+timeout_multiplier = 2.0
+
+# Mutants argued equivalent, excluded so a clean run stays the norm and any
+# new survivor is a signal. Every entry must name the code comment that
+# carries the argument; if that comment goes, so does the entry.
+#
+# emit's BrokenPipe guard flipped to `true`: no portable harness constructs
+# a non-EPIPE stdout write failure, so the flip is equivalent in practice —
+# argued at src/main.rs::emit, confirmed surviving by a live run.
+exclude_re = [
+    'replace match guard e\.kind\(\) == std::io::ErrorKind::BrokenPipe with true in emit',
+]

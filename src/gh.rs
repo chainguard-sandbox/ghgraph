@@ -368,10 +368,12 @@ fn graphql_once(
     })?;
     let call_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     tel.subprocess_count += 1;
-    // Mutation note: the subprocess_ms accumulation has surviving
-    // arithmetic mutants (+= → *=) by design — wall-clock values are the
-    // contract's enumerated nondeterminism, masked in every deterministic
-    // test, so no test may assert them without asserting noise.
+    // Wall-clock values are the contract's enumerated nondeterminism —
+    // no test may PIN them — but a lower bound is contract-safe:
+    // Instant::elapsed can never undershoot a child's sleep, and the
+    // subprocess_ms_accumulates test asserts exactly that bound (killing
+    // the *=-from-zero mutant deliberately; the -= sibling already dies
+    // by debug underflow, now on purpose rather than by luck).
     tel.subprocess_ms += call_ms;
     tel.bytes_parsed += out.stdout.len() as u64;
     if out.killed {
@@ -963,6 +965,24 @@ mod tests {
         );
     }
 
+    // Timing telemetry carries no pinnable value (enumerated
+    // nondeterminism), but its ACCUMULATION direction is a contract: a
+    // child that provably slept 50ms must leave at least 50ms behind —
+    // Instant::elapsed cannot undershoot the sleep — so a broken
+    // accumulator (stuck at zero, or subtracting) fails here without any
+    // test asserting noise.
+    #[test]
+    fn subprocess_ms_accumulates_a_wall_clock_lower_bound() {
+        let fake = FakeGh::new("sleep 0.05\ncat > /dev/null\nprintf '%s' '{\"data\":{}}'");
+        let mut ctx = GhCtx::single();
+        graphql_ctx(&fake.bin(), deadline(), "q", &[], &mut ctx).unwrap();
+        assert!(
+            ctx.tel.subprocess_ms >= 50,
+            "a 50ms child sleep must accumulate >= 50ms, got {}",
+            ctx.tel.subprocess_ms
+        );
+    }
+
     // Partial data beside a top-level errors array is a SUCCESS carrying
     // masked nulls (here node:null): gh exits 1 on any errors array, but the
     // body decides. parse.rs types the masked spots and milestone-2 sync
@@ -1209,6 +1229,14 @@ mod tests {
         assert_eq!(resp.data.get("ok"), Some(&serde_json::Value::Bool(true)));
         assert_eq!(ctx.tel.subprocess_count, 2, "one failure, one success");
         assert_eq!(ctx.tel.sleeps, 1);
+        // The one retry backed off >= 1s (backoff's floor); the sleep the
+        // suite already pays buys the accumulator's lower bound for free —
+        // a *=-from-zero (or dropped) accumulation reads 0 here.
+        assert!(
+            ctx.tel.sleep_ms >= 1_000,
+            "one Other-class retry sleeps >= 1s, got {}ms",
+            ctx.tel.sleep_ms
+        );
         assert_eq!(ctx.retry_budget, 9, "one retry consumed");
         // No rateLimit selected: the blind-call counter must say so.
         assert_eq!(ctx.tel.rate_limit_unknown, 1);

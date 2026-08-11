@@ -332,6 +332,22 @@ mod tests {
     }
 
     #[test]
+    fn empty_name_segment_falls_through_to_a_bare_ref() {
+        // The discriminating input for target_at's empty-name arm:
+        // "owner/#5" has name == 0 with '#' immediately following. The ||
+        // rejects the cross-repo parse, and the scanner then finds the
+        // bare `#5`, which binds to the SOURCE repo — under the && mutant
+        // the cross-repo arm passes instead and mints repo "owner/"
+        // (trailing slash, empty name), a non-canonical shape only the
+        // fuzz harness's property could previously see. Pinning the
+        // fall-through's repo makes the unit suite the killer.
+        assert_eq!(
+            refs("see owner/#5"),
+            vec![(RefKind::Mentions, "src/repo".into(), 5)]
+        );
+    }
+
+    #[test]
     fn every_fixes_keyword_maps() {
         for kw in [
             "fix", "fixes", "fixed", "close", "closes", "closed", "resolve", "resolves",

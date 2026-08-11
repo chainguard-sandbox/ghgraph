@@ -1,10 +1,7 @@
 # Makefile for ghgraph
 # Self-documenting: run `make` or `make help` to see available targets.
-#
-# ghgraph is a design scaffold — function bodies are `todo!()` stubs, so
-# `build` compiles but `run` will panic until the bodies land. See DESIGN.md.
 
-.PHONY: help doctor config build release run test check-heavy fuzz fuzz-all fuzz-replay fuzz-cmin fuzz-targets-check dict dict-check mutants fmt lint check check-full audit vet tree tree-check clean install setup
+.PHONY: help doctor config build release run test check-heavy fuzz fuzz-all fuzz-replay fuzz-cmin fuzz-targets-check dict dict-check mutants mutants-diff mutants-extreme mutants-equiv fmt lint check check-full audit vet tree tree-check clean install setup
 
 BINARY_NAME := ghgraph
 
@@ -46,17 +43,18 @@ FUZZ_TARGETS := $(notdir $(basename $(wildcard fuzz/fuzz_targets/*.rs)))
 # The nightly bin dir the fuzz targets need on PATH.
 NIGHTLY_BIN = $$(dirname "$$(rustup which --toolchain nightly cargo)")
 
-# Mutation-testing knobs (see the `mutants` target). Scoped to the implemented
-# modules by default — mutating the todo!() stubs only yields false survivors;
-# widen MUTANTS_FILES as modules land.
+# Mutation-testing knobs (see the `mutants` targets). Scope, timeout policy,
+# and the known-equivalent exclusions live in .cargo/mutants.toml so every
+# invocation shares them; FILE narrows a run, SINCE picks the diff base for
+# `mutants-diff` (the per-milestone form).
 # JOBS is deliberately modest: each job is a full build tree plus a test
 # suite, and a mutant that breaks a loop's progress can allocate at memory-
-# bandwidth speed until TIMEOUT kills it — 4 concurrent runaways have OOMed
-# a 16GB machine. Loop-bearing code should also carry a progress
+# bandwidth speed until the timeout kills it — 4 concurrent runaways have
+# OOMed a 16GB machine. Loop-bearing code should also carry a progress
 # debug_assert (see gh::scrub_tokens) so that class dies by panic instead.
-MUTANTS_FILES ?= --file src/db.rs --file src/config.rs --file src/time.rs --file src/identity.rs --file src/queries.rs --file src/parse.rs --file src/gh.rs --file src/refs.rs --file src/sync.rs --file src/attention.rs --file src/report.rs
 JOBS ?= 2
-TIMEOUT ?= 60
+FILE ?=
+SINCE ?= main
 
 help: ## Show this help
 	@echo "$(BINARY_NAME) — make <target>"
@@ -184,9 +182,62 @@ dict-check: ## Fail if the dictionary drifted from parse.rs
 	{ rm -rf $$t; echo "dictionary diverged — 'make dict' regenerated it; review and commit"; exit 1; }; \
 	rm -rf $$t
 
-mutants: ## Mutation-test the implemented modules (needs cargo-mutants). MUTANTS_FILES/JOBS/TIMEOUT
+mutants: ## Mutation-test the crate (full sweep ~4h; needs cargo-mutants). FILE=src/foo.rs narrows
 	@command -v cargo-mutants >/dev/null 2>&1 || { echo "cargo-mutants not found — run: cargo install cargo-mutants"; exit 1; }
-	cargo mutants $(MUTANTS_FILES) --jobs $(JOBS) --timeout $(TIMEOUT)
+	cargo mutants $(if $(FILE),--file $(FILE)) --jobs $(JOBS)
+
+mutants-diff: ## Mutation-test only code changed since SINCE (default: main)
+	@command -v cargo-mutants >/dev/null 2>&1 || { echo "cargo-mutants not found — run: cargo install cargo-mutants"; exit 1; }
+	@t=$$(mktemp); git diff $$(git merge-base $(SINCE) HEAD) > $$t; \
+		cargo mutants --in-diff $$t --jobs $(JOBS); s=$$?; rm -f $$t; exit $$s
+
+# Function-replacement mutants only — the pseudo-tested-code sweep: a
+# survivor here is a function whose ENTIRE body can vanish unnoticed, the
+# signal operator-level noise drowns. The ' in ' discriminator relies on
+# cargo-mutants' mutant-naming convention (operator mutants read "replace X
+# with Y in fn"; body replacements read "replace fn -> T with v") — verified
+# exact against --list at 0.27; re-verify after a cargo-mutants major bump.
+mutants-extreme: ## Pseudo-tested-code sweep: function-replacement mutants only (~35 min)
+	@command -v cargo-mutants >/dev/null 2>&1 || { echo "cargo-mutants not found — run: cargo install cargo-mutants"; exit 1; }
+	cargo mutants --exclude-re ' in ' --jobs $(JOBS)
+
+# The inverse gate over the argued-equivalent ledger: each entry is
+# "pattern|expected-missed-count", and the run must miss EXACTLY that many.
+# Fewer missed means a note rotted in the secretly-killable direction (a
+# test now discriminates it — the db.rs reverse-selects hook did exactly
+# this): delete the entry and its code note, and record the killing test
+# there instead. MORE missed means a new survivor appeared inside the same
+# function — triage it. Counts, not names, because mutant names embed
+# line numbers that drift. Entries mirror .cargo/mutants.toml exclude_re
+# plus the documented-at-code survivors.
+MUTANTS_EQUIV := \
+	'replace match guard e.kind\(\) == std::io::ErrorKind::BrokenPipe with true in emit|1' \
+	'replace - with \+ in overhead_intercept_ms|2' \
+	'replace < with <= in wrong_version|1' \
+	'replace > with >= in wrong_version|1' \
+	'replace \| with . in open_rw|3' \
+	'replace \| with \^ in open_ro$$|1' \
+	'replace \| with \^ in open_ro_audit|1' \
+	'replace == with != in open_ro_audit|1' \
+	'replace match guard e.kind\(\) == std::io::ErrorKind::AlreadyExists with true|1' \
+	'replace configure_conn -> Result<\(\)> with Ok\(\(\)\)|1' \
+	'replace - with / in cap$$|1' \
+	'replace > with >= in incremental_since|1' \
+	'replace < with <= in split_point|1' \
+	'replace match guard !has_prev with true in refresh_one|1' \
+	'replace \+= with \*= in refresh_one|1' \
+	'replace match guard Some\(&c\) != cursor.as_ref\(\) with false in refresh_one|1'
+
+mutants-equiv: ## Verify the argued-equivalent mutants still survive, exactly (drift either way fails)
+	@command -v cargo-mutants >/dev/null 2>&1 || { echo "cargo-mutants not found — run: cargo install cargo-mutants"; exit 1; }
+	@for entry in $(MUTANTS_EQUIV); do \
+		re=$${entry%|*}; want=$${entry##*|}; \
+		rm -rf mutants.out; \
+		cargo mutants --no-config --re "$$re" --jobs $(JOBS) >/dev/null 2>&1; \
+		got=$$(wc -l < mutants.out/missed.txt | tr -d ' '); \
+		[ "$$got" -eq "$$want" ] || { echo "equiv ledger drift for $$re: expected $$want missed, got $$got — a stale note (fewer) or a new survivor (more)"; exit 1; }; \
+		echo "as argued ($$got missed): $$re"; \
+	done
 
 check: ## Fast pre-commit gate: format, clippy, check, test
 	cargo fmt --all -- --check

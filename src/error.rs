@@ -128,4 +128,16 @@ mod tests {
             r#"{"error":{"code":"USER_INPUT","message":"x"}}"#
         );
     }
+
+    /// Display feeds the sync summary's `health.errors` — consumer-visible
+    /// text, so the WHOLE string is the contract, not just the code prefix
+    /// (a prefix-only assertion lets the message half regress silently).
+    #[test]
+    fn display_is_code_colon_message_exactly() {
+        assert_eq!(
+            Error::transient("rate limited").to_string(),
+            "TRANSIENT: rate limited"
+        );
+        assert_eq!(Error::internal("boom").to_string(), "INTERNAL: boom");
+    }
 }

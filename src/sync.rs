@@ -924,6 +924,9 @@ fn incremental_since(state: Option<&(String, String)>, lookback_start: &Rfc3339U
     let wm = state
         .and_then(|(wm, _)| Rfc3339Utc::parse(wm).ok())
         .and_then(|wm| wm.checked_sub_secs(OVERLAP_SECS));
+    // Mutation note: `>` → `>=` is a value-level identity — at equality
+    // both arms return the same instant — so the boundary mutant is
+    // equivalent by construction, not by test gap.
     match wm {
         Some(wm) if wm > *lookback_start => wm,
         _ => lookback_start.clone(),
@@ -2020,6 +2023,10 @@ fn split_point(since: &Rfc3339Utc, until: Option<&Rfc3339Utc>) -> Option<Rfc3339
         None => Rfc3339Utc::now(),
     };
     let width = end.epoch() - since.epoch();
+    // (The guard's own `<` → `<=` mutant declines to split at EXACTLY the
+    // minimum width, whose halves are the degenerate 1s windows the
+    // constant exists to rule out — declining there is inside the argued
+    // behavior: no gap either way, only a disclosed cap.)
     if width < MIN_WINDOW_SECS {
         return None;
     }
