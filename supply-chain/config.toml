@@ -68,6 +68,7 @@ criteria = "safe-to-deploy"
 [[exemptions.libsqlite3-sys]]
 version = "0.38.2"
 criteria = "safe-to-deploy"
+notes = "0.38.1 -> 0.38.2 delta reviewed by hand: the cfg_select! -> local polyfill MSRV fix (rusqlite/rusqlite c922ca5) in build.rs; bundled SQLite amalgamation unchanged at 3.53.2, no new C."
 
 [[exemptions.memchr]]
 version = "2.8.3"
@@ -92,6 +93,7 @@ criteria = "safe-to-deploy"
 [[exemptions.rusqlite]]
 version = "0.40.2"
 criteria = "safe-to-deploy"
+notes = "0.40.1 -> 0.40.2 delta reviewed by hand: the cfg_select! -> local polyfill MSRV fix (rusqlite/rusqlite c922ca5) in src; no behavioral or unsafe changes."
 
 [[exemptions.rustversion]]
 version = "1.0.23"

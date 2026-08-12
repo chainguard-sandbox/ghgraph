@@ -106,9 +106,16 @@ jobs:
         # The raise condition in the Cargo.toml note fired late once before
         # (the unblock came from rusqlite, not Kani) — this step makes the
         # Kani side self-announcing without turning unrelated PRs red.
+        # Authenticated (via env, never inline interpolation): anonymous
+        # API calls share a 60/hour per-IP limit on hosted runners, whose
+        # exhaustion would silently suppress the one warning this exists
+        # to emit. Empty $latest still short-circuits quiet on a failed
+        # fetch — the probe must never be the thing that breaks CI.
         continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          latest=$(curl -sf https://api.github.com/repos/model-checking/kani/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)
+          latest=$(curl -sf -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/model-checking/kani/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)
           if [ -n "$latest" ] && [ "$latest" != "kani-0.67.0" ]; then
             echo "::warning title=Kani released $latest::check its bundled toolchain — if >= 1.95, raise rust-version and KANI_VERSION together (Cargo.toml MSRV note)"
             exit 1

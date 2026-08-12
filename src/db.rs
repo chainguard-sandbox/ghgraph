@@ -429,9 +429,13 @@ mod kani_proofs {
     /// points, closed over all 2^64 inputs: no mode bit but the sticky bit
     /// and no uid but 0 influence the verdict. Deliberately NOT specified
     /// by restating the implementation's expression (a mirrored oracle is
-    /// a change-detector, not a spec): two frame asserts plus three point
-    /// anchors DERIVE the full truth table — any (mode, uid) reduces by
-    /// the frames to one of the anchored points.
+    /// a change-detector, not a spec): two frame asserts plus FOUR point
+    /// anchors — one per behavioral quadrant — DERIVE the full truth
+    /// table: any (mode, uid) reduces by the frames to one of the
+    /// anchored points. All four are load-bearing; with only three, an
+    /// implementation that inverts the unanchored quadrant satisfies
+    /// both frames and every remaining anchor (the .2 killer plants
+    /// exactly that).
     #[kani::proof]
     fn sticky_swap_exempt_frame_over_all_inputs() {
         let mode: u32 = kani::any();
@@ -454,10 +458,12 @@ mod kani_proofs {
                 "two nonzero uids diverged — root is the only special owner"
             );
         }
-        // Point anchors: with the frames, these three decide every input.
+        // Point anchors: with the frames, these four — one per behavioral
+        // quadrant — decide every input.
         assert!(sticky_swap_exempt(0o1000, 0), "sticky root-owned is exempt");
         assert!(!sticky_swap_exempt(0, 0), "root-owned alone is not");
         assert!(!sticky_swap_exempt(0o1000, 501), "sticky alone is not");
+        assert!(!sticky_swap_exempt(0, 501), "neither is plainly not");
     }
 
     /// The two wrong_version ledger entries as theorems (version_arm's

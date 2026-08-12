@@ -260,6 +260,9 @@ KANI_VERSION := 0.67.0
 # witnesses gate. FAIL-CLOSED on wording drift: it demands exactly one such
 # line per inventory harness, so a prover that stops printing them (or a
 # harness that carries no cover) fails rather than silently ungating.
+# 0.67's line shape, which the awk's field positions assume:
+#   " ** N of M cover properties satisfied"  ($2 = N satisfied, $4 = M total)
+# — re-derive both from a live run when KANI_VERSION moves.
 prove: ## Run the Kani proof harnesses (needs kani; see Cargo.toml MSRV note)
 	@command -v cargo-kani >/dev/null 2>&1 || { echo "cargo-kani not found — run: cargo install --locked kani-verifier --version $(KANI_VERSION) && cargo kani setup"; exit 1; }
 	@v=$$(cargo kani --version 2>/dev/null | grep -m1 '^cargo-kani '); \
