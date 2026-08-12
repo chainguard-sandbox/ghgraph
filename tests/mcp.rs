@@ -218,6 +218,21 @@ fn handshake_lists_the_seven_verbs() {
             !text.contains("strict") && !text.contains("fail_if_any"),
             "gate flags are exit-code plumbing and stay off the MCP surface"
         );
+        // Annotations are honest per verb: sync alone touches the network
+        // and writes; the six reads are local and read-only.
+        let network = tool["name"] == "sync";
+        assert_eq!(
+            tool["annotations"]["readOnlyHint"],
+            json!(!network),
+            "{}: readOnlyHint",
+            tool["name"]
+        );
+        assert_eq!(
+            tool["annotations"]["openWorldHint"],
+            json!(network),
+            "{}: openWorldHint",
+            tool["name"]
+        );
     }
 }
 

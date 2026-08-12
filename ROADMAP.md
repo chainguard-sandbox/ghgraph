@@ -160,10 +160,31 @@ to the deferred list below with its deciding evidence.
 
 ## Deferred, with the evidence that decides each
 
-- The feature-gated resident MCP binary — from measured spawn latency in
-  real sessions: it lands only if per-call spawn overhead dominates, with
-  the long-lived-reader/WAL-checkpoint interaction as a named design
-  input at that point.
+- The feature-gated resident MCP binary — the evidence so far says no.
+  Measured (2026-08, Apple M4 Pro, 118 MB working archive): the
+  spawn+open floor is ~7 ms, the wrapper adds nothing observable over the
+  direct CLI, and the slow verbs are query work a resident would not
+  reduce (search ~36 ms is FTS hydration, stats ~2.8 s is the audit
+  sweep; SQLite answers the raw queries in under 1 ms either way). Reopen
+  only if a real session shows the spawn floor dominating — order tens of
+  calls per second sustained. Two preconditions if it ever lands: it must
+  not hold a read connection across a sync (a long-lived reader is
+  exactly the WAL-snapshot holder db.rs's truncate-at-close names as its
+  defeat), and it needs a crash-containment answer that does not reopen
+  the catch_unwind rejection (mcp.rs records the process boundary as the
+  only containment the crate's rules permit).
+- MCP structuredContent/outputSchema on tool results — the documents are
+  already structured JSON delivered as text, and a declared output schema
+  is a second encoding of the `schema_version: 1` contract that can drift
+  from it. Adopt only when a real target client measurably parses or
+  routes better with it; the text block stays regardless, so adoption is
+  purely additive.
+- MCP progress notifications for sync — the spec's answer to client tool
+  timeouts on long calls, but emitting them means parsing the child's
+  stderr heartbeat, which is deliberately non-contract on both surfaces.
+  Adopt only when a real client that honors progress-based timeout
+  renewal is observed timing out a sync wanted over MCP; until then a
+  cold sync belongs in an operator shell (mcp.rs records the posture).
 - Batched `nodes(ids:)` hydration — from the overhead-intercept median over
   trailing `sync_runs` rows: batch only if spawn overhead dominates, and
   only after the quarantine exists, or the failure unit becomes the batch.

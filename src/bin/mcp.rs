@@ -1,18 +1,27 @@
 #![forbid(unsafe_code)]
 //! ghgraph-mcp: the MCP server, as an external per-call wrapper that spawns
-//! the `ghgraph` CLI (DESIGN.md, command surface). One tool per verb, seven
-//! tools total — the 1:1 mapping is the constraint that keeps the CLI and
-//! the MCP server ONE surface with one contract. The wrapper implements the
-//! protocol and NOTHING of ghgraph: no verb logic, no archive access, no
-//! JSON reshaping of verb output — a tool result carries the CLI's stdout
-//! document byte-for-byte (modulo the contract's two enumerated timing
-//! fields, exactly what the one-surface test masks), so every CLI
-//! invariant (one JSON document, typed envelopes, determinism, in-band
-//! `_meta` freshness) is inherited by construction rather than
-//! re-implemented. The resident in-process form is
-//! deferred until measured spawn latency from real sessions says otherwise
-//! (DESIGN.md; the long-lived-reader/WAL-checkpoint interaction is a named
-//! design input at that point).
+//! the `ghgraph` CLI (DESIGN.md, command surface). The process boundary is
+//! the decision, and crash isolation is the reason: under forbid(unsafe)
+//! and the standing catch_unwind rejection, a panic is containable only by
+//! a process — here it is one child exiting nonzero with an empty stdout,
+//! mapped to an INTERNAL envelope, and the session survives. The runner-up
+//! was in-process per-call (the verbs are lib functions, so it too costs
+//! zero new dependencies): it matches this shape on statelessness, config
+//! freshness, and WAL safety, loses only the containment, and reopens only
+//! if the catch_unwind rejection ever does. A resident reader loses more —
+//! it is exactly the long-lived snapshot holder db.rs's WAL truncate names
+//! as its defeat — and measured spawn latency pays for neither (ROADMAP,
+//! deferred, carries the numbers).
+//!
+//! One tool per verb, seven tools total — the 1:1 mapping is the
+//! constraint that keeps the CLI and the MCP server ONE surface with one
+//! contract. The wrapper implements the protocol and NOTHING of ghgraph:
+//! no verb logic, no archive access, no JSON reshaping of verb output — a
+//! tool result carries the CLI's stdout document byte-for-byte (modulo the
+//! contract's two enumerated timing fields, exactly what the one-surface
+//! test masks), so every CLI invariant (one JSON document, typed
+//! envelopes, determinism, in-band `_meta` freshness) is inherited by
+//! construction rather than re-implemented.
 //!
 //! Transport: MCP over stdio — newline-delimited JSON-RPC 2.0, one message
 //! per line, responses in one `write` under a lock (tool calls run on
@@ -21,7 +30,11 @@
 //! serializing here would forfeit that for nothing). stdout carries ONLY
 //! protocol frames; children inherit stderr, so verb progress ("ghgraph: "
 //! lines) flows to the wrapper's stderr exactly as it does in a shell —
-//! stderr stays non-contract on both surfaces.
+//! stderr stays non-contract on both surfaces. That routing sets the sync
+//! posture: a COLD sync (minutes-to-hours, progress invisible to a client,
+//! client tool timeouts short) belongs in an operator shell; the MCP-shaped
+//! freshness path is the sync tool's `pr` argument — one bounded hydration,
+//! now.
 //!
 //! Exit-code mapping, decided here: exit 0 → the document as text content;
 //! nonzero with a document on stdout → the same text with `isError: true`
@@ -30,6 +43,11 @@
 //! failed", the envelope says who can fix it); nonzero with EMPTY stdout
 //! (a killed or crashed child) → a synthesized INTERNAL envelope, matching
 //! the CLI's own doctrine that empty-stdout-nonzero reads as INTERNAL.
+//! Precondition, load-bearing under wrapper↔CLI version skew (two binaries
+//! from one install can drift apart across an upgrade): main.rs intercepts
+//! every clap refusal into a USER_INPUT envelope ON STDOUT, which is what
+//! makes a skewed flag surface as the client's honest USER_INPUT — if that
+//! interception regressed, skew would read as INTERNAL instead.
 //!
 //! Gate flags (`--strict`, `--fail-if-any`) are deliberately NOT exposed as
 //! tool arguments: they exist to change a shell exit code, MCP has no exit
@@ -274,6 +292,13 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
 // ---------------------------------------------------------------------------
 // The tool table: one entry per verb, schema mirroring the CLI flags it
 // exposes. Kept as data so tools/list and the call dispatcher cannot drift.
+//
+// Tools only — MCP resources were considered and REJECTED for the reads:
+// they fit a read-mostly archive on paper, but a resource read is not a
+// CLI verb invocation (exposing one forks the one-surface contract), and
+// resources are model-passive by design where this consumer is an agent
+// driving parameterized calls — a shape real clients also under-support
+// next to tools. Revisit if client resource support reaches parity.
 
 /// Validated tool arguments, keyed by argument name.
 type Args = BTreeMap<String, Value>;
@@ -291,6 +316,16 @@ struct Tool {
     description: &'static str,
     schema: fn() -> Value,
     argv: ArgvBuilder,
+    /// Spec tool annotations — hints for client scheduling and approval
+    /// UX (absent hints read as worst-case), never enforcement: the
+    /// read-only guarantee lives at the connection (read-only open, one
+    /// prepared statement), not in this JSON.
+    annotations: fn() -> Value,
+}
+
+/// The six read verbs' annotations: local, no mutation.
+fn read_annotations() -> Value {
+    json!({ "readOnlyHint": true, "openWorldHint": false })
 }
 
 fn tools_table() -> &'static [Tool] {
@@ -318,6 +353,7 @@ fn tools_table() -> &'static [Tool] {
                 push_uint(&mut v, args, "limit")?;
                 Ok(v)
             },
+            annotations: read_annotations,
         },
         Tool {
             name: "pr",
@@ -357,6 +393,7 @@ fn tools_table() -> &'static [Tool] {
                 v.push(reference);
                 Ok(v)
             },
+            annotations: read_annotations,
         },
         Tool {
             name: "prs",
@@ -384,6 +421,7 @@ fn tools_table() -> &'static [Tool] {
                 push_uint(&mut v, args, "limit")?;
                 Ok(v)
             },
+            annotations: read_annotations,
         },
         Tool {
             name: "query",
@@ -408,6 +446,7 @@ fn tools_table() -> &'static [Tool] {
                 v.push(req_string(args, "sql")?);
                 Ok(v)
             },
+            annotations: read_annotations,
         },
         Tool {
             name: "search",
@@ -431,6 +470,7 @@ fn tools_table() -> &'static [Tool] {
                 v.push(req_string(args, "query")?);
                 Ok(v)
             },
+            annotations: read_annotations,
         },
         Tool {
             name: "stats",
@@ -441,15 +481,18 @@ fn tools_table() -> &'static [Tool] {
             // Unknown keys are already refused upstream against the empty
             // schema (call()), so the builder has nothing to check.
             argv: |_| Ok(vec![]),
+            annotations: read_annotations,
         },
         Tool {
             name: "sync",
             description: "Fetch configured repos into the archive via the gh CLI \
-                          (network; can run minutes-to-hours on a cold start; a \
-                          concurrent sync returns a TRANSIENT already-running \
-                          envelope). pr=\"owner/name#123\" hydrates one PR now — \
-                          the read-time freshness path; full=true ignores \
-                          watermarks and refetches the lookback window.",
+                          (network; a concurrent sync returns a TRANSIENT \
+                          already-running envelope). A COLD start runs \
+                          minutes-to-hours and belongs in an operator shell, \
+                          where progress is visible — here, an incremental \
+                          sync is quick and pr=\"owner/name#123\" hydrates one \
+                          PR now, the read-time freshness path; full=true \
+                          ignores watermarks and refetches the lookback window.",
             schema: || {
                 obj_schema(
                     json!({
@@ -468,6 +511,18 @@ fn tools_table() -> &'static [Tool] {
                 push_string(&mut v, args, "pr")?;
                 Ok(v)
             },
+            // Writes, but honestly: upserts and soft deletes only, never
+            // destruction (destructiveHint false), and an unchanged resync
+            // writes nothing — fixture-replay proven — so retries are safe
+            // (idempotentHint true). openWorld: the network, via gh.
+            annotations: || {
+                json!({
+                    "readOnlyHint": false,
+                    "destructiveHint": false,
+                    "idempotentHint": true,
+                    "openWorldHint": true,
+                })
+            },
         },
     ]
 }
@@ -481,6 +536,7 @@ fn tools() -> Vec<Value> {
                 "name": t.name,
                 "description": t.description,
                 "inputSchema": (t.schema)(),
+                "annotations": (t.annotations)(),
             })
         })
         .collect()
