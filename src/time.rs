@@ -339,6 +339,31 @@ fn format_epoch(epoch: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
+// No proof harnesses in this module, by measurement rather than by choice
+// (the proof tier lives in db.rs and sync.rs — `make prove`). Both natural
+// theorems here defeat the pinned prover (Kani 0.67): any harness that
+// constructs an Rfc3339Utc pays format_epoch's core::fmt machinery
+// (minutes-to-timeout vs milliseconds for the same theorem over integers),
+// and the civil algorithms' chained symbolic 64-bit divisions blow up the
+// SAT instance even for totality alone (measured: no close in 10 CPU-min;
+// with the days_from_civil inverse, 25). What carries those claims
+// instead: the exhaustive civil test below (bijection + monotonicity,
+// total over every representable date), the 86,400-case seconds-of-day
+// test (parse's time factor), and the epoch_arith fuzz target (full-i64
+// sampling with overflow checks live). Re-measure if a Kani release ships
+// a stronger solver path; the two measured shapes were: (a) symbolic i64
+// through from_epoch, asserting rejection-exactness plus the canonical
+// form's width and charset; (b) days = secs.div_euclid(86_400) through
+// civil_from_days, asserting field ranges, ± days_from_civil as inverse.
+
+/// The representable epoch band: [`Rfc3339Utc::from_epoch`] accepts exactly
+/// this range (years 0001..=9999). Shared with sync.rs's split_mid proof
+/// harness so the band it assumes is the band the type enforces — the edge
+/// tests below pin the correspondence, so a widened calendar range cannot
+/// silently leave the proof sweeping the old band.
+pub(crate) const MIN_EPOCH: i64 = -719_162 * 86_400;
+pub(crate) const MAX_EPOCH: i64 = 2_932_896 * 86_400 + 86_399;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,10 +555,14 @@ mod tests {
         //     schema's ORDER BY on timestamp columns depends on (declared at the
         //     top of this module, and what makes Eq/Ord-by-instant consistent
         //     with the string). Witnessed here, not just argued in prose.
-        // This is the algebraic core the epoch<->string round-trip rests on, and
-        // what a Kani proof would establish; Kani can't run here yet (its
-        // toolchain predates our 1.95 MSRV), so exhaustion stands in. Runs in
-        // well under a couple seconds (the monotonicity check formats each date).
+        // This is the algebraic core the epoch<->string round-trip rests on —
+        // and where the bijection claim deliberately STAYS now that Kani runs
+        // (the MSRV holds at its toolchain; Cargo.toml note): the civil
+        // algorithms defeat the pinned prover by measurement (the module
+        // comment above the tests carries the numbers), so exhaustion
+        // carries the bijection over every representable date. Runs in
+        // well under a couple seconds (the monotonicity check formats
+        // each date).
         let mut prev = i64::MIN;
         let mut prev_str: Option<String> = None;
         for year in 1..=9999i64 {
@@ -570,6 +599,26 @@ mod tests {
         }
         assert_eq!(days_from_civil(1, 1, 1), -719_162);
         assert_eq!(days_from_civil(9999, 12, 31), 2_932_896);
+    }
+
+    #[test]
+    fn epoch_band_constants_match_from_epoch_exactly() {
+        // The proof-shared band (MIN_EPOCH/MAX_EPOCH above) and from_epoch's
+        // acceptance set must be the same set: both edges accepted, both
+        // neighbors refused. If the calendar range ever widens, this fails
+        // before the split_mid proof can silently under-sweep.
+        assert!(Rfc3339Utc::from_epoch(MIN_EPOCH).is_some(), "min edge");
+        assert!(Rfc3339Utc::from_epoch(MAX_EPOCH).is_some(), "max edge");
+        assert!(Rfc3339Utc::from_epoch(MIN_EPOCH - 1).is_none(), "below min");
+        assert!(Rfc3339Utc::from_epoch(MAX_EPOCH + 1).is_none(), "above max");
+        assert_eq!(
+            Rfc3339Utc::from_epoch(MIN_EPOCH).unwrap().as_str(),
+            "0001-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            Rfc3339Utc::from_epoch(MAX_EPOCH).unwrap().as_str(),
+            "9999-12-31T23:59:59Z"
+        );
     }
 
     #[test]

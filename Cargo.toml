@@ -21,6 +21,12 @@ repository = "https://github.com/chainguard-sandbox/ghgraph"
 keywords = ["github", "cli", "sqlite", "pull-requests"]
 categories = ["command-line-utilities", "development-tools"]
 
+# cargo-kani injects --cfg=kani when it builds the crate; everything under
+# #[cfg(kani)] is dead to every other toolchain. Declared so `make lint`'s
+# -D warnings does not trip on the unknown cfg.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 # `harness` gates the Serialize derives on the parse types (src/parse.rs):
 # only the fuzz workspace enables it, so shipped builds cannot serialize
 # API-derived data even by accident — the claim is a compile error, not prose.

@@ -15,9 +15,9 @@
 # floor lives in Cargo.toml (rust-version), and catching a new stable's
 # breakage in CI is the point, not a hazard.
 #
-# Deployment dependency, not expressible here: both jobs must be listed
-# as required status checks in branch protection, or a red supply-chain
-# job cannot block a merge. The jobs are parallel on purpose (no needs:).
+# Deployment dependency, not expressible here: all three jobs must be
+# listed as required status checks in branch protection, or a red job
+# cannot block a merge. The jobs are parallel on purpose (no needs:).
 
 name: ci
 
@@ -47,6 +47,13 @@ jobs:
         run: rustup update --no-self-update stable && rustup default stable
       - name: fmt + clippy + check + test (the make check gate)
         run: make check
+      - name: MSRV floor (rust-version = 1.93; the Cargo.toml note)
+        # Stable 1.93, not kani's nightly: the nightly ACCEPTS feature-gated
+        # code the declared floor rejects, so stable is the stricter oracle.
+        # --all-targets closes the cfg(test) gap the prove build never sees.
+        run: |
+          rustup toolchain install --no-self-update 1.93
+          cargo +1.93 check --all-targets
 
   supply-chain:
     name: supply-chain
@@ -70,3 +77,39 @@ jobs:
         run: cargo vet --locked
       - name: dependency-graph diff against the committed snapshot
         run: make tree-check
+
+  prove:
+    name: prove
+    # Kani publishes a prebuilt x86_64-linux bundle; `cargo kani setup`
+    # fetches it plus its own pinned nightly — the toolchain Cargo.toml's
+    # rust-version holds the crate under. No cache action, per the decision
+    # above. prove-kill runs here deliberately: the ephemeral checkout is
+    # where its apply/revert cycle is structurally harmless, and killer
+    # patches bitrot only detectably by being run.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: install kani (version-pinned, locked)
+        # 0.67.0 matches KANI_VERSION in the Makefile — bump together, by diff.
+        run: |
+          cargo install --locked kani-verifier --version 0.67.0
+          cargo kani setup
+      - name: inventories agree (harnesses and killers vs source)
+        run: make prove-check
+      - name: run the proof harnesses (pinned prover, exact count, covers gated)
+        run: make prove
+      - name: every proof goes red under its killer patch
+        run: make prove-kill
+      - name: newer Kani release probe (warning only)
+        # The raise condition in the Cargo.toml note fired late once before
+        # (the unblock came from rusqlite, not Kani) — this step makes the
+        # Kani side self-announcing without turning unrelated PRs red.
+        continue-on-error: true
+        run: |
+          latest=$(curl -sf https://api.github.com/repos/model-checking/kani/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)
+          if [ -n "$latest" ] && [ "$latest" != "kani-0.67.0" ]; then
+            echo "::warning title=Kani released $latest::check its bundled toolchain — if >= 1.95, raise rust-version and KANI_VERSION together (Cargo.toml MSRV note)"
+            exit 1
+          fi

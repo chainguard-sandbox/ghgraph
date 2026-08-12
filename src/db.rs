@@ -413,6 +413,118 @@ fn sticky_swap_exempt(mode: u32, owner_uid: u32) -> bool {
     mode & 0o1000 != 0 && owner_uid == 0
 }
 
+/// Proof harnesses (`make prove`; they exist only under `cargo kani`).
+/// Discipline per DESIGN.md Verification: each harness has a killer patch
+/// under proofs/killers/ (applied by `make prove-kill`, which asserts the
+/// proof goes RED) and `kani::cover!` witnesses against an assume-stack or
+/// bound quietly emptying the swept domain. Kani 0.67 itself treats an
+/// UNSATISFIABLE cover as informational — it does not fail the run — so
+/// the `prove` recipe greps the output and fails on any unsatisfied cover;
+/// the witness gates through the Makefile, not the prover.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// The frame property the quadrant and sweep tests sample at 2^17
+    /// points, closed over all 2^64 inputs: no mode bit but the sticky bit
+    /// and no uid but 0 influence the verdict. Deliberately NOT specified
+    /// by restating the implementation's expression (a mirrored oracle is
+    /// a change-detector, not a spec): two frame asserts plus three point
+    /// anchors DERIVE the full truth table — any (mode, uid) reduces by
+    /// the frames to one of the anchored points.
+    #[kani::proof]
+    fn sticky_swap_exempt_frame_over_all_inputs() {
+        let mode: u32 = kani::any();
+        let uid: u32 = kani::any();
+        kani::cover!(mode & 0o1000 != 0 && uid == 0, "exempt quadrant reachable");
+        kani::cover!(mode & 0o1000 == 0, "non-sticky reachable");
+        // Mode frame: no bit outside the sticky bit influences the verdict.
+        let noise: u32 = kani::any();
+        assert_eq!(
+            sticky_swap_exempt(mode, uid),
+            sticky_swap_exempt(mode ^ (noise & !0o1000), uid),
+            "a bit other than sticky moved the verdict"
+        );
+        // Uid frame: all nonzero uids are one equivalence class.
+        let other_uid: u32 = kani::any();
+        if uid != 0 && other_uid != 0 {
+            assert_eq!(
+                sticky_swap_exempt(mode, uid),
+                sticky_swap_exempt(mode, other_uid),
+                "two nonzero uids diverged — root is the only special owner"
+            );
+        }
+        // Point anchors: with the frames, these three decide every input.
+        assert!(sticky_swap_exempt(0o1000, 0), "sticky root-owned is exempt");
+        assert!(!sticky_swap_exempt(0, 0), "root-owned alone is not");
+        assert!(!sticky_swap_exempt(0o1000, 501), "sticky alone is not");
+    }
+
+    /// The two wrong_version ledger entries as theorems (version_arm's
+    /// mutation note: `<`/`>` have equivalent `<=`/`>=` mutants because
+    /// their boundary values are unreachable). No test may check this —
+    /// the `>` boundary's discriminating input violates the debug_assert_ne
+    /// precondition, the `<` boundary's is consumed by an earlier arm — so
+    /// this is the one place the claim can be discharged. What discharges
+    /// it is the biconditional spec below (under which both mutants
+    /// provably preserve behavior); the two trailing identity asserts
+    /// restate the ledger's arithmetic argument as checked marginalia. The
+    /// judgment is pure (no format!, no allocation), so the sweep over
+    /// every admissible i64 solves in seconds; wrong_version's rendering
+    /// of each arm stays on the unit-test rung.
+    #[kani::proof]
+    fn version_arm_selection_and_boundaries() {
+        let v: i64 = kani::any();
+        // The callers' guard, assumed exactly as wrong_version's
+        // debug_assert_ne states it. Every other i64 flows through.
+        kani::assume(v != SCHEMA_VERSION);
+        // All five arms are inside the swept domain (an assume-stack that
+        // emptied one would pass silently without these).
+        kani::cover!(v == 0, "empty-archive arm reachable");
+        kani::cover!(v < 0, "negative-sentinel arm reachable");
+        kani::cover!(v > SCHEMA_VERSION, "newer-archive arm reachable");
+        kani::cover!(v == 3, "additive-migrate arm reachable");
+        kani::cover!(v > 0 && v < 3, "pre-release arm reachable");
+        // Arm selection as five order-independent biconditionals — the
+        // spec stated without the if-chain's ordering shortcuts, so a
+        // reordering or widened comparison cannot satisfy this by
+        // mirroring the implementation.
+        let arm = version_arm(v);
+        assert_eq!(arm == VersionArm::Empty, v == 0, "Empty ⟺ v == 0");
+        assert_eq!(
+            arm == VersionArm::NegativeSentinel,
+            v < 0,
+            "Negative ⟺ v < 0"
+        );
+        assert_eq!(
+            arm == VersionArm::Newer,
+            v > SCHEMA_VERSION,
+            "Newer ⟺ v > current"
+        );
+        assert_eq!(
+            arm == VersionArm::AdditiveBehind,
+            v == 3,
+            "Additive ⟺ v == 3"
+        );
+        assert_eq!(
+            arm == VersionArm::PreRelease,
+            v == 1 || v == 2,
+            "PreRelease ⟺ v ∈ {1, 2} — the catch-all must not leak"
+        );
+        // The ledger identities, valid on exactly the domain the arms
+        // carve: v == 0 is consumed before the `< 0` comparison, and
+        // v == SCHEMA_VERSION is excluded by the precondition.
+        if v != 0 {
+            assert_eq!(v < 0, v <= 0, "the < boundary is consumed by the v==0 arm");
+        }
+        assert_eq!(
+            v > SCHEMA_VERSION,
+            v >= SCHEMA_VERSION,
+            "the > boundary is excluded by the precondition"
+        );
+    }
+}
+
 fn refuse_writable_parent(dir: &Path) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     // A bare-filename db_path ("ghgraph.db") has parent Some("") — that is
@@ -581,6 +693,55 @@ fn migrate(conn: &mut Connection, path: &Path) -> Result<()> {
 /// `migrate` (its refusal arms) so the two never drift. `migrate` consumes
 /// v == 0 and v == 3 by applying the schema, so those messages are reached
 /// only from `open_ro`.
+/// The wrong-version judgment, extracted pure (the sticky_swap_exempt
+/// pattern): arm selection over the full i64 domain is proof-checkable
+/// (kani_proofs::version_arm_selection_and_boundaries) while the message
+/// rendering stays on the unit-test rung. Arm ORDER is semantics and is
+/// preserved from the original if-chain: 0 is consumed before the `< 0`
+/// comparison, `>` before the pre-release catch-all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VersionArm {
+    /// v == 0: an empty or foreign file, never a ghgraph version.
+    Empty,
+    /// v < 0: SQLite stores any i64; a negative user_version is not a
+    /// version this (or any) ghgraph ever wrote — a corrupt or foreign
+    /// sentinel, said as such rather than "no migration path" (which
+    /// would imply a real intermediate version).
+    NegativeSentinel,
+    /// v > SCHEMA_VERSION: a newer ghgraph wrote this archive.
+    Newer,
+    /// v == 3: additively migratable — but only the write path migrates,
+    /// so open_ro's remedy is one sync, not a rebuild.
+    AdditiveBehind,
+    /// 0 < v < 3: a shape-changing pre-release schema, not migrated by
+    /// policy (see SCHEMA_VERSION) — the archive is a disposable cache.
+    PreRelease,
+}
+
+fn version_arm(v: i64) -> VersionArm {
+    // Mutation note: the < and > below have equivalent mutants (<= / >=)
+    // whose boundary values are unreachable — v == 0 is consumed by the
+    // arm above, and v == SCHEMA_VERSION never reaches this judgment
+    // (wrong_version's debug_assert_ne is the callers' guard as a
+    // mechanism). Formerly documented per the triage rule as untestable;
+    // now DISCHARGED by proof: version_arm_selection_and_boundaries pins
+    // the full arm spec over every admissible i64, under which both
+    // mutants provably preserve behavior. The mutants stay MISSED on the
+    // test rung — the ledger entries stand; the proof verifies them
+    // equivalent rather than killing them.
+    if v == 0 {
+        VersionArm::Empty
+    } else if v < 0 {
+        VersionArm::NegativeSentinel
+    } else if v > SCHEMA_VERSION {
+        VersionArm::Newer
+    } else if v == 3 {
+        VersionArm::AdditiveBehind
+    } else {
+        VersionArm::PreRelease
+    }
+}
+
 fn wrong_version(path: &Path, v: i64) -> Error {
     // The `>` arm's `>=` mutant is equivalent only while every caller
     // consumes v == SCHEMA_VERSION before calling here; this assert is
@@ -590,34 +751,23 @@ fn wrong_version(path: &Path, v: i64) -> Error {
         v, SCHEMA_VERSION,
         "wrong_version called on the current version"
     );
-    // Mutation note: the < and > below have equivalent mutants (<= / >=):
-    // their boundary values are unreachable — v == 0 is consumed by the arm
-    // above, and v == SCHEMA_VERSION never reaches this function (open_ro
-    // calls it only on a version mismatch; migrate's arms consume the rest).
-    // Documented per the triage rule rather than chased with a test that
-    // could only assert the unreachable.
-    let detail = if v == 0 {
-        "empty or not a ghgraph archive — run `ghgraph sync` first".to_string()
-    } else if v < 0 {
-        // SQLite stores any i64; a negative user_version is not a version this
-        // (or any) ghgraph ever wrote — a corrupt or foreign sentinel. Say so,
-        // rather than "no migration path", which implies a real intermediate
-        // version. This arm must come before the > / catch-all below.
-        "a negative sentinel — the archive is corrupt or not a ghgraph archive".to_string()
-    } else if v > SCHEMA_VERSION {
-        format!("newer than this ghgraph (v{SCHEMA_VERSION}); upgrade ghgraph")
-    } else if v == 3 {
-        // Reached only from open_ro: the read path cannot write, but the
-        // write path migrates v3 additively (see `migrate`), so the remedy
-        // is one sync, not a rebuild.
-        "one additive version behind — run `ghgraph sync` once to migrate".to_string()
-    } else {
-        // 0 < v < 3: a shape-changing pre-release schema. Not migrated,
-        // by policy (SCHEMA_VERSION) — the archive is a disposable cache.
-        format!(
+    let detail = match version_arm(v) {
+        VersionArm::Empty => {
+            "empty or not a ghgraph archive — run `ghgraph sync` first".to_string()
+        }
+        VersionArm::NegativeSentinel => {
+            "a negative sentinel — the archive is corrupt or not a ghgraph archive".to_string()
+        }
+        VersionArm::Newer => {
+            format!("newer than this ghgraph (v{SCHEMA_VERSION}); upgrade ghgraph")
+        }
+        VersionArm::AdditiveBehind => {
+            "one additive version behind — run `ghgraph sync` once to migrate".to_string()
+        }
+        VersionArm::PreRelease => format!(
             "a pre-release schema this ghgraph (v{SCHEMA_VERSION}) does not migrate — \
              the archive is a disposable cache; remove it and resync"
-        )
+        ),
     };
     Error::config(format!(
         "archive {} is at schema version {v}: {detail}",

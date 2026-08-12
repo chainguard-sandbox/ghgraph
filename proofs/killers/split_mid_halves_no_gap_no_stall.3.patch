@@ -1,0 +1,13 @@
+diff --git a/src/sync.rs b/src/sync.rs
+index 942c8b1f..3de0a2de 100644
+--- a/src/sync.rs
++++ b/src/sync.rs
+@@ -2043,7 +2043,7 @@ fn split_mid(since: i64, end: i64) -> Option<i64> {
+     // the ledger entry stands on the test rung. The proof nonetheless pins
+     // the shipped guard exactly — its refusal arm goes red under this
+     // mutant — so guard drift is proof-visible even though test-green.)
+-    if width < MIN_WINDOW_SECS {
++    if width < MIN_WINDOW_SECS + 1 {
+         return None;
+     }
+     Some(since + width / 2)
