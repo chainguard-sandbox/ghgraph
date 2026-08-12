@@ -25,6 +25,13 @@ timeout_multiplier = 2.0
 # emit's BrokenPipe guard flipped to `true`: no portable harness constructs
 # a non-EPIPE stdout write failure, so the flip is equivalent in practice —
 # argued at src/main.rs::emit, confirmed surviving by a live run.
+#
+# serve's InvalidData guard flipped to `true`: the same shape one surface
+# over — no portable harness constructs a non-InvalidData stdin READ
+# failure (EIO on the wrapper's own stdin), so the flip is equivalent in
+# practice — argued at src/bin/mcp.rs::serve, confirmed surviving by a
+# live run.
 exclude_re = [
     'replace match guard e\.kind\(\) == std::io::ErrorKind::BrokenPipe with true in emit',
+    'replace match guard e\.kind\(\) == std::io::ErrorKind::InvalidData with true in serve',
 ]
