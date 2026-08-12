@@ -151,14 +151,19 @@ reads.
 
 ## 6 — MCP
 
-In order: contract-honesty fixes (1), freeze (3), then an external per-call
-CLI-spawning wrapper as v0 — zero new dependencies, every CLI invariant
-inherited. The feature-gated resident binary lands only on measured spawn
-latency from real sessions, with the long-lived-reader/WAL-checkpoint
-interaction as a named design input at that point.
+In order: contract-honesty fixes (1), freeze (3), then the external
+per-call CLI-spawning wrapper as v0 — zero new dependencies, every CLI
+invariant inherited. Built: `ghgraph-mcp` (src/bin/mcp.rs), the wrapper's
+protocol decisions recorded in its module docs and the one-surface
+invariant proven by test against the live CLI. The resident binary moved
+to the deferred list below with its deciding evidence.
 
 ## Deferred, with the evidence that decides each
 
+- The feature-gated resident MCP binary — from measured spawn latency in
+  real sessions: it lands only if per-call spawn overhead dominates, with
+  the long-lived-reader/WAL-checkpoint interaction as a named design
+  input at that point.
 - Batched `nodes(ids:)` hydration — from the overhead-intercept median over
   trailing `sync_runs` rows: batch only if spawn overhead dominates, and
   only after the quarantine exists, or the failure unit becomes the batch.

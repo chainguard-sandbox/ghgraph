@@ -191,7 +191,10 @@ fn handshake_lists_the_seven_verbs() {
     );
     assert!(status.success(), "EOF is a clean exit");
     let init = &resp["1"]["result"];
-    assert_eq!(init["protocolVersion"], "2025-06-18", "echoes the request");
+    assert_eq!(
+        init["protocolVersion"], "2025-06-18",
+        "answers the supported revision"
+    );
     assert_eq!(init["serverInfo"]["name"], "ghgraph-mcp");
     let tools: Vec<&str> = resp["2"]["result"]["tools"]
         .as_array()
@@ -401,17 +404,25 @@ fn protocol_edges_answer_by_the_book() {
 }
 
 #[test]
-fn initialize_version_negotiation_never_promises_the_future() {
+fn initialize_answers_only_the_supported_version() {
+    // The spec's negotiation rule: the server answers the requested
+    // version when it supports it, otherwise a version it DOES support,
+    // and the client decides whether to proceed. This server implements
+    // exactly one revision, so every request draws that one — echoing an
+    // older or garbage request would assert support nobody implemented.
     let s = Scratch::new();
     seed(&s);
     for (requested, expect) in [
-        // Older published revision: echoed, so a conservative client is
-        // not false-refused.
-        ("2024-11-05", "2024-11-05"),
-        // A revision that postdates this code: answered with our own —
-        // echoing it would claim support nobody verified.
+        // The supported revision: answered with itself (the MUST-echo
+        // half of the rule).
+        ("2025-06-18", "2025-06-18"),
+        // An older published revision: answered with ours; the client
+        // owns the proceed-or-disconnect decision.
+        ("2024-11-05", "2025-06-18"),
+        // A revision that postdates this code: ours — echoing it would
+        // claim support nobody verified.
         ("2099-01-01", "2025-06-18"),
-        // Garbage: our own.
+        // Garbage: ours.
         ("banana", "2025-06-18"),
     ] {
         let (resp, _) = drive(

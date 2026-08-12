@@ -61,7 +61,8 @@ mechanisms and two proofs where the design wants one.
 The MCP server (`ghgraph-mcp`, src/bin/mcp.rs) is an external per-call
 wrapper spawning the CLI — zero new dependencies, every CLI invariant
 inherited by construction: a tool result carries the verb's stdout document
-byte-for-byte, proven by test against the live CLI. The wrapper owns only
+byte-for-byte modulo the contract's enumerated timing fields, proven by
+test against the live CLI. The wrapper owns only
 protocol decisions, recorded in its module docs (exit-code→isError mapping,
 gate flags off the tool surface, argv injection-proofing). A feature-gated
 resident binary lands only on measured spawn latency, never before.

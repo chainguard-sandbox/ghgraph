@@ -5,9 +5,11 @@
 //! the MCP server ONE surface with one contract. The wrapper implements the
 //! protocol and NOTHING of ghgraph: no verb logic, no archive access, no
 //! JSON reshaping of verb output — a tool result carries the CLI's stdout
-//! document byte-for-byte, so every CLI invariant (one JSON document, typed
-//! envelopes, determinism, in-band `_meta` freshness) is inherited by
-//! construction rather than re-implemented. The resident in-process form is
+//! document byte-for-byte (modulo the contract's two enumerated timing
+//! fields, exactly what the one-surface test masks), so every CLI
+//! invariant (one JSON document, typed envelopes, determinism, in-band
+//! `_meta` freshness) is inherited by construction rather than
+//! re-implemented. The resident in-process form is
 //! deferred until measured spawn latency from real sessions says otherwise
 //! (DESIGN.md; the long-lived-reader/WAL-checkpoint interaction is a named
 //! design input at that point).
@@ -42,11 +44,17 @@
 //!
 //! Accepted trades for a LOCAL, single-client transport, recorded: per-call
 //! concurrency is uncapped (N pipelined calls = N threads and N children —
-//! the client end of a stdio pipe is one process pacing itself), stdin
-//! lines buffer unbounded (the client is the operator's own agent, not a
-//! network peer), and EOF shutdown waits on in-flight children without a
-//! deadline (a hung child would be ghgraph's own bug; killing it here
-//! would trade a visible hang for a hidden one).
+//! the client end of a stdio pipe is one process pacing itself; the join
+//! ledger grows one handle per CALL for the session's lifetime, cumulative
+//! rather than concurrent, a few dozen bytes each), stdin lines buffer
+//! unbounded (the client is the operator's own agent, not a network peer),
+//! and EOF shutdown waits on in-flight children without a deadline (a hung
+//! child would be ghgraph's own bug; killing it here would trade a visible
+//! hang for a hidden one). The no-deadline wait leans on a precondition
+//! ghgraph itself provides: it bounds every gh interaction (gh.rs,
+//! DRAIN_GRACE) and then exits, closing its stdout even when a gh-spawned
+//! credential helper lingers holding gh's pipe — so a wait here ends when
+//! ghgraph ends, not when the slowest grandchild does.
 //!
 //! Untrusted input is data, here too: tool arguments become argv VALUES,
 //! never argv grammar — flag-shaped values cannot become flags because
@@ -65,12 +73,13 @@ use std::sync::{Arc, Mutex};
 use clap::Parser;
 use serde_json::{Value, json};
 
-/// The protocol revision this wrapper was written against. On initialize
-/// the requested revision is echoed back when it is a plausible version
-/// string: everything this server uses (initialize / tools/list /
-/// tools/call, newline-delimited stdio) is stable across published
-/// revisions, so refusing an older client over the number alone would be
-/// a false refusal. Revisit if a used surface ever diverges by revision.
+/// The protocol revision this wrapper implements — the only member of its
+/// supported set, so initialize always answers it (the handler records the
+/// negotiation rule). Everything this server uses (initialize / tools/list
+/// / tools/call, newline-delimited stdio) is stable across published
+/// revisions, so older clients interoperate in practice — but whether to
+/// proceed on a version mismatch is the client's decision under the spec,
+/// not a support claim this server may assert on its behalf.
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 #[derive(Parser)]
@@ -183,23 +192,23 @@ fn serve(server: Server) {
             // notifications/cancelled deliberately so (module docs).
             (_, None) => {}
             ("initialize", Some(id)) => {
-                // Echo the requested revision only when it does not
-                // POSTDATE this code (date-form versions compare
-                // lexicographically): claiming support for a future
-                // revision would be a promise nobody checked. Older
-                // published revisions are fine — everything this server
-                // uses is stable across them (PROTOCOL_VERSION docs).
-                let requested = msg
-                    .pointer("/params/protocolVersion")
-                    .and_then(Value::as_str)
-                    .filter(|v| v.starts_with("20") && *v <= PROTOCOL_VERSION)
-                    .unwrap_or(PROTOCOL_VERSION);
+                // Version negotiation, by the spec's rule: answer the
+                // requested revision when the server supports it,
+                // otherwise a revision the server DOES support — and the
+                // client decides whether to proceed. The supported set
+                // here has size one, so the answer is constant. Echoing
+                // an unsupported request (an older revision, or garbage)
+                // was tried and rejected: it asserts support nobody
+                // implemented, and interop with older clients — real,
+                // since every surface this server uses is stable across
+                // published revisions — is the client's call to make,
+                // not ours (PROTOCOL_VERSION docs).
                 respond(
                     &stdout,
                     &rpc_result(
                         id,
                         json!({
-                            "protocolVersion": requested,
+                            "protocolVersion": PROTOCOL_VERSION,
                             "capabilities": { "tools": { "listChanged": false } },
                             "serverInfo": {
                                 "name": "ghgraph-mcp",
@@ -272,8 +281,11 @@ type Args = BTreeMap<String, Value>;
 /// error naming the offending argument.
 type ArgvBuilder = fn(&Args) -> Result<Vec<String>, String>;
 
-/// One verb's tool entry. The builder validates against the same table the
-/// schema is generated from, so the two cannot drift.
+/// One verb's tool entry. Sharing the table ties tools/list to dispatch by
+/// construction; the schema↔builder KEY agreement it cannot tie (two
+/// independent fn fields relate by convention), so the table test below
+/// pins it: every declared property is read by its builder, every
+/// `required` key enforced by it.
 struct Tool {
     name: &'static str,
     description: &'static str,
@@ -594,11 +606,10 @@ fn call(server: &Server, params: &Value) -> Result<Value, String> {
     let output = match cmd.output() {
         Ok(o) => o,
         // Spawn failures split by actor: a missing or unrunnable binary is
-        // CONFIGURATION with the install remedy; anything else (an argv
-        // the OS refuses — e.g. an argument list past ARG_MAX) traces to
-        // the CALL's inputs, and blaming the binary path would launder a
-        // client's oversized argument into a reinstall chase — the blanket-
-        // From rule, one code over.
+        // CONFIGURATION with the install remedy; an argv the OS refuses
+        // (past ARG_MAX) traces to the CALL's inputs, and blaming the
+        // binary path would launder a client's oversized argument into a
+        // reinstall chase — the blanket-From rule, one code over.
         Err(e)
             if matches!(
                 e.kind(),
@@ -615,10 +626,32 @@ fn call(server: &Server, params: &Value) -> Result<Value, String> {
                 true,
             ));
         }
-        Err(e) => {
+        Err(e) if e.kind() == std::io::ErrorKind::ArgumentListTooLong => {
             return Ok(tool_result(
                 &json!({ "error": { "code": "USER_INPUT", "message": format!(
                     "cannot spawn ghgraph with these arguments: {e}"
+                )}})
+                .to_string(),
+                true,
+            ));
+        }
+        // The residue is resource pressure in every population a review
+        // could name — EMFILE/ENFILE/ENOMEM/EAGAIN, the failure mode of
+        // the accepted uncapped-concurrency trade (module docs) — and it
+        // clears as in-flight calls drain: TRANSIENT, the retry actor.
+        // Calling it USER_INPUT (as this arm once did) blamed the one
+        // party who cannot fix it. Untestable by construction: no
+        // portable harness constructs a spawn failure that is neither
+        // NotFound/PermissionDenied nor E2BIG (ENOEXEC does not qualify —
+        // posix_spawn launches the child, which dies at exec, landing in
+        // the empty-stdout INTERNAL path below); the ArgumentListTooLong
+        // guard's widening mutant survives on that argument, ledgered in
+        // .cargo/mutants.toml.
+        Err(e) => {
+            return Ok(tool_result(
+                &json!({ "error": { "code": "TRANSIENT", "message": format!(
+                    "cannot spawn ghgraph: {e} — likely resource pressure from \
+                     concurrent calls; retry after in-flight calls finish"
                 )}})
                 .to_string(),
                 true,
@@ -663,4 +696,92 @@ fn tool_result(text: &str, is_error: bool) -> Value {
         "content": [ { "type": "text", "text": text } ],
         "isError": is_error,
     })
+}
+
+#[cfg(test)]
+mod table {
+    use super::*;
+
+    /// One representative value per schema type. The string doubles as a
+    /// qualified PR reference so it passes `pr`'s bare-number gate — the
+    /// one builder that inspects a value beyond its type.
+    fn sample(spec: &Value) -> Value {
+        match spec["type"].as_str().expect("every property is typed") {
+            "string" => json!("octo/alpha#1"),
+            "integer" => json!(1),
+            "boolean" => json!(true),
+            other => panic!("unhandled schema type {other} — extend sample()"),
+        }
+    }
+
+    /// The schema↔builder agreement the Tool comment claims, made a
+    /// mechanism: a declared property no builder reads would be a silently
+    /// ignored argument (it passes the unknown-key gate, then vanishes),
+    /// and an unenforced `required` key would surface as a confusing CLI
+    /// error blamed on the wrong actor. Both directions, per tool.
+    #[test]
+    fn every_schema_key_is_read_and_every_required_key_enforced() {
+        for tool in tools_table() {
+            let schema = (tool.schema)();
+            let props = schema["properties"]
+                .as_object()
+                .expect("object schema")
+                .clone();
+            let required: Vec<&str> = schema["required"]
+                .as_array()
+                .expect("required is a list")
+                .iter()
+                .map(|k| k.as_str().unwrap())
+                .collect();
+            for key in &required {
+                assert!(
+                    props.contains_key(*key),
+                    "{}: required key {key} is not a declared property",
+                    tool.name
+                );
+            }
+            let base: Args = props
+                .iter()
+                .filter(|(k, _)| required.contains(&k.as_str()))
+                .map(|(k, spec)| (k.clone(), sample(spec)))
+                .collect();
+            for (key, spec) in &props {
+                let mut with = base.clone();
+                with.insert(key.clone(), sample(spec));
+                let argv_with = (tool.argv)(&with)
+                    .unwrap_or_else(|e| panic!("{}: {key} sample refused: {e}", tool.name));
+                let mut without = with.clone();
+                without.remove(key);
+                match (tool.argv)(&without) {
+                    // Optional key: its presence must change the argv, or
+                    // the builder never read it.
+                    Ok(argv_without) => assert_ne!(
+                        argv_with, argv_without,
+                        "{}: declared property {key} is never read by the builder",
+                        tool.name
+                    ),
+                    // Refusing the removal is enforcement — and only a
+                    // key the schema marks required may be enforced.
+                    Err(msg) => assert!(
+                        required.contains(&key.as_str()),
+                        "{}: builder demands {key} but the schema does not: {msg}",
+                        tool.name
+                    ),
+                }
+            }
+            for key in &required {
+                let mut without = base.clone();
+                without.remove(*key);
+                let err = (tool.argv)(&without).expect_err(&format!(
+                    "{}: required key {key} is not enforced by the builder",
+                    tool.name
+                ));
+                assert!(
+                    err.contains(key),
+                    "{}: the {key} refusal does not name the argument: {err}",
+                    tool.name
+                );
+            }
+        }
+    }
 }
