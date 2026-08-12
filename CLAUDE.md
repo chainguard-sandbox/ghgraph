@@ -60,5 +60,6 @@ Windows port, a CLI command with no MCP counterpart (human setup or config
 scaffolding is a flag or a Makefile target, not a verb), and a fifth
 verification instrument without a property that needs it — proptest, Miri,
 Loom, unbounded provers, a chrono oracle (per-instrument arguments in
-DESIGN.md Verification; Kani is deferred there, not rejected). Each was
-argued down in DESIGN.md; meet the argument, not the absence.
+DESIGN.md Verification; Kani is adopted there — `make prove`, pure integer
+judgments only). Each was argued down in DESIGN.md; meet the argument, not
+the absence.

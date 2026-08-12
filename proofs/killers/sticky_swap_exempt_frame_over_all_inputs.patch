@@ -1,0 +1,13 @@
+diff --git a/src/db.rs b/src/db.rs
+index 84c977ad..82a77666 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -410,7 +410,7 @@ fn ensure_dir_0700(dir: &Path) -> Result<()> {
+ /// fixture for "root-owned writable non-sticky" cannot be built
+ /// unprivileged, but the judgment can be pinned without it.
+ fn sticky_swap_exempt(mode: u32, owner_uid: u32) -> bool {
+-    mode & 0o1000 != 0 && owner_uid == 0
++    mode & 0o3000 != 0 && owner_uid == 0
+ }
+ 
+ /// Proof harnesses (`make prove`; they exist only under `cargo kani`).

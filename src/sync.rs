@@ -2015,25 +2015,99 @@ enum Hydrated {
 /// overlap free, exactly like the deliberate 10-minute watermark overlap —
 /// and no ±1/×1 mutant of a midpoint can produce a GAP, which is the only
 /// wrong direction. Only the halving itself (progress toward the floor)
-/// is load-bearing, and a non-halving mutant times out against the
-/// recursion.
+/// is load-bearing, and halving is proof-checked directly — the
+/// balancedness assert in split_mid's harness — rather than left to time
+/// out against the recursion.
 fn split_point(since: &Rfc3339Utc, until: Option<&Rfc3339Utc>) -> Option<Rfc3339Utc> {
     let end = match until {
         Some(u) => u.clone(),
         None => Rfc3339Utc::now(),
     };
+    split_mid(since.epoch(), end.epoch()).and_then(Rfc3339Utc::from_epoch)
+}
+
+/// The split judgment over epochs, extracted pure (the sticky_swap_exempt
+/// pattern) so the safety argument above is proof-checked over the whole
+/// representable band (kani_proofs::split_mid_halves_no_gap_no_stall)
+/// without paying format_epoch's fmt machinery for a symbolic Rfc3339Utc.
+fn split_mid(since: i64, end: i64) -> Option<i64> {
     // The subtraction cannot overflow: representable epochs are bounded by
-    // the year 1..=9999 domain (|epoch| < 2^38 — time.rs's range guard), a
-    // precondition this arithmetic inherits from the Rfc3339Utc type.
-    let width = end.epoch() - since.epoch();
+    // the year 1..=9999 domain (|epoch| < 2^38 — time.rs's MIN/MAX_EPOCH,
+    // whose correspondence with from_epoch is pinned by test), a
+    // precondition this arithmetic inherits from the Rfc3339Utc callers.
+    let width = end - since;
     // (The guard's own `<` → `<=` mutant declines to split at EXACTLY the
     // minimum width, whose halves are the degenerate 1s windows the
     // constant exists to rule out — declining there is inside the argued
-    // behavior: no gap either way, only a disclosed cap.)
+    // BEHAVIORAL envelope (no gap either way, only a disclosed cap), so
+    // the ledger entry stands on the test rung. The proof nonetheless pins
+    // the shipped guard exactly — its refusal arm goes red under this
+    // mutant — so guard drift is proof-visible even though test-green.)
     if width < MIN_WINDOW_SECS {
         return None;
     }
-    Rfc3339Utc::from_epoch(since.epoch() + width / 2)
+    Some(since + width / 2)
+}
+
+/// Proof harnesses (`make prove`) for the window theorem the notes above
+/// argue in prose: no midpoint mutant can gap, and halving — the walk's
+/// ~22-level depth bound — actually halves. Scope is the pure epoch
+/// judgment — split_point's wrapper (clock read, Rfc3339Utc construction)
+/// and incremental_since (String-parsing edges; its `>` boundary identity
+/// is value-trivial once seen over epochs) stay on the test rungs: any
+/// harness constructing an Rfc3339Utc pays format_epoch's fmt machinery,
+/// solver-intractable under Kani 0.67 (measured — time.rs's no-harness
+/// note carries the numbers). Killer patches under proofs/killers/;
+/// `make prove-kill` asserts each turns its proof red.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    use crate::time::{MAX_EPOCH, MIN_EPOCH};
+
+    /// ∀ (since, end) in the representable band (time.rs's MIN/MAX_EPOCH —
+    /// the precondition split_mid inherits from its Rfc3339Utc callers,
+    /// assumed here exactly as the type enforces it and pinned to
+    /// from_epoch by epoch_band_constants_match_from_epoch_exactly): a
+    /// split lands strictly between its edges with BALANCED halves —
+    /// |left − right| ≤ 1, the independent characterization of "midpoint"
+    /// that yields walk_window's logarithmic depth (strict betweenness
+    /// alone would admit a since+1 stall: progress, but O(width) depth) —
+    /// no gap is arithmetically possible, and refusal happens exactly
+    /// below MIN_WINDOW_SECS. Overflow along every path is checked by
+    /// kani's unconditional -C overflow-checks=on.
+    #[kani::proof]
+    fn split_mid_halves_no_gap_no_stall() {
+        let since: i64 = kani::any();
+        let end: i64 = kani::any();
+        kani::assume((MIN_EPOCH..=MAX_EPOCH).contains(&since));
+        kani::assume((MIN_EPOCH..=MAX_EPOCH).contains(&end));
+        match split_mid(since, end) {
+            None => {
+                kani::cover!(true, "refusal arm reachable");
+                assert!(end - since < MIN_WINDOW_SECS, "refused a splittable window");
+            }
+            Some(mid) => {
+                kani::cover!(mid - since > 1, "wide-window splits are swept too");
+                assert!(
+                    end - since >= MIN_WINDOW_SECS,
+                    "split a window the guard should have refused"
+                );
+                assert!(since < mid, "left half must strictly narrow");
+                assert!(
+                    mid < end,
+                    "right half must strictly narrow — a gap or a stall"
+                );
+                assert!(
+                    (mid - since).abs_diff(end - mid) <= 1,
+                    "halves must balance — this is what makes the walk's depth logarithmic"
+                );
+                assert!(
+                    (MIN_EPOCH..=MAX_EPOCH).contains(&mid),
+                    "the midpoint must stay representable (from_epoch cannot refuse it)"
+                );
+            }
+        }
+    }
 }
 
 fn quarantine_record(id: &str, stream: Stream, attempts: u32, class: &str) -> QuarantineRecord {

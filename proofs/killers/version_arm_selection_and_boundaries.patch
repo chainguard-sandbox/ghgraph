@@ -1,0 +1,13 @@
+diff --git a/src/db.rs b/src/db.rs
+index 84c977ad..7a924bfd 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -729,7 +729,7 @@ fn version_arm(v: i64) -> VersionArm {
+     // mutants provably preserve behavior. The mutants stay MISSED on the
+     // test rung — the ledger entries stand; the proof verifies them
+     // equivalent rather than killing them.
+-    if v == 0 {
++    if v == 1 {
+         VersionArm::Empty
+     } else if v < 0 {
+         VersionArm::NegativeSentinel

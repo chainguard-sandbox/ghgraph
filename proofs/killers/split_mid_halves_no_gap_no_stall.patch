@@ -1,0 +1,13 @@
+diff --git a/src/sync.rs b/src/sync.rs
+index 942c8b1f..585ceee4 100644
+--- a/src/sync.rs
++++ b/src/sync.rs
+@@ -2046,7 +2046,7 @@ fn split_mid(since: i64, end: i64) -> Option<i64> {
+     if width < MIN_WINDOW_SECS {
+         return None;
+     }
+-    Some(since + width / 2)
++    Some(since + 1)
+ }
+ 
+ /// Proof harnesses (`make prove`) for the window theorem the notes above

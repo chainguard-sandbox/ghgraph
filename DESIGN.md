@@ -38,9 +38,12 @@ TLS, or async crates: network transport is the `gh` CLI as a subprocess,
 which owns auth, SSO, and TLS. `gh` is a documented runtime prerequisite.
 `unsafe` is forbidden crate-wide. No time crate: timestamps are strict
 RFC 3339 UTC "Z" strings, validated at ingest by ~40 lines of std. The MSRV
-is 1.95, set by the dependency tree: rusqlite and libsqlite3-sys use std's
-`cfg_select!` (stable since 1.95). Our own code needs only 1.89
-(`std::fs::File::try_lock`, the sync run lock); the deps dominate.
+is 1.93, set by the prover: Kani's pinned toolchain compiles the whole
+crate for `make prove`, and our declared rust-version must not exceed it
+(the Cargo.toml note carries the mechanics and the raise condition). Our
+own code needs only 1.89 (`std::fs::File::try_lock`, the sync run lock);
+the deps float free of the floor since rusqlite 0.40.2 polyfilled away its
+brief `cfg_select!` (stable 1.95) dependence.
 
 The gh coupling is a seam, not a marriage: `gh::graphql()` is the entire
 transport surface, nothing else knows gh exists, and every semantic signal
@@ -367,13 +370,26 @@ here is bounded or finite, so a research toolchain buys nothing over
 enumeration); a chrono differential oracle for the RFC 3339 parser (its
 deliberate acceptances — offsets, lowercase markers, leap seconds — force
 the harness to restate our spec as filters, after which the reference
-contributes nothing). Bounded model checking (Kani) is the standing
-exception, deferred not rejected: adopted when its pinned toolchain clears
-our MSRV, scoped to properties whose domain is 2^64 or whose discriminating
-input a precondition forbids any test to construct (the wrong_version
-boundaries, from_epoch totality), and a harness lands only with a green
-pinned run in the same change, each carrying a killer patch and cover
-witnesses — a proof no toolchain runs is prose with a checkmark.
+contributes nothing). Bounded model checking (Kani) is ADOPTED — `make
+prove`, version-pinned; Cargo.toml's rust-version holds the crate under
+the prover's toolchain and records the raise condition — scoped to pure
+integer judgments whose SAT instances close in seconds and whose domains
+sit beyond enumeration's reach: 2^64 inputs (the sticky-exemption frame,
+the version_arm sweep), a discriminating input no test may construct (the
+version_arm boundaries), or a band squared (the split judgment). The
+scope boundary is measured, not guessed: a harness that constructs a
+String pays core::fmt (minutes-to-timeout vs milliseconds for the same
+theorem over integers), and the civil-date algorithms' chained symbolic
+division defeats the solver even for totality — those claims stay on the
+enumeration and fuzz rungs that already hold them (time.rs records the
+numbers). Every harness lands with a green pinned run in the same change
+and carries a killer patch and cover witnesses — enforced, not asked:
+prove-check ties inventory to source AND killers to inventory, prove
+fails on any unsatisfied cover (Kani itself treats those as
+informational), and prove-kill accepts nothing but a verification
+failure naming the harness. A proof no toolchain runs is prose with a
+checkmark, and a green proof is trusted only after its killer turns it
+red.
 
 Telemetry follows one rule: every measured field names the decision it
 feeds or the regression it detects, and a field with no consumer is deleted

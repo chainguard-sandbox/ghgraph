@@ -1,7 +1,7 @@
 # Makefile for ghgraph
 # Self-documenting: run `make` or `make help` to see available targets.
 
-.PHONY: help doctor config build release run test check-heavy fuzz fuzz-all fuzz-replay fuzz-cmin fuzz-targets-check dict dict-check mutants mutants-diff mutants-extreme mutants-equiv fmt lint check check-full audit vet tree tree-check clean install setup
+.PHONY: help doctor config build release run test check-heavy fuzz fuzz-all fuzz-replay fuzz-cmin fuzz-targets-check dict dict-check mutants mutants-diff mutants-extreme mutants-equiv prove prove-check prove-kill fmt lint check check-full audit vet tree tree-check clean install setup
 
 BINARY_NAME := ghgraph
 
@@ -207,14 +207,17 @@ mutants-extreme: ## Pseudo-tested-code sweep: function-replacement mutants only 
 # test now discriminates it — the db.rs reverse-selects hook did exactly
 # this): delete the entry and its code note, and record the killing test
 # there instead. MORE missed means a new survivor appeared inside the same
-# function — triage it. Counts, not names, because mutant names embed
+# function — triage it. A PROOF may discharge an entry's argument while
+# the mutant still survives the suite (this gate counts test-missed only):
+# the entry stays, and its code note points at the proof — the version_arm
+# boundaries are the standing example. Counts, not names, because mutant names embed
 # line numbers that drift. Entries mirror .cargo/mutants.toml exclude_re
 # plus the documented-at-code survivors.
 MUTANTS_EQUIV := \
 	'replace match guard e.kind\(\) == std::io::ErrorKind::BrokenPipe with true in emit|1' \
 	'replace - with \+ in overhead_intercept_ms|2' \
-	'replace < with <= in wrong_version|1' \
-	'replace > with >= in wrong_version|1' \
+	'replace < with <= in version_arm|1' \
+	'replace > with >= in version_arm|1' \
 	'replace \| with . in open_rw|3' \
 	'replace \| with \^ in open_ro$$|1' \
 	'replace \| with \^ in open_ro_audit|1' \
@@ -223,7 +226,7 @@ MUTANTS_EQUIV := \
 	'replace configure_conn -> Result<\(\)> with Ok\(\(\)\)|1' \
 	'replace - with / in cap$$|1' \
 	'replace > with >= in incremental_since|1' \
-	'replace < with <= in split_point|1' \
+	'replace < with <= in split_mid|1' \
 	'replace match guard !has_prev with true in refresh_one|1' \
 	'replace \+= with \*= in refresh_one|1' \
 	'replace match guard Some\(&c\) != cursor.as_ref\(\) with false in refresh_one|1'
@@ -237,6 +240,74 @@ mutants-equiv: ## Verify the argued-equivalent mutants still survive, exactly (d
 		got=$$(wc -l < mutants.out/missed.txt | tr -d ' '); \
 		[ "$$got" -eq "$$want" ] || { echo "equiv ledger drift for $$re: expected $$want missed, got $$got — a stale note (fewer) or a new survivor (more)"; exit 1; }; \
 		echo "as argued ($$got missed): $$re"; \
+	done
+
+# ---- proofs ---------------------------------------------------------------
+# The pin is the proof's compiler — a proof under a different prover is a
+# different claim. 0.67.0 exactly: its bundled nightly (2025-11-21, rustc
+# 1.93) is what Cargo.toml's rust-version holds the crate under; bump the
+# two together (KANI_VERSION here, rust-version there) when a Kani release
+# ships a >= 1.95 toolchain (the Cargo.toml note points back here).
+KANI_VERSION := 0.67.0
+
+# Streams progress to stderr (the first run compiles bundled SQLite under
+# the kani toolchain — minutes; silence would look like a hang) while a
+# tee'd copy carries the gates: the exact green count from
+# proofs/inventory.txt, zero failures, and the cover witnesses — Kani 0.67
+# treats an UNSATISFIABLE kani::cover! as informational, so an assume-stack
+# that empties a swept domain leaves the run green; the awk over the
+# per-harness "N of N cover properties satisfied" lines is what makes the
+# witnesses gate. FAIL-CLOSED on wording drift: it demands exactly one such
+# line per inventory harness, so a prover that stops printing them (or a
+# harness that carries no cover) fails rather than silently ungating.
+# 0.67's line shape, which the awk's field positions assume:
+#   " ** N of M cover properties satisfied"  ($2 = N satisfied, $4 = M total)
+# — re-derive both from a live run when KANI_VERSION moves.
+prove: ## Run the Kani proof harnesses (needs kani; see Cargo.toml MSRV note)
+	@command -v cargo-kani >/dev/null 2>&1 || { echo "cargo-kani not found — run: cargo install --locked kani-verifier --version $(KANI_VERSION) && cargo kani setup"; exit 1; }
+	@v=$$(cargo kani --version 2>/dev/null | grep -m1 '^cargo-kani '); \
+	[ "$$v" = "cargo-kani $(KANI_VERSION)" ] || { echo "'$$v' found, $(KANI_VERSION) pinned — a proof under a different prover is a different claim"; exit 1; }
+	@t=$$(mktemp); cargo kani 2>&1 | tee "$$t" >&2; \
+	want=$$(wc -l < proofs/inventory.txt | tr -d ' '); \
+	grep -q "Complete - $$want successfully verified harnesses, 0 failures, $$want total." "$$t" \
+		|| { rm -f "$$t"; echo "expected exactly $$want green harnesses (proofs/inventory.txt) — a harness vanished or failed"; exit 1; }; \
+	awk -v want="$$want" '/ of [0-9]+ cover properties satisfied/ { n++; if ($$2 != $$4) bad = 1 } END { exit (bad || n != want) }' "$$t" \
+		|| { rm -f "$$t"; echo "cover witnesses unsatisfied or missing — an emptied swept domain (vacuous proof), or a harness with no cover, or the pinned prover reworded its summary"; exit 1; }; \
+	rm -f "$$t"; echo "✓ $$want proofs verified, all cover witnesses satisfied"
+
+# The committed inventory, the #[kani::proof] fns in source, and the killer
+# patches must all agree, or a harness passes by absence — the
+# fuzz-targets-check shape, twice. Shape assumption for the source grep:
+# the attribute sits directly above the fn, at most one line between.
+prove-check: ## Fail if proofs/inventory.txt, the source harnesses, or the killers disagree
+	@grep -rh -A2 '#\[kani::proof\]' src --include='*.rs' | grep -o 'fn [a-z0-9_]*' | sed 's/^fn //' | LC_ALL=C sort | diff -u proofs/inventory.txt - \
+		|| { echo "proof inventory drifted — committed (-) vs source (+); update proofs/inventory.txt and review"; exit 1; }
+	@for p in proofs/killers/*.patch; do basename "$$p" .patch; done | sed 's/\.[0-9]*$$//' | LC_ALL=C sort -u | diff -u proofs/inventory.txt - \
+		|| { echo "killer set drifted — every proof in the inventory needs at least one killer patch (<harness>.patch, extras as <harness>.N.patch)"; exit 1; }
+
+# Kill-verification for proofs, the analog of the suite's hand-applied
+# mutations: a green proof is trusted only after its killer patch turns it
+# red. Each proofs/killers/<harness>[.N].patch introduces a bug its harness
+# claims to exclude. Only a kani "VERIFICATION:- FAILED" that NAMES the
+# harness counts as a kill — a missing prover, a stale harness name, or a
+# non-compiling patch all fail the gate instead of green-lighting it. The
+# clean-tree guard plus the INT/TERM trap keep a planted bug from surviving
+# an interrupt into the working tree.
+prove-kill: ## Assert every proof goes red under its killer patch (proofs/killers/)
+	@command -v cargo-kani >/dev/null 2>&1 || { echo "cargo-kani not found — run: cargo install --locked kani-verifier --version $(KANI_VERSION) && cargo kani setup"; exit 1; }
+	@v=$$(cargo kani --version 2>/dev/null | grep -m1 '^cargo-kani '); \
+	[ "$$v" = "cargo-kani $(KANI_VERSION)" ] || { echo "'$$v' found, $(KANI_VERSION) pinned — a kill under a different prover is a different claim"; exit 1; }
+	@git diff --quiet -- src/ || { echo "src/ is dirty — prove-kill applies and reverts patches in place; commit or stash first"; exit 1; }
+	@for p in proofs/killers/*.patch; do \
+		h=$$(basename "$$p" .patch | sed 's/\.[0-9]*$$//'); \
+		git apply "$$p" || { echo "killer patch no longer applies: $$p — regenerate it against current source"; exit 1; }; \
+		trap 'git apply -R "'"$$p"'" 2>/dev/null; echo "interrupted — killer reverted" >&2' INT TERM; \
+		out=$$(cargo kani --harness "$$h" 2>&1); \
+		git apply -R "$$p" || { echo "could not revert $$p — inspect the tree"; exit 1; }; \
+		trap - INT TERM; \
+		printf '%s\n' "$$out" | grep -q "Verification failed for - .*::$$h\$$" \
+			|| { printf '%s\n' "$$out" | tail -8; echo "KILLER FAILED TO KILL: $$p — the named proof did not go red under its bug"; exit 1; }; \
+		echo "✓ killed and restored: $$p"; \
 	done
 
 check: ## Fast pre-commit gate: format, clippy, check, test
@@ -272,7 +343,7 @@ fuzz-targets-check: ## Fail if fuzz_targets/*.rs and fuzz/Cargo.toml [[bin]] dis
 	echo "✓ $$(grep -c . $$s) fuzz targets — sources and manifest agree"; \
 	rm -f $$s $$b
 
-check-full: check audit vet tree-check fuzz-targets-check dict-check ## check, plus the supply-chain checks CI runs
+check-full: check audit vet tree-check fuzz-targets-check dict-check prove-check ## check, plus the supply-chain and inventory checks CI runs
 
 #
 # Supply chain (dependency policy — see DESIGN.md; all four run in CI)
