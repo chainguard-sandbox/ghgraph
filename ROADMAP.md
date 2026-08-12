@@ -185,6 +185,16 @@ to the deferred list below with its deciding evidence.
   Adopt only when a real client that honors progress-based timeout
   renewal is observed timing out a sync wanted over MCP; until then a
   cold sync belongs in an operator shell (mcp.rs records the posture).
+- Output bounding for the agent consumer — measured (2026-08,
+  400-comment fixture): a default `pr` call returns ~787 KB (~197k
+  tokens) with no truncation marker, `attention`/`prs` have no default
+  limit, and nothing caps a PR's comment count. The bound is a
+  CLI-contract feature (an additive comment-cap flag, or defaulted
+  limits with disclosed elision — defaults live in the CLI, so the
+  wrapper cannot bound without forking the one surface's behavior).
+  Adopt when a real agent session blows a real client's ingestion cap
+  on a default read, sized by that evidence; today's real-archive reads
+  measure ~1-3 KB on every verb except a comment-heavy `pr`.
 - Batched `nodes(ids:)` hydration — from the overhead-intercept median over
   trailing `sync_runs` rows: batch only if spawn overhead dominates, and
   only after the quarantine exists, or the failure unit becomes the batch.

@@ -45,6 +45,11 @@ client at the binary:
     { "mcpServers": { "ghgraph": { "command": "ghgraph-mcp" } } }
 
 (`--ghgraph <path>` names the CLI if it is not adjacent or on PATH;
-`--config` passes a config file through to every call.)
+`--config` — or the `GHGRAPH_CONFIG` environment variable — passes a
+config file through to every call.) To smoke-test without a client:
+
+    printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n' | ghgraph-mcp
+
+prints one `serverInfo` frame and exits on EOF.
 
 License: Apache-2.0.

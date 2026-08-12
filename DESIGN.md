@@ -347,6 +347,18 @@ cannot write because the connection is opened read-only at the file layer
 and each invocation runs exactly one prepared statement — `query_only` is
 defense-in-depth, not the boundary.
 
+The trust model, stated whole: ghgraph trusts the operator's config, the
+archive file's modes, and the `gh` binary resolved from PATH — running gh
+IS trusted code execution, deliberately, since auth and transport are its
+job. It runs unsandboxed with the operator's privileges: it is a local
+tool, not a service, and the MCP client that spawns the wrapper was
+configured by the same operator. The residual risk is by design: archived
+GitHub text — anyone's words, in project scope — is delivered into model
+context through reads; the mechanisms above keep that text data (never
+SQL, argv, error prose, or judgments), and what a model does with hostile
+prose in a body field is the consumer's problem, disclosed here rather
+than pretended away.
+
 ## Verification
 
 Invariants land as mechanisms, not comments: a type that makes the violation

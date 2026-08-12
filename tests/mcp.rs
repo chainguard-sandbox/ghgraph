@@ -218,6 +218,20 @@ fn handshake_lists_the_seven_verbs() {
             !text.contains("strict") && !text.contains("fail_if_any"),
             "gate flags are exit-code plumbing and stay off the MCP surface"
         );
+        // The required arrays are frozen public API: adding a required
+        // parameter to a shipped tool breaks every existing caller, so a
+        // change here must be a deliberate contract decision, not drift.
+        let required = match tool["name"].as_str().unwrap() {
+            "pr" => json!(["reference"]),
+            "query" => json!(["sql"]),
+            "search" => json!(["query"]),
+            _ => json!([]),
+        };
+        assert_eq!(
+            tool["inputSchema"]["required"], required,
+            "{}: required set is frozen",
+            tool["name"]
+        );
         // Annotations are honest per verb: sync alone touches the network
         // and writes; the six reads are local and read-only.
         let network = tool["name"] == "sync";
@@ -384,6 +398,10 @@ fn protocol_edges_answer_by_the_book() {
             json!({"jsonrpc":"2.0","id":9}),
             call(10, "pr", json!({"reference": "1"})),
             call(11, "query", json!({"sql": "SELECT '\u{0}'"})),
+            json!({"jsonrpc":"1.0","id":12,"method":"ping"}),
+            json!({"id":13,"method":"ping"}),
+            json!({"jsonrpc":"2.0","id":null,"method":"tools/list"}),
+            json!({"jsonrpc":"2.0","id":"s7","method":"ping"}),
         ],
     );
     assert!(status.success());
@@ -415,6 +433,72 @@ fn protocol_edges_answer_by_the_book() {
         resp["11"]["error"]["code"], -32602,
         "a NUL cannot travel in argv and is named at the argument, not \
          blamed on the binary path"
+    );
+    assert_eq!(
+        resp["12"]["error"]["code"], -32600,
+        "jsonrpc \"1.0\" is an invalid request, not a serviced one"
+    );
+    assert_eq!(
+        resp["13"]["error"]["code"], -32600,
+        "a missing jsonrpc member is an invalid request"
+    );
+    assert_eq!(
+        resp["null"]["error"]["code"], -32600,
+        "a null id is an invalid request — not a notification, not a \
+         serviceable request (MCP forbids null ids)"
+    );
+    // The map key carries the quotes, so this asserts the id came back
+    // as a STRING — type-preserving echo, not a stringified number.
+    assert_eq!(
+        resp["\"s7\""]["result"],
+        json!({}),
+        "a string id round-trips as a string"
+    );
+}
+
+#[test]
+fn notifications_draw_zero_frames() {
+    // JSON-RPC forbids replying to a notification; the by-id map cannot
+    // see a spurious extra frame, so this test counts raw stdout lines:
+    // two requests in, exactly two frames out, notifications (known,
+    // cancellation, and future/unknown methods alike) contributing none.
+    let s = Scratch::new();
+    seed(&s);
+    let lines: Vec<Vec<u8>> = [
+        init_request(1),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0","method":"notifications/cancelled",
+               "params":{"requestId":99}}),
+        json!({"jsonrpc":"2.0","method":"notifications/future/thing"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
+    ]
+    .iter()
+    .map(|r| r.to_string().into_bytes())
+    .collect();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ghgraph-mcp"))
+        .arg("--ghgraph")
+        .arg(env!("CARGO_BIN_EXE_ghgraph"))
+        .arg("--config")
+        .arg(s.config_path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ghgraph-mcp");
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        for line in &lines {
+            stdin.write_all(line).unwrap();
+            stdin.write_all(b"\n").unwrap();
+        }
+    }
+    let out = child.wait_with_output().expect("collect ghgraph-mcp");
+    assert!(out.status.success());
+    let frames: Vec<&str> = std::str::from_utf8(&out.stdout).unwrap().lines().collect();
+    assert_eq!(
+        frames.len(),
+        2,
+        "two requests, two frames — notifications draw nothing: {frames:?}"
     );
 }
 

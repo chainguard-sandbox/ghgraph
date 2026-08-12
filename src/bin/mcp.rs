@@ -58,7 +58,11 @@
 //! notifications are ignored on the same doctrine the CLI records:
 //! cancellation is the absence of a handler — an MCP client that stops
 //! caring drops the session, stdin EOFs, and in-flight children finish
-//! against an archive whose writers are crash-safe anyway.
+//! against an archive whose writers are crash-safe anyway. There is no
+//! lifecycle gate either — requests arriving before initialize are
+//! served: the spec's pre-initialization SHOULDs bind the CLIENT, and a
+//! stateless dispatch has no session state to desync; revisit if a
+//! revision adds a server-side MUST.
 //!
 //! Accepted trades for a LOCAL, single-client transport, recorded: per-call
 //! concurrency is uncapped (N pipelined calls = N threads and N children —
@@ -189,21 +193,39 @@ fn serve(server: Server) {
                 continue;
             }
         };
-        // A request is an OBJECT with a string method: anything else that
-        // parsed as JSON (a bare string, an array — batching left the
-        // spec) is an invalid request, not a notification to swallow.
-        if !msg.is_object() || !msg["method"].is_string() {
+        // A request is an OBJECT carrying jsonrpc "2.0" and a string
+        // method: anything else that parsed as JSON (a bare string, an
+        // array — batching left the spec — a wrong or absent version) is
+        // an invalid request, not a notification to swallow.
+        if !msg.is_object() || msg["jsonrpc"] != "2.0" || !msg["method"].is_string() {
             respond(
                 &stdout,
                 &rpc_error(
                     msg.get("id").cloned().unwrap_or(Value::Null),
                     -32600,
-                    "invalid request: expected an object with a string method",
+                    "invalid request: expected an object with jsonrpc \"2.0\" and a \
+                     string method",
                 ),
             );
             continue;
         }
         let id = msg.get("id").cloned();
+        // MCP narrows JSON-RPC here: an id, when present, MUST NOT be
+        // null — a null id is an invalid request, not a notification (the
+        // absence of the member is what makes a notification) and not a
+        // request to service under a sentinel id.
+        if id == Some(Value::Null) {
+            respond(
+                &stdout,
+                &rpc_error(
+                    Value::Null,
+                    -32600,
+                    "invalid request: id must not be null (omit id to send a \
+                     notification)",
+                ),
+            );
+            continue;
+        }
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         match (method, id) {
             // Notifications (no id) are consumed without response;
@@ -237,7 +259,11 @@ fn serve(server: Server) {
                                  PRs, review threads, and issues synced via the gh CLI. Every \
                                  read carries in-band `_meta` freshness (age, stale, hint) — \
                                  advisory, reads never fail stale; run the sync tool when it \
-                                 says so. Results are deterministic JSON documents.",
+                                 says so. Coverage is the configured repos only: an empty \
+                                 result means not-in-archive, never nonexistent-on-GitHub. \
+                                 Start from attention (what needs the operator) or prs (the \
+                                 listing) and follow their references into pr. Results are \
+                                 deterministic JSON documents.",
                         }),
                     ),
                 );
@@ -357,11 +383,12 @@ fn tools_table() -> &'static [Tool] {
         },
         Tool {
             name: "pr",
-            description: "One PR with reviews (effective review state, per-review \
-                          freshness), threads, comments, refs, and linked issues. \
-                          Pass the qualified reference — owner/name#123 or the \
-                          GitHub URL (bare numbers are a CLI-cwd convenience that \
-                          does not exist here).",
+            description: "One PR from the archive, whole: reviews (effective review \
+                          state, per-review freshness), threads, comments, refs, \
+                          and linked issues. Pass the qualified reference — \
+                          owner/name#123 or the GitHub URL (bare numbers are a \
+                          CLI-cwd convenience that does not exist here); prs, \
+                          attention, and search results all carry it.",
             schema: || {
                 obj_schema(
                     json!({
@@ -399,7 +426,8 @@ fn tools_table() -> &'static [Tool] {
             name: "prs",
             description: "List PRs in the archive (open by default; all=true adds \
                           merged/closed/deleted). The matching total is always \
-                          disclosed — limits govern presentation, never derivation.",
+                          disclosed — limits govern presentation, never derivation. \
+                          For one PR's full detail, use the pr tool.",
             schema: || {
                 obj_schema(
                     json!({
@@ -408,7 +436,9 @@ fn tools_table() -> &'static [Tool] {
                             "description": "Only PRs authored by this login." },
                         "all": { "type": "boolean",
                             "description": "Include merged, closed, and upstream-deleted PRs." },
-                        "limit": { "type": "integer", "minimum": 0 },
+                        "limit": { "type": "integer", "minimum": 0,
+                            "description": "Cap returned rows; the matching total \
+                                            stays disclosed." },
                     }),
                     &[],
                 )
@@ -428,7 +458,9 @@ fn tools_table() -> &'static [Tool] {
             description: "One read-only SQL statement against the archive (SQLite; \
                           FTS5 available). One statement per call, no parameters — \
                           inline values. The schema is introspectable \
-                          (sqlite_master).",
+                          (sqlite_master). For plain text lookup, the search tool \
+                          is the shorter path; this one is for counts, joins, and \
+                          filters.",
             schema: || {
                 obj_schema(
                     json!({
@@ -450,9 +482,11 @@ fn tools_table() -> &'static [Tool] {
         },
         Tool {
             name: "search",
-            description: "Full-text search over PR/issue titles+bodies and comments \
-                          (FTS5 syntax: terms, quoted phrases, AND/OR/NOT). Results \
-                          group by PR/issue, recency-ordered.",
+            description: "Full-text search over archived PR/issue titles+bodies and \
+                          comments (FTS5 syntax: terms, quoted phrases, AND/OR/NOT). \
+                          Results group by PR/issue, recency-ordered. For \
+                          structural or aggregate questions, use the query tool \
+                          (SQL).",
             schema: || {
                 obj_schema(
                     json!({
