@@ -13,14 +13,14 @@ ghgraph v0.1.0
 │           ├── proc-macro2 v1.0.107 (*)
 │           ├── quote v1.0.47 (*)
 │           └── unicode-ident v1.0.24
-├── rusqlite v0.40.1
+├── rusqlite v0.40.2
 │   ├── bitflags v2.13.1
 │   ├── fallible-iterator v0.3.0
 │   ├── fallible-streaming-iterator v0.1.9
 │   ├── hashlink v0.12.1
 │   │   └── hashbrown v0.17.1
 │   │       └── foldhash v0.2.0
-│   ├── libsqlite3-sys v0.38.1
+│   ├── libsqlite3-sys v0.38.2
 │   ├── smallvec v1.15.2
 │   └── sqlite-wasm-rs v0.5.5
 │       ├── js-sys v0.3.103

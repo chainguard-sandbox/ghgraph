@@ -2,14 +2,19 @@
 name = "ghgraph"
 version = "0.1.0"
 edition = "2024"
-# MSRV 1.95: the dependency tree sets the floor, not our code. rusqlite 0.40 and
-# libsqlite3-sys 0.38 use std's cfg_select! macro (stable since 1.95.0), so
-# anything older fails to build (E0658). Verified by building + testing on
-# 1.95.0. Our own minimum is 1.89 (std::fs::File::try_lock, the sync run lock),
-# now subsumed. Pinning older deps to hold 1.89 was rejected — it forfeits
-# SQLite and security updates for a floor nothing enforces; if the MSRV must drop
-# later, that pin is the lever, and the run-lock fallback is a sidecar lock DB.
-rust-version = "1.95"
+# MSRV 1.93: the prover's toolchain sets the floor. Kani 0.67 (KANI_VERSION
+# in the Makefile — bump the two together) pins nightly-2025-11-21, a 1.93
+# nightly; the proofs compile this whole crate under it, and cargo refuses
+# any package whose DECLARED rust-version exceeds the toolchain — so ours
+# must not. The dependencies no longer constrain this: rusqlite 0.40.2 /
+# libsqlite3-sys 0.38.2 polyfilled away the std cfg_select! (stable 1.95,
+# rustc E0658 on older toolchains — the deps declare no rust-version of
+# their own) that briefly forced a 1.95 floor here. Our own std minimum is
+# 1.89 (std::fs::File::try_lock, the sync run lock), subsumed. When a Kani
+# release ships a ≥ 1.95 toolchain (watch model-checking/kani#4685), raise
+# this and KANI_VERSION in the same change. Verified by building + testing
+# under nightly-2025-11-21; CI pins a stable 1.93 check leg.
+rust-version = "1.93"
 license = "Apache-2.0"
 description = "Sync your GitHub work — pull requests, review threads, issues — into local SQLite; query it offline from the CLI, in JSON."
 repository = "https://github.com/chainguard-sandbox/ghgraph"
