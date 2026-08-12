@@ -185,6 +185,18 @@ to the deferred list below with its deciding evidence.
   Adopt only when a real client that honors progress-based timeout
   renewal is observed timing out a sync wanted over MCP; until then a
   cold sync belongs in an operator shell (mcp.rs records the posture).
+- The MCP "modern era" (spec revision 2026-07-28+) — it replaces the
+  initialize handshake with per-request `_meta` version declaration and
+  a `server/discover` capability probe; this server implements the
+  2025-06-18 handshake, which is what the operator's real client
+  negotiates today (probed 2026-08: Claude Code 2.1.172 carries exactly
+  2024-11-05/2025-03-26/2025-06-18 and no modern-era symbols). The
+  draft's own compatibility story keeps legacy servers working against
+  modern clients, though sources read it differently (silent bridge vs
+  actionable failure on the discover probe). Adopt only when a
+  modern-era client appears in real use against this server: observe
+  which compatibility path actually fires, then size the work from
+  that evidence.
 - Output bounding for the agent consumer — measured (2026-08,
   400-comment fixture): a default `pr` call returns ~787 KB (~197k
   tokens) with no truncation marker, `attention`/`prs` have no default
