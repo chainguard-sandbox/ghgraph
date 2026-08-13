@@ -31,7 +31,8 @@ stdout is always one JSON document. Progress goes to stderr. Errors are typed
 envelopes with exit code 2.
 
 Getting started: `make doctor` checks your prerequisites (the gh CLI, signed
-in, and the Rust toolchain), `make check` runs everything CI does, and
+in, and the Rust toolchain), `make install` puts `ghgraph` and `ghgraph-mcp`
+side by side in `~/.cargo/bin`, `make check` runs everything CI does, and
 `make help` lists the rest.
 
 Config: `~/.config/ghgraph/config.json` — see
