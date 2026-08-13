@@ -1596,8 +1596,9 @@ fn audits(conn: &Connection) -> Result<Value> {
     });
 
     // Watermark assertion: "watermark never leads data" is enforced at
-    // sync time by the fold over resolved outcomes (CLAUDE.md names the
-    // preconditions); what an audit can check after the fact is the
+    // sync time by the fold over resolved outcomes (DESIGN.md's Watermarks
+    // section names the preconditions); what an audit can check after the
+    // fact is the
     // DURABLE RESIDUE of that fold. `quarantine_unlicensed` = quarantine
     // rows whose (repo, stream) has no sync_state row — a resurfacing
     // record without the watermark whose advance it licensed.
