@@ -1880,3 +1880,99 @@ fn invalid_author_flag_is_user_input() {
     let err = s.run_err(&["prs", "--repo", "not-a-repo"]);
     assert_eq!(err["error"]["code"], json!("USER_INPUT"));
 }
+
+/// The own-PR restriction on requests, integration-seated: a declared
+/// team's request reaching the viewer on their OWN PR demands the rest of
+/// the team, not the viewer (attention.rs owns the argument; the oracle
+/// test pins it over the signal cube — this is the SQL-fed witness). The
+/// control is seed PR #1: the same declared team on someone else's PR
+/// still escalates, proving the exclusion fires on authorship, never on a
+/// failed team match.
+#[test]
+fn attention_team_request_on_own_pr_demands_the_team_not_the_viewer() {
+    let s = Scratch::new();
+    seed(&s);
+    {
+        let arch = db::open_rw(&s.db_path()).unwrap();
+        let c = arch.conn();
+        c.execute(
+            "INSERT INTO prs (pk, id, repo, number, title, state, is_draft, author, \
+                              created_at, updated_at, url) \
+             VALUES (16, 'PR_a16', 'octo/alpha', 16, 'Probe own-PR team request', 'OPEN', 0, \
+                     'me', '2026-01-02T00:00:00Z', '2026-01-05T00:00:00Z', 'u16')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO review_requests (pr, reviewer, kind) VALUES (16, 'platform', 'team')",
+            [],
+        )
+        .unwrap();
+    }
+    attention_config(&s, &["platform"]);
+    let doc = s.run_ok(&["attention"]);
+    let buckets = doc["attention"].as_array().unwrap();
+    let numbers = |name: &str| -> Vec<i64> {
+        buckets
+            .iter()
+            .find(|b| b["bucket"] == name)
+            .map(|b| {
+                b["prs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p["number"].as_i64().unwrap())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(
+        !numbers("waiting_on_me").contains(&16),
+        "a team request on the viewer's own PR is not the viewer's demand"
+    );
+    assert!(
+        numbers("waiting_on_me").contains(&1),
+        "control: the same declared team on someone else's PR still escalates"
+    );
+}
+
+/// `triage: false` is read-side: same archive, config-only flip, and the
+/// maintainer buckets go from present to ABSENT (absent, not empty — no
+/// sweep was performed, so an empty array would overclaim). Everything
+/// non-maintainer survives the flip untouched.
+#[test]
+fn attention_triage_off_drops_maintainer_buckets_read_side() {
+    let s = Scratch::new();
+    seed(&s);
+    let bucket_names = |doc: &serde_json::Value| -> Vec<String> {
+        doc["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["bucket"].as_str().unwrap().to_string())
+            .collect()
+    };
+    attention_config(&s, &[]);
+    let with = bucket_names(&s.run_ok(&["attention"]));
+    assert!(
+        with.contains(&"needs_reviewer".into()) && with.contains(&"untriaged".into()),
+        "control: project scope serves the maintainer buckets by default"
+    );
+    s.write_config(&json!({
+        "viewer": "me",
+        "repos": ["octo/alpha", {"repo": "octo/beta", "scope": "project", "triage": false}],
+        "people": ["alice"],
+    }));
+    let without = bucket_names(&s.run_ok(&["attention"]));
+    assert!(
+        !without.contains(&"needs_reviewer".into()) && !without.contains(&"untriaged".into()),
+        "triage: false removes the maintainer buckets entirely"
+    );
+    assert_eq!(
+        with.iter()
+            .filter(|b| *b != "needs_reviewer" && *b != "untriaged")
+            .collect::<Vec<_>>(),
+        without.iter().collect::<Vec<_>>(),
+        "the demand surface narrows; nothing else moves"
+    );
+}

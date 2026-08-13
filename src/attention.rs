@@ -50,7 +50,14 @@
 //!                     records why the empty default surfaces no team
 //!                     requests rather than all of them; a request of an
 //!                     UNRECOGNIZED kind naming the viewer escalates —
-//!                     shape drift must not drop a request). Or an unresolved
+//!                     shape drift must not drop a request). A request
+//!                     reaching the viewer on their OWN PR is excluded:
+//!                     an author cannot review their own PR, so a team
+//!                     request there is a demand on the rest of the team
+//!                     — the exclusion rests on [`login_eq`](author,
+//!                     viewer), structural certainty, not uncertainty,
+//!                     so it suppresses no demand addressed to the
+//!                     viewer. Or an unresolved
 //!                     thread on viewer's OWN PR whose last substantive
 //!                     speaker is the other party ([`waiting_on`] == Me);
 //!                     the same state on someone else's PR is a reply, not
@@ -96,11 +103,15 @@
 //!                     collaboration demand).
 //!
 //! The maintainer buckets (DESIGN.md, project scope) follow, gated on
-//! `project_scope`: a READ-time fact of the LOADED config, computed by
-//! report.rs and carried in as a structural signal — never the archive's
-//! stored fingerprint, so archive contents cannot create a bucket, and the
-//! judgment (with its oracle) still lives here. For a config with no
-//! project-scope repo the buckets are absent from output entirely, not
+//! `triage_scope`: a READ-time fact of the LOADED config — project scope
+//! with `triage` enabled (config.rs owns the default and the
+//! working-scope refusal) — computed by report.rs and carried in as a
+//! structural signal, never the archive's stored fingerprint, so archive
+//! contents cannot create a bucket, and the judgment (with its oracle)
+//! still lives here. `triage: false` narrows the DEMAND surface only:
+//! the whole-stream archive keeps project breadth for search, query, and
+//! people; what turns off is the duty. For a config with no
+//! triage-licensed repo the buckets are absent from output entirely, not
 //! empty: an empty array is the "checked, nothing" disclosure, and no
 //! maintainer sweep was asked for or performed (report.rs serializes;
 //! the gate is [`Bucket::maintainer`]).
@@ -457,6 +468,11 @@ pub struct PrSignals<'a> {
     pub review_decision: Option<&'a str>,
     /// Some review_requests row addresses the viewer: kind='user' matching
     /// the viewer login, or kind='team' matching a declared team name.
+    /// Computed on any PR; [`bucket`] itself applies the own-PR
+    /// restriction (an author cannot review their own PR, so a request
+    /// reaching the viewer there demands someone else), mirroring
+    /// [`Self::thread_demands_viewer`] — the spec lives here, not in the
+    /// caller's SQL.
     pub requested_of_viewer: bool,
     /// Some unresolved thread has [`waiting_on`] == Me from the viewer's
     /// seat. Computed on any PR; [`bucket`] itself applies the own-PR
@@ -479,10 +495,12 @@ pub struct PrSignals<'a> {
     /// Any kind='review' row by the viewer, any verdict: a COMMENTED review
     /// is still "a review from viewer" for people_prs.
     pub viewer_reviewed: bool,
-    /// The repo is at project scope in the LOADED config — a read-time
-    /// fact computed by report.rs from config, never from the archive
-    /// (archive contents never create a bucket — DESIGN.md).
-    pub project_scope: bool,
+    /// The repo's maintainer sweep is licensed by the LOADED config:
+    /// project scope with `triage` enabled (config.rs owns the default
+    /// and the working-scope refusal) — a read-time fact computed by
+    /// report.rs from config, never from the archive (archive contents
+    /// never create a bucket — DESIGN.md).
+    pub triage_scope: bool,
     /// Any review_requests row at all, anyone, user or team, declared or
     /// not: an undeclared team request still means somebody was asked.
     pub has_review_requests: bool,
@@ -494,7 +512,7 @@ pub struct PrSignals<'a> {
 /// (signals) → at most one bucket, the first qualifying in [`Bucket::ALL`]
 /// order. Pure; report.rs only queries and serializes.
 pub fn bucket(s: &PrSignals<'_>) -> Option<Bucket> {
-    if s.requested_of_viewer || (s.viewers_pr && s.thread_demands_viewer) {
+    if (s.requested_of_viewer && !s.viewers_pr) || (s.viewers_pr && s.thread_demands_viewer) {
         return Some(Bucket::WaitingOnMe);
     }
     if replied_since(s.viewer_last_activity_at, s.last_other_activity_at) {
@@ -512,7 +530,7 @@ pub fn bucket(s: &PrSignals<'_>) -> Option<Bucket> {
     if s.person_pr && !s.viewers_pr && !s.draft && !s.viewer_reviewed {
         return Some(Bucket::PeoplePrs);
     }
-    if s.project_scope && !s.draft && !s.has_review_requests && !s.has_reviews {
+    if s.triage_scope && !s.draft && !s.has_review_requests && !s.has_reviews {
         return Some(Bucket::NeedsReviewer);
     }
     None
@@ -522,9 +540,9 @@ pub fn bucket(s: &PrSignals<'_>) -> Option<Bucket> {
 /// [`untriaged`] may see — the issue-shaped mirror of [`PrSignals`], and the
 /// same fence: the caller (report.rs) queries, the judgment lives here.
 pub struct IssueSignals {
-    /// The repo is at project scope in the LOADED config (see
-    /// [`PrSignals::project_scope`] — same fact, same source).
-    pub project_scope: bool,
+    /// The repo's maintainer sweep is licensed by the LOADED config (see
+    /// [`PrSignals::triage_scope`] — same fact, same source).
+    pub triage_scope: bool,
     /// issues.labels holds a non-empty array ([`json_array_nonempty`]).
     pub labeled: bool,
     /// issues.assignees holds a non-empty array ([`json_array_nonempty`]).
@@ -538,7 +556,7 @@ pub struct IssueSignals {
 /// so this returns bool where [`bucket`] returns an enum. A demand: every
 /// input that cannot PROVE triage leaves the issue in (module docs).
 pub fn untriaged(s: &IssueSignals) -> bool {
-    s.project_scope && !s.labeled && !s.assigned && !s.maintainer_replied
+    s.triage_scope && !s.labeled && !s.assigned && !s.maintainer_replied
 }
 
 /// Is a stored JSON value a non-empty array? The triage-mark reading for
@@ -1066,13 +1084,13 @@ mod tests {
                             effective,
                             has_unresolved_threads: f(6),
                             viewer_reviewed: f(7),
-                            project_scope: f(8),
+                            triage_scope: f(8),
                             has_review_requests: f(9),
                             has_reviews: f(10),
                         };
                         let got = bucket(&s);
-                        let waiting =
-                            s.requested_of_viewer || (s.viewers_pr && s.thread_demands_viewer);
+                        let waiting = (s.requested_of_viewer && !s.viewers_pr)
+                            || (s.viewers_pr && s.thread_demands_viewer);
                         let ready = s.viewers_pr
                             && !s.draft
                             && !s.truncated
@@ -1081,7 +1099,7 @@ mod tests {
                             && matches!(s.review_decision, None | Some("APPROVED"));
                         let people = s.person_pr && !s.viewers_pr && !s.draft && !s.viewer_reviewed;
                         let needs =
-                            s.project_scope && !s.draft && !s.has_review_requests && !s.has_reviews;
+                            s.triage_scope && !s.draft && !s.has_review_requests && !s.has_reviews;
                         let want = [
                             (waiting, Bucket::WaitingOnMe),
                             (*replied, Bucket::TheyReplied),
@@ -1098,11 +1116,20 @@ mod tests {
                              viewer_last={viewer_last:?} other_last={other_last:?}"
                         );
                         // Polarity, independent of either formulation:
-                        if s.requested_of_viewer {
+                        if s.requested_of_viewer && !s.viewers_pr {
                             assert_eq!(
                                 got,
                                 Some(Bucket::WaitingOnMe),
-                                "a review request is never suppressed by any other signal"
+                                "a review request on someone else's PR is never \
+                                 suppressed by any other signal"
+                            );
+                        }
+                        if s.viewers_pr && s.requested_of_viewer && !s.thread_demands_viewer {
+                            assert_ne!(
+                                got,
+                                Some(Bucket::WaitingOnMe),
+                                "a request reaching the viewer on their own PR is a \
+                                 demand on someone else — the author cannot review it"
                             );
                         }
                         if got == Some(Bucket::ReadyToMerge) {
@@ -1120,8 +1147,8 @@ mod tests {
                         assert_ne!(got, Some(Bucket::Untriaged));
                         if got == Some(Bucket::NeedsReviewer) {
                             assert!(
-                                s.project_scope,
-                                "a maintainer bucket leaked outside project scope"
+                                s.triage_scope,
+                                "a maintainer bucket leaked outside triage scope"
                             );
                         }
                     }
@@ -1147,7 +1174,7 @@ mod tests {
             effective: EffectiveReviewState::Unreviewed,
             has_unresolved_threads: false,
             viewer_reviewed: false,
-            project_scope: false,
+            triage_scope: false,
             has_review_requests: false,
             has_reviews: false,
         };
@@ -1181,21 +1208,21 @@ mod tests {
         // The same PR at project scope IS the maintainer's demand: nobody
         // asked, nobody reviewed — find it a reviewer.
         let s = PrSignals {
-            project_scope: true,
+            triage_scope: true,
             ..base(false)
         };
         assert_eq!(bucket(&s), Some(Bucket::NeedsReviewer));
         // The viewer's own fresh PR qualifies too (the demand is
         // assignment, not review — module docs).
         let s = PrSignals {
-            project_scope: true,
+            triage_scope: true,
             ..base(true)
         };
         assert_eq!(bucket(&s), Some(Bucket::NeedsReviewer));
         // A tracked person's unreviewed PR is the collaboration demand
         // first — people_prs outranks needs_reviewer (one bucket per PR).
         let s = PrSignals {
-            project_scope: true,
+            triage_scope: true,
             person_pr: true,
             ..base(false)
         };
@@ -1203,13 +1230,13 @@ mod tests {
         // Somebody was asked, or somebody reviewed (any verdict — a
         // COMMENTED review is engagement): no needs_reviewer demand.
         let s = PrSignals {
-            project_scope: true,
+            triage_scope: true,
             has_review_requests: true,
             ..base(false)
         };
         assert_eq!(bucket(&s), None);
         let s = PrSignals {
-            project_scope: true,
+            triage_scope: true,
             has_reviews: true,
             ..base(false)
         };
@@ -1217,7 +1244,7 @@ mod tests {
         // Drafts don't need a reviewer yet — the demand starts when the PR
         // asks for review (the same rule people_prs applies).
         let s = PrSignals {
-            project_scope: true,
+            triage_scope: true,
             draft: true,
             ..base(false)
         };
@@ -1235,7 +1262,7 @@ mod tests {
         for bits in 0u32..16 {
             let f = |i: u32| bits & (1 << i) != 0;
             let s = IssueSignals {
-                project_scope: f(0),
+                triage_scope: f(0),
                 labeled: f(1),
                 assigned: f(2),
                 maintainer_replied: f(3),
@@ -1243,11 +1270,11 @@ mod tests {
             let got = untriaged(&s);
             assert_eq!(
                 got,
-                s.project_scope && !s.labeled && !s.assigned && !s.maintainer_replied,
+                s.triage_scope && !s.labeled && !s.assigned && !s.maintainer_replied,
                 "bits={bits:04b}"
             );
-            if !s.project_scope {
-                assert!(!got, "a maintainer bucket leaked outside project scope");
+            if !s.triage_scope {
+                assert!(!got, "a maintainer bucket leaked outside triage scope");
             }
             if s.labeled || s.assigned || s.maintainer_replied {
                 assert!(!got, "a proven triage mark must clear the demand");

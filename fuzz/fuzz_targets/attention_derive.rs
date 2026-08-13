@@ -69,11 +69,11 @@ struct Input {
     effective_sel: u8,
     has_unresolved_threads: bool,
     viewer_reviewed: bool,
-    project_scope: bool,
+    triage_scope: bool,
     has_review_requests: bool,
     has_reviews: bool,
 
-    issue_project_scope: bool,
+    issue_triage_scope: bool,
     labeled: bool,
     assigned: bool,
     maintainer_replied: bool,
@@ -115,7 +115,7 @@ fn signals<'a>(i: &'a Input, force_truncated: bool, force_unresolved: bool) -> P
         effective: effective_of(i.effective_sel),
         has_unresolved_threads: i.has_unresolved_threads || force_unresolved,
         viewer_reviewed: i.viewer_reviewed,
-        project_scope: i.project_scope,
+        triage_scope: i.triage_scope,
         has_review_requests: i.has_review_requests,
         has_reviews: i.has_reviews,
     }
@@ -165,12 +165,24 @@ fuzz_target!(|i: Input| {
         "an unresolved thread produced ready_to_merge"
     );
 
-    // (4) An explicit request of the viewer outranks everything else.
-    if s.requested_of_viewer {
+    // (4) An explicit request of the viewer outranks everything else —
+    // on someone else's PR. On the viewer's OWN PR the request demands
+    // the rest of the team (the author cannot review it), so the same
+    // signal must NOT read as the viewer's demand: both polarity
+    // directions witnessed, so neither regression direction is silent.
+    if s.requested_of_viewer && !s.viewers_pr {
         assert_eq!(
             got,
             Some(Bucket::WaitingOnMe),
-            "a review requested of the viewer must lead the priority order"
+            "a review requested of the viewer on someone else's PR must \
+             lead the priority order"
+        );
+    }
+    if s.viewers_pr && s.requested_of_viewer && !s.thread_demands_viewer {
+        assert_ne!(
+            got,
+            Some(Bucket::WaitingOnMe),
+            "a request on the viewer's own PR demands the team, not the viewer"
         );
     }
 
@@ -179,8 +191,8 @@ fuzz_target!(|i: Input| {
     if let Some(b) = got {
         if b.maintainer() {
             assert!(
-                s.project_scope,
-                "maintainer bucket {:?} outside project scope",
+                s.triage_scope,
+                "maintainer bucket {:?} outside triage scope",
                 b.as_str()
             );
         }
@@ -192,7 +204,7 @@ fuzz_target!(|i: Input| {
     // (6) Triage must be proven: any single proof clears untriaged, and
     // untriaged never fires outside project scope.
     let issue = IssueSignals {
-        project_scope: i.issue_project_scope,
+        triage_scope: i.issue_triage_scope,
         labeled: i.labeled,
         assigned: i.assigned,
         maintainer_replied: i.maintainer_replied,
@@ -200,7 +212,7 @@ fuzz_target!(|i: Input| {
     let u = untriaged(&issue);
     assert_eq!(u, untriaged(&issue), "untriaged not deterministic");
     if u {
-        assert!(issue.project_scope, "untriaged outside project scope");
+        assert!(issue.triage_scope, "untriaged outside triage scope");
         assert!(!issue.labeled, "untriaged despite a label");
         assert!(!issue.assigned, "untriaged despite an assignee");
         assert!(

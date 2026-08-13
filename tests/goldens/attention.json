@@ -157,6 +157,7 @@
           "draft": false,
           "number": 8,
           "repo": "octo/alpha",
+          "threads_unresolved": 0,
           "title": "Document the archive layout",
           "truncated": false,
           "updated_at": "2026-01-04T12:00:00Z",

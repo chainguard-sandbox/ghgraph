@@ -136,6 +136,17 @@ pub struct RepoConfig {
     /// work), false at project scope (the firehose is mostly dependabot).
     #[serde(default)]
     bots: Option<bool>,
+    /// Serve this repo's maintainer buckets (needs_reviewer, untriaged)
+    /// in `attention`. Default: on at project scope, meaningless below
+    /// it — working scope has no maintainer sweep, so setting it there
+    /// is a CONFIGURATION error, never a silent no-op. `false` narrows
+    /// the demand surface only: the whole-stream archive keeps project
+    /// breadth (search, query, people), and the duty turns off — scope
+    /// chooses what is archived, triage chooses what is owed. Read-side
+    /// only, like `teams`: never part of the sync fingerprint, so
+    /// editing it re-derives buckets instantly and cold-starts nothing.
+    #[serde(default)]
+    triage: Option<bool>,
     /// Logins whose PRs are never ingested for this repo. Matching is one
     /// function (identity::AuthorPattern::matches, on identity::login_eq):
     /// ASCII-case-insensitive; a bare "x" matches an author with login x of
@@ -163,6 +174,14 @@ impl RepoConfig {
     pub fn bots(&self) -> bool {
         self.bots.unwrap_or(self.scope == Scope::Working)
     }
+
+    /// Maintainer sweep licensed: project scope with `triage` on. The
+    /// working-scope arm reads false without a second judgment site —
+    /// a SET value there is refused at load (`parse`), so this method
+    /// never launders one into a silent no-op.
+    pub fn triage(&self) -> bool {
+        self.scope == Scope::Project && self.triage.unwrap_or(true)
+    }
 }
 
 impl RepoEntry {
@@ -179,6 +198,7 @@ impl RepoEntry {
                 issues: None,
                 lookback_days: None,
                 bots: None,
+                triage: None,
                 exclude_authors: Vec::new(),
             },
         }
@@ -334,6 +354,14 @@ fn validate(cfg: &Config) -> Result<()> {
                 rc.repo.as_str()
             )));
         }
+        if rc.scope == Scope::Working && rc.triage.is_some() {
+            return Err(Error::config(format!(
+                "repo {:?}: triage gates the maintainer buckets, which exist \
+                 only at scope: project — working scope has none to turn on \
+                 or off",
+                rc.repo.as_str()
+            )));
+        }
     }
     Ok(())
 }
@@ -418,6 +446,19 @@ mod tests {
             .resolved();
         assert!(p.issues(), "project: issues() defaults on");
         assert!(!p.bots(), "project: bots() defaults off");
+        assert!(p.triage(), "project: triage() defaults on");
+        assert!(
+            !w.triage(),
+            "working: triage() reads false — no maintainer sweep exists there"
+        );
+        let off = parse(
+            r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"project","triage":false}]}"#,
+            "<test>",
+        )
+        .unwrap()
+        .repos[0]
+            .resolved();
+        assert!(!off.triage(), "project: triage(false) turns the sweep off");
     }
 
     // The global defaults are a documented contract; a silent change is a
@@ -449,6 +490,21 @@ mod tests {
         .err()
         .expect("issues:true at working scope must be rejected");
         assert_eq!(e.code, crate::error::Code::Configuration);
+        // triage mirrors issues: a SET value at working scope is a typo
+        // surface (there are no maintainer buckets to gate), refused with
+        // the same actor — and false is as refused as true, since either
+        // spelling claims a knob the scope does not have.
+        for v in ["true", "false"] {
+            let e = parse(
+                &format!(
+                    r#"{{"viewer":"v","repos":[{{"repo":"o/n","scope":"working","triage":{v}}}]}}"#
+                ),
+                "<test>",
+            )
+            .err()
+            .expect("triage at working scope must be rejected");
+            assert_eq!(e.code, crate::error::Code::Configuration);
+        }
         assert!(
             parse(
                 r#"{"viewer":"v","repos":[{"repo":"o/n","scope":"project"}]}"#,

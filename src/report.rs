@@ -93,7 +93,8 @@
 //!                               author_assoc, updated_at, url, truncated,
 //!                               verified_at,
 //!                               requested_via? threads_waiting?      (waiting_on_me)
-//!                               last_other_activity_at? } ]          (they_replied)
+//!                               last_other_activity_at?              (they_replied)
+//!                               threads_unresolved? } ]              (people_prs)
 //!                    "issues": [ { same minus draft } ] } ] }        (untriaged only)
 //! ```
 //!
@@ -101,10 +102,11 @@
 //!   DESC, tiebroken total by repo, number); every emitted bucket appears
 //!   even when empty — an empty array IS the "checked, nothing"
 //!   disclosure. The maintainer pair (needs_reviewer, untriaged) is
-//!   emitted only when the loaded config has a project-scope repo, and is
+//!   emitted only when the loaded config has a triage-licensed repo
+//!   (project scope with `triage` on), and is
 //!   ABSENT otherwise — "checked, nothing" would claim a sweep the config
 //!   never asked for (attention.rs owns the argument and the per-row
-//!   project_scope gate). untriaged rows are issues and ride under an
+//!   triage_scope gate). untriaged rows are issues and ride under an
 //!   "issues" key — same locator fields minus `draft`, which an issue does
 //!   not have. Both additions are additive under schema_version 1: no
 //!   pre-existing bucket, field, or ordering moved.
@@ -317,14 +319,14 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
     // carry the absent-vs-empty output argument). Repo names are folded to
     // lowercase on both sides of this lookup (RepoName at the config
     // boundary, ingest folding to match — config.rs).
-    let project_repos: std::collections::BTreeSet<String> = cfg
+    let triage_repos: std::collections::BTreeSet<String> = cfg
         .repos
         .iter()
         .map(|e| e.resolved())
-        .filter(|rc| rc.scope == crate::config::Scope::Project)
+        .filter(|rc| rc.triage())
         .map(|rc| rc.repo.as_str().to_string())
         .collect();
-    let maintainer_scope = !project_repos.is_empty();
+    let maintainer_scope = !triage_repos.is_empty();
 
     // Candidates: every open, not-upstream-deleted PR (the bucket scope —
     // attention.rs module docs own the argument). Iteration order (repo,
@@ -522,7 +524,7 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
             effective,
             has_unresolved_threads: !unresolved.is_empty(),
             viewer_reviewed,
-            project_scope: project_repos.contains(&cand.repo),
+            triage_scope: triage_repos.contains(&cand.repo),
             // Anyone asked / anyone reviewed — the raw row sets, before the
             // viewer-specific narrowings above (attention.rs owns why an
             // undeclared team or a COMMENTED review still counts here).
@@ -569,9 +571,15 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
             attention::Bucket::TheyReplied => {
                 obj.insert("last_other_activity_at".into(), json!(other_last));
             }
-            attention::Bucket::ReadyToMerge
-            | attention::Bucket::PeoplePrs
-            | attention::Bucket::NeedsReviewer => {}
+            attention::Bucket::PeoplePrs => {
+                // The stalled-vs-busy discriminator: total unresolved
+                // threads, anyone's seat. Zero on a days-old row reads
+                // "nobody showed up"; a high count reads "already under
+                // review" — the judgment stays with the reader, the
+                // number is structural.
+                obj.insert("threads_unresolved".into(), json!(unresolved.len()));
+            }
+            attention::Bucket::ReadyToMerge | attention::Bucket::NeedsReviewer => {}
             // bucket() never returns the issue bucket for a PR — pinned
             // over the whole signal cube (attention.rs oracle test).
             attention::Bucket::Untriaged => unreachable!("bucket() is PR-only"),
@@ -588,7 +596,7 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
     // hydration_source: a fill-only linked row's NULL labels read as
     // unwitnessed and fail open (attention.rs owns that argument). Skipped
     // entirely when no repo is at project scope: the gate is per-row
-    // anyway (project_scope in the signals), so the skip only saves the
+    // anyway (triage_scope in the signals), so the skip only saves the
     // scan — it can't change the outcome.
     if maintainer_scope {
         let mut issue_stmt = conn
@@ -648,7 +656,7 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
                 .collect::<std::result::Result<_, _>>()
                 .map_err(classify_ours)?;
             let placed = attention::untriaged(&attention::IssueSignals {
-                project_scope: project_repos.contains(&issue.repo),
+                triage_scope: triage_repos.contains(&issue.repo),
                 labeled: attention::json_array_nonempty(issue.labels.as_deref()),
                 assigned: attention::json_array_nonempty(issue.assignees.as_deref()),
                 maintainer_replied: assocs

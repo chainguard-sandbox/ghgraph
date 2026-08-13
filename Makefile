@@ -316,6 +316,12 @@ check: ## Fast pre-commit gate: format, clippy, check, test
 	cargo fmt --all -- --check
 	cargo clippy --all-targets -- -D warnings
 	cargo check --all-targets
+# The fuzz workspace type-checks in the same gate (stable cargo suffices;
+# only RUNNING targets needs nightly): the harnesses reference the main
+# crate's public types, so a rename there can orphan the witness that
+# carries the renamed invariant — and fuzz-targets-check only pins the
+# file/[[bin]] pairing, not compilation. Seconds after the first build.
+	cargo check --manifest-path fuzz/Cargo.toml
 	cargo test
 	@echo "✓ all checks passed"
 
