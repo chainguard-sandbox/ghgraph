@@ -38,7 +38,14 @@ timeout_multiplier = 2.0
 # spawn — the child launches and dies at exec), so the widened guard is
 # equivalent in practice — argued at src/bin/mcp.rs::call, confirmed
 # surviving by a live run.
+# Proof harness bodies replaced with (): #[cfg(kani)] code is dead to
+# every non-kani toolchain, so no test can see the gutting — the PROVER's
+# own gates police it instead: prove fails closed when a harness carries
+# zero satisfied cover witnesses, and prove-kill demands each harness go
+# red under its planted bug. Argued at the kani_proofs modules (db.rs,
+# sync.rs); confirmed 3 missed by a scoped live run.
 exclude_re = [
+    'replace kani_proofs::',
     'replace match guard e\.kind\(\) == std::io::ErrorKind::BrokenPipe with true in emit',
     'replace match guard e\.kind\(\) == std::io::ErrorKind::InvalidData with true in serve',
     'replace match guard e\.kind\(\) == std::io::ErrorKind::ArgumentListTooLong with true in call',

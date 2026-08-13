@@ -123,7 +123,18 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// and was verified correct; it was deleted by this policy, not by a
 /// defect (the git history holds it if the first release ever needs the
 /// pattern back).
-pub const SCHEMA_VERSION: i64 = 4;
+///
+/// v5: comments.author_type — the structural __typename, so derivations
+/// can tell a bot's comment from a human's (they_replied consumes it;
+/// NULL fails open there). WIDENS the policy: an additive COLUMN now
+/// migrates too, under two conditions met here and owed by any future
+/// column — it is APPENDED (last in schema.sql's CREATE and in the
+/// migration's ALTER, so fresh and migrated archives agree column-for-
+/// column and SELECT * cannot fork by provenance — the exact constraint
+/// the deleted v1→v2 migration was rejected over), and the ALTER is
+/// guarded on the live shape inside the same transaction as the batch
+/// and the stamp (apply_full), so an archive is never between versions.
+pub const SCHEMA_VERSION: i64 = 5;
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 
@@ -421,6 +432,11 @@ fn sticky_swap_exempt(mode: u32, owner_uid: u32) -> bool {
 /// UNSATISFIABLE cover as informational — it does not fail the run — so
 /// the `prove` recipe greps the output and fails on any unsatisfied cover;
 /// the witness gates through the Makefile, not the prover.
+/// Mutation note: cfg(kani) makes these bodies dead code to cargo test,
+/// so their gutted-body mutants survive the suite by construction and are
+/// ledgered (mutants.toml); the prover's own gates are the discriminator
+/// — prove fails closed on zero satisfied covers, prove-kill on a harness
+/// that stays green under its planted bug.
 #[cfg(kani)]
 mod kani_proofs {
     use super::*;
@@ -489,7 +505,8 @@ mod kani_proofs {
         kani::cover!(v == 0, "empty-archive arm reachable");
         kani::cover!(v < 0, "negative-sentinel arm reachable");
         kani::cover!(v > SCHEMA_VERSION, "newer-archive arm reachable");
-        kani::cover!(v == 3, "additive-migrate arm reachable");
+        kani::cover!(v == 3, "additive-migrate arm reachable (v3)");
+        kani::cover!(v == 4, "additive-migrate arm reachable (v4)");
         kani::cover!(v > 0 && v < 3, "pre-release arm reachable");
         // Arm selection as five order-independent biconditionals — the
         // spec stated without the if-chain's ordering shortcuts, so a
@@ -509,8 +526,8 @@ mod kani_proofs {
         );
         assert_eq!(
             arm == VersionArm::AdditiveBehind,
-            v == 3,
-            "Additive ⟺ v == 3"
+            v == 3 || v == 4,
+            "Additive ⟺ v ∈ {3, 4}"
         );
         assert_eq!(
             arm == VersionArm::PreRelease,
@@ -675,14 +692,15 @@ fn user_version(conn: &Connection, path: &Path) -> Result<i64> {
 fn migrate(conn: &mut Connection, path: &Path) -> Result<()> {
     match user_version(conn, path)? {
         0 => apply_full(conn, path),
-        // v3 → v4 is purely additive (sync_runs, idx_observations_pr_field;
-        // no v3 object changes shape), so re-applying the idempotent schema
-        // batch creates exactly the missing objects and stamps v4 — the
-        // additive-migration arm of the policy at SCHEMA_VERSION. This arm
-        // is valid for v3 SPECIFICALLY, argued there; a future bump must
-        // justify its own arm, because IF NOT EXISTS silently skips an
-        // object whose DEFINITION changed.
-        3 => apply_full(conn, path),
+        // v3/v4 → v5 are additive end to end: the v4 objects (sync_runs,
+        // idx_observations_pr_field) arrive by re-applying the idempotent
+        // batch, and the v5 column (comments.author_type) by apply_full's
+        // guarded ALTER — no v3 or v4 object changes DEFINITION, which is
+        // what licenses IF NOT EXISTS for the objects; the column cannot
+        // ride that mechanism and gets its own guard (apply_full). These
+        // arms are valid for v3 and v4 SPECIFICALLY, argued here; a future
+        // bump must justify its own arm.
+        3 | 4 => apply_full(conn, path),
         v if v == SCHEMA_VERSION => Ok(()),
         // Everything else — an older shape-changing stamp (refused with the
         // remove-and-resync remedy; see the policy at SCHEMA_VERSION), a
@@ -716,8 +734,8 @@ enum VersionArm {
     NegativeSentinel,
     /// v > SCHEMA_VERSION: a newer ghgraph wrote this archive.
     Newer,
-    /// v == 3: additively migratable — but only the write path migrates,
-    /// so open_ro's remedy is one sync, not a rebuild.
+    /// v == 3 or v == 4: additively migratable — but only the write path
+    /// migrates, so open_ro's remedy is one sync, not a rebuild.
     AdditiveBehind,
     /// 0 < v < 3: a shape-changing pre-release schema, not migrated by
     /// policy (see SCHEMA_VERSION) — the archive is a disposable cache.
@@ -741,7 +759,7 @@ fn version_arm(v: i64) -> VersionArm {
         VersionArm::NegativeSentinel
     } else if v > SCHEMA_VERSION {
         VersionArm::Newer
-    } else if v == 3 {
+    } else if v == 3 || v == 4 {
         VersionArm::AdditiveBehind
     } else {
         VersionArm::PreRelease
@@ -782,10 +800,12 @@ fn wrong_version(path: &Path, v: i64) -> Error {
 }
 
 /// Apply the current schema and stamp user_version=[`SCHEMA_VERSION`]
-/// atomically. Serves two arms of `migrate`: a fresh archive (v0 — every
-/// statement creates) and an additively-migratable one (v3 — the idempotent
-/// IF NOT EXISTS batch creates exactly the missing objects and touches
-/// nothing else). The schema apply and the version bump run inside ONE
+/// atomically. Serves three arms of `migrate`: a fresh archive (v0 —
+/// every statement creates) and the additively-migratable v3/v4 (the
+/// idempotent IF NOT EXISTS batch creates exactly the missing OBJECTS,
+/// and the guarded ALTER below adds the one thing IF NOT EXISTS cannot:
+/// the v5 column, appended per the order constraint at SCHEMA_VERSION).
+/// The schema apply, the ALTER, and the version bump run inside ONE
 /// rusqlite-managed transaction (schema.sql carries no BEGIN/COMMIT of its
 /// own; the only BEGINs there are trigger bodies), and PRAGMA user_version
 /// is transactional — so a crash between the last CREATE and the stamp
@@ -794,6 +814,22 @@ fn apply_full(conn: &mut Connection, path: &Path) -> Result<()> {
     let cannot = |e: rusqlite::Error| sqlite_err(path, "cannot initialize archive", e);
     let tx = conn.transaction().map_err(cannot)?;
     tx.execute_batch(SCHEMA).map_err(cannot)?;
+    // The v5 column: CREATE TABLE IF NOT EXISTS cannot add a column to a
+    // table that already exists, so a pre-v5 archive needs the one ALTER,
+    // guarded on the live shape — a fresh apply's SCHEMA already carries
+    // the column and skips it. Appended last (the order constraint at
+    // SCHEMA_VERSION), same transaction as the batch and the stamp.
+    let has_author_type: i64 = tx
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('comments') WHERE name = 'author_type'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(cannot)?;
+    if has_author_type == 0 {
+        tx.execute_batch("ALTER TABLE comments ADD COLUMN author_type TEXT")
+            .map_err(cannot)?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(cannot)?;
     tx.commit().map_err(cannot)?;
@@ -1298,9 +1334,10 @@ mod tests {
         assert_eq!(err.code, crate::error::Code::Configuration);
     }
 
-    /// A faithful v3 archive is the current schema minus exactly what v4
-    /// added (sync_runs, idx_observations_pr_field) under a v3 stamp —
-    /// that identity is what licenses building the fixture by subtraction.
+    /// A faithful v3 archive is the current schema minus everything later
+    /// versions added — v4's objects (sync_runs, idx_observations_pr_field)
+    /// AND v5's column (comments.author_type) — under a v3 stamp; that
+    /// identity is what licenses building the fixture by subtraction.
     fn make_v3_archive(path: &Path) {
         {
             let arc = open_rw(path).unwrap();
@@ -1311,11 +1348,78 @@ mod tests {
                      VALUES ('PR_m', 'o/n', 1, 'kept', 'OPEN', \
                              '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'u'); \
                      DROP TABLE sync_runs; \
-                     DROP INDEX idx_observations_pr_field",
+                     DROP INDEX idx_observations_pr_field; \
+                     ALTER TABLE comments DROP COLUMN author_type",
                 )
                 .unwrap();
         }
         set_raw_user_version(path, 3);
+    }
+
+    /// A true v4 shape: the current schema minus the v5 column.
+    fn make_v4_archive(path: &Path) {
+        {
+            let arc = open_rw(path).unwrap();
+            arc.conn()
+                .execute_batch(
+                    "INSERT INTO prs (id, repo, number, title, state, created_at, \
+                                      updated_at, url) \
+                     VALUES ('PR_m', 'o/n', 1, 'kept', 'OPEN', \
+                             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'u'); \
+                     ALTER TABLE comments DROP COLUMN author_type",
+                )
+                .unwrap();
+        }
+        set_raw_user_version(path, 4);
+    }
+
+    #[test]
+    fn migrates_v4_archive_additively() {
+        // The write path brings a v4 archive to v5 by the guarded ALTER:
+        // the column appears (appended last — the order constraint at
+        // SCHEMA_VERSION), the stamp moves, and existing data survives.
+        // The NULL-fails-open consumption is pinned where it is consumed
+        // (read_surface's they_replied witness), not here.
+        let s = Scratch::new();
+        let path = s.join("ghgraph.db");
+        make_v4_archive(&path);
+        let arc = open_rw(&path).expect("v4 must migrate on the write path");
+        assert_eq!(user_version(arc.conn(), &path).unwrap(), SCHEMA_VERSION);
+        let (name, position): (String, i64) = arc
+            .conn()
+            .query_row(
+                "SELECT name, cid FROM pragma_table_info('comments') \
+                 WHERE cid = (SELECT MAX(cid) FROM pragma_table_info('comments'))",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "author_type", "the v5 column exists and sits LAST");
+        let fresh = Scratch::new();
+        let fresh_path = fresh.join("fresh.db");
+        let fresh_arc = open_rw(&fresh_path).unwrap();
+        let fresh_pos: i64 = fresh_arc
+            .conn()
+            .query_row(
+                "SELECT cid FROM pragma_table_info('comments') WHERE name='author_type'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fresh_pos, position,
+            "fresh and migrated archives agree on column order — SELECT * \
+             cannot fork by provenance"
+        );
+        let title: String = arc
+            .conn()
+            .query_row(
+                "SELECT title FROM prs WHERE repo='o/n' AND number=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "kept", "data must survive migration");
     }
 
     #[test]
@@ -1368,6 +1472,24 @@ mod tests {
         assert!(
             err.message.contains("run `ghgraph sync`") && !err.message.contains("remove"),
             "v3's read-path remedy is a sync, not a rebuild, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn ro_tells_v4_to_sync_not_rebuild() {
+        // The AdditiveBehind arm now covers two versions, and each owes
+        // its own read-path pin: the message route is shared with v3, but
+        // sharing is an implementation fact — the CONTRACT is per version,
+        // and the next schema bump repeats this pair.
+        let s = Scratch::new();
+        let path = s.join("ghgraph.db");
+        make_v4_archive(&path);
+        let err = open_ro(&path).err().expect("open_ro must refuse v4");
+        assert_eq!(err.code, crate::error::Code::Configuration);
+        assert!(
+            err.message.contains("run `ghgraph sync`") && !err.message.contains("remove"),
+            "v4's read-path remedy is a sync, not a rebuild, got: {}",
             err.message
         );
     }

@@ -62,11 +62,30 @@
 //!                     speaker is the other party ([`waiting_on`] == Me);
 //!                     the same state on someone else's PR is a reply, not
 //!                     a request, and falls through to they_replied.
-//!   they_replied    — substantive activity by another party since the
-//!                     viewer's last, on PRs the viewer participates in.
-//!                     Authorship is participation (it counts as activity
-//!                     at the PR's created_at); minimized and deleted
-//!                     comments are neither activity nor participation.
+//!   they_replied    — substantive activity by another HUMAN party since
+//!                     the viewer's last, on PRs the viewer participates
+//!                     in. Authorship is participation (it counts as
+//!                     activity at the PR's created_at); minimized and
+//!                     deleted comments are neither activity nor
+//!                     participation, and neither is a Bot-typed author's
+//!                     comment — a stale-bot warning or a CI summary
+//!                     demands nothing — UNLESS the config names the bot
+//!                     in reply_bots: a review bot the operator answers
+//!                     daily is conversation, and the explicit list is
+//!                     the honest tool (config.rs owns the default's
+//!                     argument; the ambient population stays machinery).
+//!                     The judgment is the structural
+//!                     __typename, never a login pattern; an UNTYPED
+//!                     author (NULL — ingested before the column existed)
+//!                     fails OPEN as a human until re-hydration types it,
+//!                     so uncertainty escalates here like everywhere
+//!                     else. A third known narrowing joins the two above:
+//!                     the exclusion — and its reply_bots opt-in — is
+//!                     PR-seat only. A bot speaking LAST in a review
+//!                     thread still flips waiting_on, listed or not
+//!                     (ThreadComment carries no type). Promote it on the
+//!                     first real bot thread-reply that fabricates a
+//!                     demand, like the others.
 //!                     An APPROVED review verdict is NOT a reply: it
 //!                     demands nothing ready_to_merge doesn't already say,
 //!                     and counting it would shunt every freshly-approved
@@ -486,7 +505,9 @@ pub struct PrSignals<'a> {
     /// The other parties' last substantive act: same definition over
     /// comments whose author is not the viewer (a ghost author counts as
     /// the other party, as in [`waiting_on`]), EXCLUDING APPROVED review
-    /// verdicts — module docs carry why an approval is not a reply.
+    /// verdicts — module docs carry why an approval is not a reply — and
+    /// EXCLUDING Bot-typed authors not named in config.reply_bots
+    /// (module docs; NULL type fails open as human).
     pub last_other_activity_at: Option<&'a str>,
     pub effective: EffectiveReviewState,
     /// Any review_threads row with is_resolved = 0 (structural — comment

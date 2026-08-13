@@ -154,7 +154,18 @@ CREATE TABLE IF NOT EXISTS comments (
   created_at   TEXT NOT NULL,
   updated_at   TEXT,                     -- edit detection; keeps the FTS copy honest
   url          TEXT,
-  deleted_at   TEXT
+  deleted_at   TEXT,
+  author_type  TEXT                      -- GraphQL __typename (User|Bot|...).
+                                         -- LAST on purpose: v4 archives gain
+                                         -- it by appending ALTER (db.rs), and
+                                         -- the fresh shape must agree or
+                                         -- SELECT * forks by archive
+                                         -- provenance (the order constraint
+                                         -- recorded at SCHEMA_VERSION). NULL
+                                         -- = row predates v5; fails OPEN in
+                                         -- they_replied (an untyped author
+                                         -- reads as a human other-party until
+                                         -- re-hydration types it).
 );
 CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments (parent_kind, parent);
 CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments (thread);

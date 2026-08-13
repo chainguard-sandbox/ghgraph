@@ -4117,13 +4117,14 @@ fn upsert_comment(
     let existing: Option<(i64, Vec<Option<String>>)> = tx
         .query_row(
             "SELECT pk, parent_kind, parent, thread, kind, state, author, author_id, \
-                    author_assoc, body, is_minimized, created_at, updated_at, url, deleted_at \
+                    author_assoc, author_type, body, is_minimized, created_at, updated_at, \
+                    url, deleted_at \
              FROM comments WHERE id = ?1",
             [c.id],
             |r| {
                 let pk: i64 = r.get(0)?;
                 let mut cols = Vec::new();
-                for i in 1..15 {
+                for i in 1..16 {
                     cols.push(r.get::<_, Option<String>>(i).or_else(|_| {
                         r.get::<_, Option<i64>>(i).map(|v| v.map(|v| v.to_string()))
                     })?);
@@ -4143,6 +4144,7 @@ fn upsert_comment(
         author_login.map(str::to_string),
         author_id.map(|x| x.to_string()),
         Some(c.author_assoc.to_string()),
+        c.author.map(|a| a.typename.clone()),
         Some(c.body.to_string()),
         Some(i64::from(c.is_minimized).to_string()),
         Some(c.created_at.clone()),
@@ -4156,9 +4158,9 @@ fn upsert_comment(
             exec(
                 tx,
                 "INSERT INTO comments (id, parent_kind, parent, thread, kind, state, author, \
-                                       author_id, author_assoc, body, is_minimized, created_at, \
-                                       updated_at, url, deleted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL)",
+                                       author_id, author_assoc, author_type, body, is_minimized, \
+                                       created_at, updated_at, url, deleted_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL)",
                 rusqlite::params![
                     c.id,
                     parent_kind,
@@ -4169,6 +4171,7 @@ fn upsert_comment(
                     author_login,
                     author_id,
                     c.author_assoc,
+                    c.author.map(|a| a.typename.as_str()),
                     c.body,
                     c.is_minimized,
                     c.created_at,
@@ -4182,8 +4185,9 @@ fn upsert_comment(
             exec(
                 tx,
                 "UPDATE comments SET parent_kind=?1, parent=?2, thread=?3, kind=?4, state=?5, \
-                   author=?6, author_id=?7, author_assoc=?8, body=?9, is_minimized=?10, \
-                   created_at=?11, updated_at=?12, url=?13, deleted_at=NULL WHERE pk=?14",
+                   author=?6, author_id=?7, author_assoc=?8, author_type=?9, body=?10, \
+                   is_minimized=?11, created_at=?12, updated_at=?13, url=?14, \
+                   deleted_at=NULL WHERE pk=?15",
                 rusqlite::params![
                     parent_kind,
                     parent_pk,
@@ -4193,6 +4197,7 @@ fn upsert_comment(
                     author_login,
                     author_id,
                     c.author_assoc,
+                    c.author.map(|a| a.typename.as_str()),
                     c.body,
                     c.is_minimized,
                     c.created_at,
