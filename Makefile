@@ -215,6 +215,8 @@ mutants-extreme: ## Pseudo-tested-code sweep: function-replacement mutants only 
 # plus the documented-at-code survivors.
 MUTANTS_EQUIV := \
 	'replace match guard e.kind\(\) == std::io::ErrorKind::BrokenPipe with true in emit|1' \
+	'replace match guard e.kind\(\) == std::io::ErrorKind::InvalidData with true in serve|1' \
+	'replace match guard e.kind\(\) == std::io::ErrorKind::ArgumentListTooLong with true in call|1' \
 	'replace - with \+ in overhead_intercept_ms|2' \
 	'replace < with <= in version_arm|1' \
 	'replace > with >= in version_arm|1' \

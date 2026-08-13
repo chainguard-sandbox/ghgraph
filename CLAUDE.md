@@ -3,9 +3,10 @@
 ghgraph: local GitHub work memory in SQLite — the operator's working set, or
 a whole project's PR and issue stream, chosen per repo in config. The `gh`
 CLI is the only transport. Unix only, enforced by a `compile_error!`.
-Read DESIGN.md before changing anything; ROADMAP.md sequences the build.
-Working through milestone 4; the output contract is frozen at
-`schema_version: 1`, additive-only.
+Read DESIGN.md before changing anything. The roadmap's numbered milestones
+are complete; ROADMAP.md keeps the deferred items and the evidence that
+decides each. The output contract is frozen at `schema_version: 1`,
+additive-only.
 
 ## The discipline
 

@@ -151,14 +151,62 @@ reads.
 
 ## 6 — MCP
 
-In order: contract-honesty fixes (1), freeze (3), then an external per-call
-CLI-spawning wrapper as v0 — zero new dependencies, every CLI invariant
-inherited. The feature-gated resident binary lands only on measured spawn
-latency from real sessions, with the long-lived-reader/WAL-checkpoint
-interaction as a named design input at that point.
+In order: contract-honesty fixes (1), freeze (3), then the external
+per-call CLI-spawning wrapper as v0 — zero new dependencies, every CLI
+invariant inherited. Built: `ghgraph-mcp` (src/bin/mcp.rs), the wrapper's
+protocol decisions recorded in its module docs and the one-surface
+invariant proven by test against the live CLI. The resident binary moved
+to the deferred list below with its deciding evidence.
 
 ## Deferred, with the evidence that decides each
 
+- The feature-gated resident MCP binary — the evidence so far says no.
+  Measured (2026-08, Apple M4 Pro, 118 MB working archive): the
+  spawn+open floor is ~7 ms, the wrapper adds nothing observable over the
+  direct CLI, and the slow verbs are query work a resident would not
+  reduce (search ~36 ms is FTS hydration, stats ~2.8 s is the audit
+  sweep; SQLite answers the raw queries in under 1 ms either way). Reopen
+  only if a real session shows the spawn floor dominating — order tens of
+  calls per second sustained. Two preconditions if it ever lands: it must
+  not hold a read connection across a sync (a long-lived reader is
+  exactly the WAL-snapshot holder db.rs's truncate-at-close names as its
+  defeat), and it needs a crash-containment answer that does not reopen
+  the catch_unwind rejection (mcp.rs records the process boundary as the
+  only containment the crate's rules permit).
+- MCP structuredContent/outputSchema on tool results — the documents are
+  already structured JSON delivered as text, and a declared output schema
+  is a second encoding of the `schema_version: 1` contract that can drift
+  from it. Adopt only when a real target client measurably parses or
+  routes better with it; the text block stays regardless, so adoption is
+  purely additive.
+- MCP progress notifications for sync — the spec's answer to client tool
+  timeouts on long calls, but emitting them means parsing the child's
+  stderr heartbeat, which is deliberately non-contract on both surfaces.
+  Adopt only when a real client that honors progress-based timeout
+  renewal is observed timing out a sync wanted over MCP; until then a
+  cold sync belongs in an operator shell (mcp.rs records the posture).
+- The MCP "modern era" (spec revision 2026-07-28+) — it replaces the
+  initialize handshake with per-request `_meta` version declaration and
+  a `server/discover` capability probe; this server implements the
+  2025-06-18 handshake, which is what the operator's real client
+  negotiates today (probed 2026-08: Claude Code 2.1.172 carries exactly
+  2024-11-05/2025-03-26/2025-06-18 and no modern-era symbols). The
+  draft's own compatibility story keeps legacy servers working against
+  modern clients, though sources read it differently (silent bridge vs
+  actionable failure on the discover probe). Adopt only when a
+  modern-era client appears in real use against this server: observe
+  which compatibility path actually fires, then size the work from
+  that evidence.
+- Output bounding for the agent consumer — measured (2026-08,
+  400-comment fixture): a default `pr` call returns ~787 KB (~197k
+  tokens) with no truncation marker, `attention`/`prs` have no default
+  limit, and nothing caps a PR's comment count. The bound is a
+  CLI-contract feature (an additive comment-cap flag, or defaulted
+  limits with disclosed elision — defaults live in the CLI, so the
+  wrapper cannot bound without forking the one surface's behavior).
+  Adopt when a real agent session blows a real client's ingestion cap
+  on a default read, sized by that evidence; today's real-archive reads
+  measure ~1-3 KB on every verb except a comment-heavy `pr`.
 - Batched `nodes(ids:)` hydration — from the overhead-intercept median over
   trailing `sync_runs` rows: batch only if spawn overhead dominates, and
   only after the quarantine exists, or the failure unit becomes the batch.
