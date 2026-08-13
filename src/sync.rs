@@ -5009,6 +5009,28 @@ mod tests {
         assert_eq!(project["viewer"], "");
         assert_eq!(project["people"], json!([]));
         assert_eq!(project["bots"], json!(false), "project default");
+        // The key SET is the fingerprint's identity: a field added here
+        // cold-starts every archive, and a read-side knob (teams, triage)
+        // leaking in would turn instant re-derivation into a refetch.
+        // Growth is a deliberate act against this pin, never a drive-by.
+        let keys: Vec<&str> = project
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "bots",
+                "exclude_authors",
+                "lookback_days",
+                "people",
+                "scope",
+                "viewer"
+            ],
+            "the fingerprint's exact field set"
+        );
     }
 
     #[test]

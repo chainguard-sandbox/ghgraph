@@ -282,9 +282,12 @@ Buckets derive from archive state at read time: `people_prs` membership is
 row, a team review request reaches `waiting_on_me` only through a declared
 `config.teams` name (membership is declared, not verified — team rosters
 are not local data, and without the declaration a team request provably
-addresses no particular viewer; config.rs records the argument), and
-maintainer buckets are emitted only for repos configured at
-project scope when read — archive contents never create a bucket. Limits
+addresses no particular viewer; config.rs records the argument) and never
+on the viewer's own PR (an author cannot review it; the request demands
+the rest of the team — attention.rs), and maintainer buckets are emitted
+only for repos configured at project scope with `triage` on when read —
+scope chooses what is archived, `triage` chooses what is owed (config.rs),
+and archive contents never create a bucket. Limits
 (`--limit`, with disclosed totals, always) govern presentation; polarity
 governs derivation — a limit is never precedent for suppressing a demand.
 Derivations have one home (src/attention.rs); SQL views may encode structure,

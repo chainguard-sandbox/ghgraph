@@ -6,6 +6,7 @@
       "repo": "owner/big-project-you-maintain",
       "scope": "project",
       "lookback_days": 30,
+      "triage": true,
       "exclude_authors": ["noisy-forge-account"]
     }
   ],
