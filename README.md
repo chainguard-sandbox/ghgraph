@@ -52,4 +52,6 @@ config file through to every call.) To smoke-test without a client:
 
 prints one `serverInfo` frame and exits on EOF.
 
+Security reports: [SECURITY.md](SECURITY.md).
+
 License: Apache-2.0.
