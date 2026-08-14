@@ -64,7 +64,7 @@
 //!           review_requests: [ { reviewer, kind } ],
 //!           threads:  [ { id, path, line, resolved, outdated, waiting_on,
 //!                         comments: [ ... ] } ],
-//!           comments: [ { author, author_assoc, body, body_elided,
+//!           comments: [ { author, author_assoc, author_type, body, body_elided,
 //!                         created_at, updated_at, is_minimized, deleted_at,
 //!                         url } ],
 //!           linked_issues: [ { repo, number, title, state, url, resolved } ],
@@ -222,11 +222,35 @@ const HOT_VIEWER_LAST_ACTIVITY: &str = "SELECT MAX(created_at) FROM comments \
      WHERE parent_kind = 'pr' AND parent = ?1 AND deleted_at IS NULL \
        AND is_minimized = 0 AND author = ?2 COLLATE NOCASE";
 
-const HOT_OTHER_LAST_ACTIVITY: &str = "SELECT MAX(created_at) FROM comments \
-     WHERE parent_kind = 'pr' AND parent = ?1 AND deleted_at IS NULL \
-       AND is_minimized = 0 \
-       AND (author IS NULL OR author <> ?2 COLLATE NOCASE) \
-       AND NOT (kind = 'review' AND state IS 'APPROVED')";
+// The 'Bot' literal is identity::is_bot's judgment transcribed into SQL
+// (SQL cannot call it): __typename == "Bot" exactly, never a login
+// pattern. If is_bot ever broadens, this predicate follows it by hand —
+// the cross-reference is the drift alarm. The reply_bots allow-list
+// (config.rs owns the argument) makes the statement's SHAPE depend on
+// the config — one placeholder per named bot, ?3 onward, every value
+// BOUND (never interpolated; the logins are validated newtypes besides).
+// COLLATE NOCASE on the author keeps the match on login_eq's rule, and
+// the type gate keeps it narrow: an unlisted bot stays machinery, a
+// human sharing a listed name never rides the bot rule.
+fn other_last_activity_sql(reply_bots: usize) -> String {
+    let allow = if reply_bots == 0 {
+        String::new()
+    } else {
+        let ph: Vec<String> = (0..reply_bots).map(|i| format!("?{}", i + 3)).collect();
+        format!(
+            " OR (author_type = 'Bot' AND author COLLATE NOCASE IN ({}))",
+            ph.join(", ")
+        )
+    };
+    format!(
+        "SELECT MAX(created_at) FROM comments \
+         WHERE parent_kind = 'pr' AND parent = ?1 AND deleted_at IS NULL \
+           AND is_minimized = 0 \
+           AND (author IS NULL OR author <> ?2 COLLATE NOCASE) \
+           AND (author_type IS NULL OR author_type <> 'Bot'{allow}) \
+           AND NOT (kind = 'review' AND state IS 'APPROVED')"
+    )
+}
 
 const HOT_ISSUE_SPEAKER_ASSOCS: &str = "SELECT DISTINCT author_assoc FROM comments \
      WHERE parent_kind = 'issue' AND parent = ?1 AND deleted_at IS NULL \
@@ -241,11 +265,11 @@ const HOT_THREADS_DISPLAY: &str = "SELECT pk, id, path, line, is_resolved, is_ou
      WHERE pr = ?1 AND deleted_at IS NULL \
      ORDER BY path, line, id";
 
-const HOT_THREAD_COMMENTS_DISPLAY: &str = "SELECT author, author_assoc, body, created_at, updated_at, is_minimized, \
+const HOT_THREAD_COMMENTS_DISPLAY: &str = "SELECT author, author_assoc, body, created_at, updated_at, is_minimized, author_type, \
             deleted_at, url \
      FROM comments WHERE thread = ?1 ORDER BY created_at, id";
 
-const HOT_PR_TOP_COMMENTS: &str = "SELECT author, author_assoc, body, created_at, updated_at, is_minimized, \
+const HOT_PR_TOP_COMMENTS: &str = "SELECT author, author_assoc, body, created_at, updated_at, is_minimized, author_type, \
             deleted_at, url \
      FROM comments WHERE parent_kind = 'pr' AND parent = ?1 AND kind = 'comment' \
      ORDER BY created_at, id";
@@ -401,9 +425,9 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
     // row, silently suppressing a demand (fail-closed, the wrong
     // polarity). Unreachable from ghgraph's own writer, but a derivation
     // input is validated where it is consumed (attention.rs).
-    let mut other_last_stmt = conn
-        .prepare(HOT_OTHER_LAST_ACTIVITY)
-        .map_err(classify_ours)?;
+    let reply_bots: Vec<&str> = cfg.reply_bots.iter().map(|l| l.as_str()).collect();
+    let other_last_sql = other_last_activity_sql(reply_bots.len());
+    let mut other_last_stmt = conn.prepare(&other_last_sql).map_err(classify_ours)?;
 
     // (updated_at, repo, number, row) per bucket, sorted after collection.
     let mut buckets: Vec<Vec<(String, String, i64, Value)>> =
@@ -507,9 +531,15 @@ pub fn attention(cfg: &Config, limit: Option<usize>) -> Result<Value> {
             (None, true) => Some(cand.created_at.clone()),
             (None, false) => None,
         };
-        let other_last: Option<String> = other_last_stmt
-            .query_row(rusqlite::params![cand.pk, viewer], |r| r.get(0))
-            .map_err(classify_ours)?;
+        let other_last: Option<String> = {
+            let mut params: Vec<&dyn rusqlite::ToSql> = vec![&cand.pk, &viewer];
+            for b in &reply_bots {
+                params.push(b);
+            }
+            other_last_stmt
+                .query_row(&params[..], |r| r.get(0))
+                .map_err(classify_ours)?
+        };
 
         let placed = attention::bucket(&attention::PrSignals {
             viewers_pr,
@@ -1892,19 +1922,24 @@ fn comment_rows(
                 r.get::<_, String>(3)?,         // created_at
                 r.get::<_, Option<String>>(4)?, // updated_at
                 r.get::<_, bool>(5)?,           // is_minimized
-                r.get::<_, Option<String>>(6)?, // deleted_at
-                r.get::<_, Option<String>>(7)?, // url
+                r.get::<_, Option<String>>(6)?, // author_type
+                r.get::<_, Option<String>>(7)?, // deleted_at
+                r.get::<_, Option<String>>(8)?, // url
             ))
         })
         .map_err(classify_ours)?;
     for row in rows {
-        let (author, assoc, body, created, updated, minimized, deleted, url) =
+        let (author, assoc, body, created, updated, minimized, author_type, deleted, url) =
             row.map_err(classify_ours)?;
         let (body, elided) = elide(&body, max_body_bytes);
         derivation.push((author.clone(), minimized, deleted.is_some()));
         docs.push(json!({
             "author": author,
             "author_assoc": assoc,
+            // The structural __typename; null = ingested before the column
+            // existed (re-hydration types it). Disclosed so a reader can
+            // see WHY a bot's comment moved no attention bucket.
+            "author_type": author_type,
             "body": body,
             "body_elided": elided,
             "created_at": created,
@@ -2504,7 +2539,16 @@ mod explain_gates {
         assert_plan(
             conn,
             "other_last_activity",
-            HOT_OTHER_LAST_ACTIVITY,
+            &other_last_activity_sql(0),
+            &["SEARCH comments USING INDEX idx_comments_parent"],
+            &["SCAN comments"],
+        );
+        // The allow-list variant must not defeat the index either — the
+        // IN rides inside the OR, off the indexed (parent_kind, parent).
+        assert_plan(
+            conn,
+            "other_last_activity_reply_bots",
+            &other_last_activity_sql(2),
             &["SEARCH comments USING INDEX idx_comments_parent"],
             &["SCAN comments"],
         );

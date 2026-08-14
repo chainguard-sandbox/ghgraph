@@ -214,6 +214,7 @@ mutants-extreme: ## Pseudo-tested-code sweep: function-replacement mutants only 
 # line numbers that drift. Entries mirror .cargo/mutants.toml exclude_re
 # plus the documented-at-code survivors.
 MUTANTS_EQUIV := \
+	'replace kani_proofs::|3' \
 	'replace match guard e.kind\(\) == std::io::ErrorKind::BrokenPipe with true in emit|1' \
 	'replace match guard e.kind\(\) == std::io::ErrorKind::InvalidData with true in serve|1' \
 	'replace match guard e.kind\(\) == std::io::ErrorKind::ArgumentListTooLong with true in call|1' \

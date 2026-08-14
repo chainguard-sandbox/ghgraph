@@ -79,6 +79,7 @@
       {
         "author": "bob",
         "author_assoc": "MEMBER",
+        "author_type": null,
         "body": "retry te",
         "body_elided": true,
         "created_at": "2026-01-04T00:00:00Z",
@@ -90,6 +91,7 @@
       {
         "author": null,
         "author_assoc": null,
+        "author_type": null,
         "body": "withdraw",
         "body_elided": true,
         "created_at": "2026-01-04T01:00:00Z",
@@ -188,6 +190,7 @@
           {
             "author": "me",
             "author_assoc": "OWNER",
+            "author_type": null,
             "body": "answered",
             "body_elided": true,
             "created_at": "2026-01-03T03:00:00Z",
@@ -199,6 +202,7 @@
           {
             "author": "mallory",
             "author_assoc": "NONE",
+            "author_type": null,
             "body": "<script>",
             "body_elided": true,
             "created_at": "2026-01-03T04:00:00Z",
@@ -220,6 +224,7 @@
           {
             "author": "me",
             "author_assoc": "OWNER",
+            "author_type": null,
             "body": "does thi",
             "body_elided": true,
             "created_at": "2026-01-03T00:00:00Z",
@@ -231,6 +236,7 @@
           {
             "author": "alice",
             "author_assoc": "CONTRIBUTOR",
+            "author_type": null,
             "body": "yes — ",
             "body_elided": true,
             "created_at": "2026-01-03T01:00:00Z",
@@ -252,6 +258,7 @@
           {
             "author": "alice",
             "author_assoc": "CONTRIBUTOR",
+            "author_type": null,
             "body": "fixed in",
             "body_elided": true,
             "created_at": "2026-01-03T02:00:00Z",

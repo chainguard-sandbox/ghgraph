@@ -1976,3 +1976,82 @@ fn attention_triage_off_drops_maintainer_buckets_read_side() {
         "the demand surface narrows; nothing else moves"
     );
 }
+
+/// The Bot exclusion in they_replied, integration-seated with every
+/// direction: a Bot-typed comment is machinery and never a reply (17); a
+/// User-typed one is (18); an UNTYPED one — a row from before the column
+/// existed — fails OPEN as a human reply (19), so the migration window
+/// can over-report but never suppress; and a bot NAMED in reply_bots
+/// counts (20) — matched case-insensitively under the type gate, the
+/// config spelling differing from the stored login on purpose.
+/// attention.rs owns the judgment; this is the SQL-fed witness.
+#[test]
+fn they_replied_ignores_bots_and_fails_open_on_untyped() {
+    let s = Scratch::new();
+    seed(&s);
+    {
+        let arch = db::open_rw(&s.db_path()).unwrap();
+        let c = arch.conn();
+        for (pk, commenter, ctype) in [
+            (17, "stale-bot", Some("Bot")),
+            (18, "colleague", Some("User")),
+            (19, "old-row", None::<&str>),
+            (20, "helper-bot", Some("Bot")),
+        ] {
+            c.execute(
+                &format!(
+                    "INSERT INTO prs (pk, id, repo, number, title, state, is_draft, author, \
+                                      created_at, updated_at, url) \
+                     VALUES ({pk}, 'PR_a{pk}', 'octo/alpha', {pk}, 'Probe bot reply', 'OPEN', 0, \
+                             'me', '2026-01-02T00:00:00Z', '2026-01-05T00:00:00Z', 'u{pk}')"
+                ),
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO comments (id, parent_kind, parent, kind, author, author_type, \
+                                       body, created_at) \
+                 VALUES (?1, 'pr', ?2, 'comment', ?3, ?4, 'ping', '2026-01-04T00:00:00Z')",
+                rusqlite::params![format!("C_a{pk}"), pk, commenter, ctype],
+            )
+            .unwrap();
+        }
+    }
+    s.write_config(&json!({
+        "viewer": "me",
+        "repos": ["octo/alpha", {"repo": "octo/beta", "scope": "project"}],
+        "people": ["alice"],
+        "reply_bots": ["Helper-Bot"],
+    }));
+    let doc = s.run_ok(&["attention"]);
+    let replied: Vec<i64> = doc["attention"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["bucket"] == "they_replied")
+        .unwrap()["prs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["number"].as_i64().unwrap())
+        .collect();
+    assert!(
+        !replied.contains(&17),
+        "an UNLISTED Bot-typed comment is machinery, never a reply — even \
+         with an allow-list present"
+    );
+    assert!(
+        replied.contains(&18),
+        "control: a User-typed comment is a reply"
+    );
+    assert!(
+        replied.contains(&19),
+        "an untyped comment fails OPEN as a reply — the migration window \
+         over-reports, never suppresses"
+    );
+    assert!(
+        replied.contains(&20),
+        "a bot named in reply_bots counts as a reply, matched \
+         case-insensitively under the type gate"
+    );
+}

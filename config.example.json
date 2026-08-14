@@ -17,6 +17,9 @@
   "teams": [
     "a-team-you-are-on"
   ],
+  "reply_bots": [
+    "a-review-bot-you-answer"
+  ],
   "lookback_days": 90,
   "reverify_open_days": 7,
   "reverify_closed_days": 30,

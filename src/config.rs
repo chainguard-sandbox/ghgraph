@@ -248,6 +248,25 @@ pub struct Config {
     /// a real multi-org operator hitting the collision.
     #[serde(default)]
     pub teams: Vec<TeamName>,
+    /// Bot logins whose comments COUNT as replies in `attention`'s
+    /// they_replied — the explicit opt-in over the default that Bot-typed
+    /// comments are machinery, not conversation. The default is right for
+    /// the ambient population (stale warnings, deploy previews, coverage
+    /// summaries, tracker linkbacks), and wrong for a review bot the
+    /// operator answers daily — that bot is named here. Matched only
+    /// under the structural type gate (author_type = 'Bot'), by the same
+    /// ASCII-case-insensitive rule as every login comparison, so a HUMAN
+    /// sharing a listed name never rides the bot rule. Read-side, like
+    /// `teams`: never part of the sync fingerprint, so editing it
+    /// re-derives buckets instantly and cold-starts nothing. Naming an
+    /// author that ingest excludes (exclude_authors, or bots off at
+    /// project scope — those govern PR AUTHORSHIP, so the bot's comments
+    /// on others' PRs still archive) is a silent no-op only when no rows
+    /// exist to match; recorded here so the warn-on-composition idea is
+    /// a decision, not an oversight — it returns if a real config is
+    /// bitten.
+    #[serde(default)]
+    pub reply_bots: Vec<Login>,
     /// Archive path. Default: $XDG_DATA_HOME/ghgraph/ghgraph.db.
     #[serde(default)]
     pub db_path: Option<PathBuf>,
@@ -344,6 +363,18 @@ fn validate(cfg: &Config) -> Result<()> {
         return Err(Error::config(
             "reverify_open_days and reverify_closed_days must be at least 1              (for a full refetch every run, use sync --full)",
         ));
+    }
+    // The bound is SQLite's, not taste: each named bot is one bound
+    // placeholder in the they_replied statement (report.rs), and the
+    // engine caps variables at 32,766 — two are spent on (pr, viewer).
+    // Refusing here keeps the failure CONFIGURATION with the real actor
+    // instead of an INTERNAL bind error mid-read.
+    if cfg.reply_bots.len() > 32_764 {
+        return Err(Error::config(format!(
+            "reply_bots names {} bots; the archive's SQL engine binds at \
+             most 32,764 alongside the statement's own parameters",
+            cfg.reply_bots.len()
+        )));
     }
     for entry in &cfg.repos {
         let rc = entry.resolved();
@@ -512,6 +543,36 @@ mod tests {
             )
             .is_ok(),
             "a clean config must parse"
+        );
+    }
+
+    // The reply_bots bind-limit boundary, both sides: 32,764 is the last
+    // accepted length and 32,765 the first refused — the discriminating
+    // pair for the guard's comparison (a widened >= refuses the last
+    // legal config; a narrowed == accepts everything past the limit and
+    // the bind fails mid-read as INTERNAL, the laundering the guard
+    // exists to prevent).
+    #[test]
+    fn reply_bots_is_bounded_by_the_bind_limit() {
+        let bots = |n: usize| {
+            let list: Vec<String> = (0..n).map(|i| format!("\"b{i}\"")).collect();
+            format!(
+                r#"{{"viewer":"v","repos":["o/n"],"reply_bots":[{}]}}"#,
+                list.join(",")
+            )
+        };
+        assert!(
+            parse(&bots(32_764), "<test>").is_ok(),
+            "the last length the engine can bind must parse"
+        );
+        let e = parse(&bots(32_765), "<test>")
+            .err()
+            .expect("one past the bind limit must be refused");
+        assert_eq!(e.code, crate::error::Code::Configuration);
+        assert!(
+            e.message.contains("32,764"),
+            "the refusal names the limit: {}",
+            e.message
         );
     }
 
