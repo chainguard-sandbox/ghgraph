@@ -297,3 +297,34 @@ fn capture_pr_id() {
     );
     write_fixture("pr_id.json", &raw);
 }
+
+#[test]
+#[ignore = "talks to live GitHub and rewrites tests/fixtures/ — run explicitly"]
+fn capture_type_backfill() {
+    // Ids come from the already-captured hydration fixture — the same
+    // comment node ids the archive would store — so the capture exercises
+    // the lane's real input shape: known ids in, scalar typenames out.
+    // The null-element outcome is NOT capturable on demand (an undecodable
+    // id is a GraphQL error, not a null node; a decodable-but-dead one
+    // requires a deleted comment to exist) — the synthetic parse test
+    // carries that shape instead.
+    let hydrate: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/hydrate_pr_comments.json"))
+            .expect("hydrate fixture parses");
+    let ids: Vec<String> = hydrate["data"]["node"]["comments"]["nodes"]
+        .as_array()
+        .expect("fixture carries comments")
+        .iter()
+        .filter_map(|c| c["id"].as_str().map(str::to_string))
+        .take(2)
+        .collect();
+    assert!(
+        !ids.is_empty(),
+        "fixture must carry at least one comment id"
+    );
+    let vars: Vec<(&str, &str)> = ids.iter().map(|i| ("ids[]", i.as_str())).collect();
+    write_fixture(
+        "type_backfill.json",
+        &gh_graphql(ghgraph::queries::TYPE_BACKFILL, &vars),
+    );
+}

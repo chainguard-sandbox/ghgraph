@@ -1,0 +1,25 @@
+{
+  "data": {
+    "nodes": [
+      {
+        "author": {
+          "__typename": "User",
+          "login": "skarim"
+        },
+        "id": "IC_kwDODKw3uc8AAAABMHL0mw"
+      },
+      {
+        "author": {
+          "__typename": "User",
+          "login": "williammartin"
+        },
+        "id": "IC_kwDODKw3uc8AAAABMHaj5w"
+      }
+    ],
+    "rateLimit": {
+      "cost": 1,
+      "remaining": 4996,
+      "resetAt": "2026-08-14T17:59:15Z"
+    }
+  }
+}

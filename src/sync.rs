@@ -635,7 +635,7 @@ pub fn run(cfg: &Config, full: bool, pr: Option<&str>) -> Result<Value> {
         // The writer's original Sender is dropped before the recv loop, or
         // the loop never terminates (module invariant).
         drop(tx);
-        writer(&mut archive, rx, &now, &repo_names)
+        writer(cfg, &mut archive, rx, &now, &repo_names)
     })
 }
 
@@ -2903,6 +2903,7 @@ struct RepoTally {
 }
 
 fn writer(
+    cfg: &Config,
     archive: &mut RwArchive,
     rx: Receiver<Msg>,
     now: &Rfc3339Utc,
@@ -3091,7 +3092,12 @@ fn writer(
     }
 
     record_run(archive, now, &tallies, &samples)?;
-    Ok(summary(&tallies))
+    let mut doc = summary(&tallies);
+    let seed = tallies.values().filter_map(|t| t.remaining).min();
+    if let Some(lane) = type_backfill(cfg, archive, seed)? {
+        doc["sync"]["type_backfill"] = lane;
+    }
+    Ok(doc)
 }
 
 /// The sync_runs row: one flat INSERT per completed run, after the recv loop
@@ -4596,6 +4602,155 @@ fn upsert_linked_issue(
 // ---------------------------------------------------------------------------
 // Summary
 
+/// The type-backfill lane: give every stored comment its author's
+/// structural __typename, 100 known node ids per call, one scalar each —
+/// the cheapest shape the API sells (~1 point per call), so the whole
+/// archive types for ~1% of what a --full walk costs. The archive is the
+/// cursor: the lane selects WHERE author_type IS NULL (deterministic id
+/// order), so completed chunks can never be re-paid, a floor deferral
+/// strands at most one chunk, and restart after any kill is free — the
+/// convergence discipline the watermark gives discovery, had here by
+/// construction instead of by a second register. The lane never stamps
+/// verified_at (this fetch constructs no completeness witness) and never
+/// touches watermarks (it is not discovery); every selected id resolves
+/// to a defined outcome — typed (the author's __typename), unresolvable
+/// ('' — the node or its author is gone upstream; a durable marker so
+/// the lane terminates instead of re-paying dead ids forever; reads
+/// treat '' exactly like NULL, failing open), or deferred (still NULL,
+/// re-selected next run). Ghost authors (comments.author IS NULL) are
+/// excluded outright: there is no author to type, and the ghost's
+/// fail-open reading is the DESIGNED one, permanent. Runs after
+/// record_run — the telemetry row describes the sync proper; the lane
+/// discloses itself in the summary — and a gh failure stops the lane
+/// with the error disclosed, never failing a run whose sync already
+/// succeeded.
+fn type_backfill(
+    cfg: &Config,
+    archive: &mut db::RwArchive,
+    seed_remaining: Option<u32>,
+) -> Result<Option<Value>> {
+    let pending_sql = "SELECT id FROM comments WHERE author_type IS NULL \
+         AND author IS NOT NULL AND deleted_at IS NULL ORDER BY id LIMIT 100";
+    let count_sql = "SELECT count(*) FROM comments WHERE author_type IS NULL \
+         AND author IS NOT NULL AND deleted_at IS NULL";
+    let mut ctx = gh::GhCtx::new(cfg.retry_attempts, cfg.retry_budget);
+    let mut typed = 0u64;
+    let mut unresolvable = 0u64;
+    let mut remaining = seed_remaining;
+    let mut deferred = false;
+    let mut error: Option<String> = None;
+    loop {
+        // None never defers, by policy: an unmetered response (rateLimit
+        // absent — the posture the run's rate_limit_unknown counter
+        // records) must not stall the lane forever, and the lane is
+        // bounded without the meter: every chunk either shrinks the
+        // pending set or the progress guard stops it, so the worst
+        // unmetered spend is ceil(pending / 100) single-point calls.
+        if remaining.is_some_and(|r| r < cfg.rate_limit_floor) {
+            deferred = true;
+            break;
+        }
+        let ids: Vec<String> = {
+            let mut stmt = archive
+                .conn()
+                .prepare(pending_sql)
+                .map_err(|e| classify_sql(&e))?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| classify_sql(&e))?;
+            rows.collect::<std::result::Result<_, _>>()
+                .map_err(|e| classify_sql(&e))?
+        };
+        if ids.is_empty() {
+            break;
+        }
+        let vars: Vec<(&str, &str)> = ids.iter().map(|i| ("ids[]", i.as_str())).collect();
+        let resp = match gh::graphql(queries::TYPE_BACKFILL, &vars, &mut ctx) {
+            Ok(r) => r,
+            Err(e) => {
+                // The sync already succeeded; the lane's failure is its
+                // own, disclosed rather than escalated. The stranded rows
+                // stay NULL and re-select next run.
+                error = Some(e.error.message);
+                break;
+            }
+        };
+        let nodes = match parse::type_backfill(&resp.data) {
+            Ok(n) => n,
+            Err(e) => {
+                error = Some(e.to_string());
+                break;
+            }
+        };
+        let tx = archive
+            .conn_mut()
+            .transaction()
+            .map_err(|e| classify_sql(&e))?;
+        let mut wrote = 0usize;
+        // zip is total here: the API aligns nodes 1:1 with the requested
+        // ids; a shorter reply leaves the tail NULL for the next pass
+        // rather than mis-attributing across positions.
+        for (id, node) in ids.iter().zip(nodes.iter()) {
+            let value: Option<&str> = match node {
+                Some(n) => match (n.id == *id, &n.author) {
+                    (true, Some(a)) => Some(a.typename.as_str()),
+                    // Fragment mismatch or ghost-at-source: unresolvable.
+                    (true, None) => None,
+                    // Positional drift (never observed; nodes echoes ids
+                    // in order): skip rather than write to the wrong row.
+                    (false, _) => continue,
+                },
+                None => None,
+            };
+            let marker = value.unwrap_or("");
+            let n = tx
+                .execute(
+                    "UPDATE comments SET author_type = ?1 WHERE id = ?2 AND author_type IS NULL",
+                    rusqlite::params![marker, id],
+                )
+                .map_err(|e| classify_sql(&e))?;
+            // n is 1 by construction (unique id, single writer, NULL
+            // guard); counting classifications directly keeps the counts
+            // meaningful even if a future concurrent writer made n zero —
+            // wrote alone carries the progress judgment.
+            wrote += n;
+            if value.is_some() {
+                typed += 1;
+            } else {
+                unresolvable += 1;
+            }
+        }
+        tx.commit().map_err(|e| classify_sql(&e))?;
+        remaining = ctx.tel.remaining.or(remaining);
+        // Progress guard, structural: rows WRITTEN this chunk, straight
+        // from the UPDATEs' own change counts. A workless chunk (every
+        // node mismatched or the reply misaligned) would re-select the
+        // same ids forever; it stops the lane with the fact disclosed,
+        // and the rows stay NULL for the next run.
+        if wrote == 0 {
+            error = Some("a chunk resolved no ids; lane stopped".to_string());
+            break;
+        }
+    }
+    let remaining_untyped: i64 = archive
+        .conn()
+        .query_row(count_sql, [], |r| r.get::<_, i64>(0))
+        .map_err(|e| classify_sql(&e))?;
+    if typed == 0 && unresolvable == 0 && remaining_untyped == 0 && error.is_none() {
+        return Ok(None);
+    }
+    let mut lane = serde_json::json!({
+        "typed": typed,
+        "unresolvable": unresolvable,
+        "remaining_untyped": remaining_untyped,
+        "deferred_at_floor": deferred,
+    });
+    if let Some(msg) = error {
+        lane["error"] = serde_json::json!(msg);
+    }
+    Ok(Some(lane))
+}
+
 fn summary(tallies: &BTreeMap<String, RepoTally>) -> Value {
     let repos: Vec<Value> = tallies
         .iter()
@@ -4671,6 +4826,20 @@ fn summary(tallies: &BTreeMap<String, RepoTally>) -> Value {
 pub fn incomplete(doc: &Value) -> bool {
     if let Some(pr) = doc.pointer("/sync/pr") {
         return pr.get("truncated").and_then(Value::as_bool) != Some(false);
+    }
+    // The type-backfill lane gates on ERROR only: a broken instrument
+    // deserves the strict signal. Its deferral and remaining counts do
+    // NOT gate — they pace an enrichment whose absence fails OPEN in
+    // every reader (uncertainty escalates, never suppresses), so the
+    // strict flag's claim — incomplete DATA — is not met; the rows are
+    // whole, the typing is pending, and both are disclosed. Contrast the
+    // per-repo floor flag below, which gates because data itself is
+    // missing.
+    if doc
+        .pointer("/sync/type_backfill/error")
+        .is_some_and(|e| !e.is_null())
+    {
+        return true;
     }
     match doc.pointer("/sync/repos").and_then(Value::as_array) {
         None => true,

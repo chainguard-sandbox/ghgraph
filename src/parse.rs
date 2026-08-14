@@ -144,6 +144,7 @@ pub enum Doc {
     TailComments,
     SkeletonThreadsPage,
     ThreadBodies,
+    TypeBackfill,
 }
 
 impl fmt::Display for Doc {
@@ -160,6 +161,7 @@ impl fmt::Display for Doc {
             Doc::TailComments => "TAIL_COMMENTS",
             Doc::SkeletonThreadsPage => "SKELETON_THREADS_PAGE",
             Doc::ThreadBodies => "THREAD_BODIES",
+            Doc::TypeBackfill => "TYPE_BACKFILL",
         })
     }
 }
@@ -701,6 +703,45 @@ pub fn comments_page(data: &serde_json::Value) -> Result<Option<CommentsPageNode
         .map(|d| d.node)
         .map_err(|_| ParseError {
             doc: Doc::CommentsPage,
+        })
+}
+
+// ---------------------------------------------------------------------------
+// TYPE_BACKFILL
+
+/// One node from the type-backfill document: the id echoes the request
+/// (Node interface), the author is present only when a fragment matched
+/// AND the account survives — both absences are the lane's unresolvable
+/// outcome, decided by the CALLER (the lane owns the marker; parse only
+/// reports shape).
+#[derive(Deserialize)]
+#[cfg_attr(feature = "harness", derive(Serialize))]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TypeBackfillNode {
+    pub id: String,
+    #[serde(default)]
+    pub author: Option<Author>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct TypeBackfillData {
+    /// The nodes array aligns 1:1 with the requested ids; a NULL element
+    /// is a node the API could not resolve (deleted, or unviewable) —
+    /// live data, not an error, exactly like a null author.
+    nodes: Vec<Option<TypeBackfillNode>>,
+    /// See DiscoveryData::rate_limit.
+    #[allow(dead_code)]
+    rate_limit: Option<serde_json::Value>,
+}
+
+pub fn type_backfill(
+    data: &serde_json::Value,
+) -> Result<Vec<Option<TypeBackfillNode>>, ParseError> {
+    TypeBackfillData::deserialize(data)
+        .map(|d| d.nodes)
+        .map_err(|_| ParseError {
+            doc: Doc::TypeBackfill,
         })
 }
 
@@ -1389,6 +1430,59 @@ mod tests {
         let mut pr = minimal_pr();
         pr["updatedAt"] = json!("2026-01-01T00:00:00+02:00"); // offset form: not Z
         assert!(hydrate_pr(&json!({"node": pr})).is_err());
+    }
+
+    // The live-captured TYPE_BACKFILL shape (tests/fixtures/, re-captured
+    // by capture_type_backfill): the schema witness for the lane's real
+    // input — known ids in, scalar typenames out, rateLimit riding along.
+    #[test]
+    fn fixture_type_backfill_parses() {
+        let nodes =
+            type_backfill(&data(include_str!("../tests/fixtures/type_backfill.json"))).unwrap();
+        assert_eq!(nodes.len(), 2);
+        for n in nodes.iter().map(|n| n.as_ref().unwrap()) {
+            assert!(!n.id.is_empty());
+            assert_eq!(n.author.as_ref().unwrap().typename, "User");
+        }
+    }
+
+    // TYPE_BACKFILL's three data shapes, pinned at the parse rung: a null
+    // ELEMENT is an unresolvable node (data, not error); an absent author
+    // KEY is a fragment miss or ghost (None — #[serde(default)] departs
+    // from the `nullable` macro's key-required rule ON PURPOSE, and this
+    // pin guards against an accidental switch back); rate_limit tolerated
+    // present or absent like every sibling document.
+    #[test]
+    fn type_backfill_shapes_are_data_not_errors() {
+        let doc = serde_json::json!({
+            "nodes": [
+                {"id": "C_1", "author": {"login": "a", "__typename": "User"}},
+                null,
+                {"id": "C_3"}
+            ],
+            "rateLimit": {"cost": 1, "remaining": 4000, "resetAt": "2026-01-01T00:00:00Z"}
+        });
+        let nodes = type_backfill(&doc).expect("all three shapes parse");
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(
+            nodes[0].as_ref().unwrap().author.as_ref().unwrap().typename,
+            "User"
+        );
+        assert!(nodes[1].is_none(), "a null element is an unresolvable node");
+        assert!(
+            nodes[2].as_ref().unwrap().author.is_none(),
+            "an absent author key is None, never an error"
+        );
+        let bare = serde_json::json!({"nodes": []});
+        assert!(
+            type_backfill(&bare).is_ok(),
+            "rate_limit absent is tolerated"
+        );
+        let wrong = serde_json::json!({"nodes": [{"unexpected": 1}]});
+        assert!(
+            type_backfill(&wrong).is_err(),
+            "an unknown-field node is a shape error, named TYPE_BACKFILL"
+        );
     }
 
     #[test]

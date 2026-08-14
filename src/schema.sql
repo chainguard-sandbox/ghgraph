@@ -155,7 +155,12 @@ CREATE TABLE IF NOT EXISTS comments (
   updated_at   TEXT,                     -- edit detection; keeps the FTS copy honest
   url          TEXT,
   deleted_at   TEXT,
-  author_type  TEXT                      -- GraphQL __typename (User|Bot|...).
+  author_type  TEXT                      -- GraphQL __typename (User|Bot|...),
+                                         -- or '' = unresolvable at backfill
+                                         -- (node or author gone upstream —
+                                         -- a durable marker so the lane
+                                         -- terminates; reads treat '' like
+                                         -- NULL, failing open).
                                          -- LAST on purpose: v4 archives gain
                                          -- it by appending ALTER (db.rs), and
                                          -- the fresh shape must agree or

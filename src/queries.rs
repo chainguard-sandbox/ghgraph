@@ -586,6 +586,27 @@ query($owner: String!, $name: String!) {{
     )
 }
 
+/// The type-backfill lane's one document (sync.rs, type_backfill): the
+/// author's structural __typename for up to 100 KNOWN comment node ids, and
+/// nothing else — no connections, no bodies, so the cost model prices the
+/// whole call at ~1 point per 100 nodes. Ids travel as an array VARIABLE
+/// (`-f ids[]=…` per id — gh assembles the array), never query text: node
+/// ids are API-derived data and data stays out of documents. The three
+/// fragments cover every node type a comments row stores (schema.sql:
+/// kind = comment | review_comment | review; issue comments are
+/// IssueComment nodes too). A node outside all three still returns its id
+/// (Node interface), author absent — the lane's unresolvable outcome.
+pub const TYPE_BACKFILL: &str = r#"
+query($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    id
+    ... on IssueComment { author { login __typename } }
+    ... on PullRequestReviewComment { author { login __typename } }
+    ... on PullRequestReview { author { login __typename } }
+  }
+  rateLimit { cost remaining resetAt }
+}"#;
+
 #[cfg(test)]
 mod tests {
     use super::discovery_terms;
