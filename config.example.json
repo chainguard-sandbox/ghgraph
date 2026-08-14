@@ -24,5 +24,5 @@
   "reverify_open_days": 7,
   "reverify_closed_days": 30,
   "workers": 3,
-  "rate_limit_floor": 500
+  "rate_limit_floor": 2500
 }

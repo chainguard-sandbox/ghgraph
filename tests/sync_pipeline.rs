@@ -1837,7 +1837,12 @@ fn unsplittable_capped_window_halts_the_stream() {
 fn floor_boundary_is_strict() {
     for (remaining, defers) in [(500u32, false), (499, true)] {
         let fake = Fake::new();
-        fake.config(&base_config()); // rate_limit_floor: 500 default
+        let mut cfg = base_config();
+        // Pinned explicitly: the boundary pair tests the COMPARISON's
+        // strictness, not the shipped default (which the config defaults
+        // test owns).
+        cfg["rate_limit_floor"] = json!(500);
+        fake.config(&cfg);
         let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
         a.remaining = remaining; // observed after the FIRST hydration
         let b = Pr::new("PR_2", 2, "2026-07-20T11:00:00Z");
@@ -2512,7 +2517,10 @@ fn issue_floor_boundary_gates_follow_up_pages() {
         let fake = Fake::new();
         fake.config(&json!({
             "viewer": "viewer",
-            "repos": [{"repo": "o/n", "scope": "project"}], // floor: 500 default
+            "repos": [{"repo": "o/n", "scope": "project"}],
+            // Pinned: the boundary pair tests the comparison, not the
+            // shipped default (the config defaults test owns that).
+            "rate_limit_floor": 500,
             "workers": 1, "retry_attempts": 1, "retry_budget": 5
         }));
         install_prs(&fake, &[]);
@@ -3126,7 +3134,11 @@ fn refresh_escalates_on_deletion_and_the_full_walk_sweeps() {
 #[test]
 fn refresh_tail_hit_upserts_without_stamp() {
     let fake = Fake::new();
-    fake.config(&base_config());
+    let mut cfg = base_config();
+    // Pinned: this walk-abort scenario scripts `remaining` values around
+    // 500; the shipped default is the defaults test's to own.
+    cfg["rate_limit_floor"] = json!(500);
+    fake.config(&cfg);
     let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
     a.comment_ids = vec!["C_a".into()];
     install_prs(&fake, &[&a]);
@@ -3223,7 +3235,11 @@ fn refresh_walks_back_to_the_anchor() {
 #[test]
 fn refresh_escalates_unanchored_and_moved_counts() {
     let fake = Fake::new();
-    fake.config(&base_config());
+    let mut cfg = base_config();
+    // Pinned: this walk-abort scenario scripts `remaining` values around
+    // 500; the shipped default is the defaults test's to own.
+    cfg["rate_limit_floor"] = json!(500);
+    fake.config(&cfg);
     let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
     a.comment_ids = vec!["C_a".into()];
     install_prs(&fake, &[&a]);
@@ -3494,7 +3510,11 @@ fn refresh_gate_requires_an_untruncated_baseline() {
 #[test]
 fn refresh_floor_aborts_the_walk_back() {
     let fake = Fake::new();
-    fake.config(&base_config());
+    let mut cfg = base_config();
+    // Pinned: this walk-abort scenario scripts `remaining` values around
+    // 500; the shipped default is the defaults test's to own.
+    cfg["rate_limit_floor"] = json!(500);
+    fake.config(&cfg);
     let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
     a.comment_ids = vec!["C_a".into()];
     install_prs(&fake, &[&a]);
@@ -3588,7 +3608,11 @@ fn refresh_first_comment_hits_without_an_anchor() {
 #[test]
 fn refresh_escalates_on_a_non_advancing_cursor() {
     let fake = Fake::new();
-    fake.config(&base_config());
+    let mut cfg = base_config();
+    // Pinned: this walk-abort scenario scripts `remaining` values around
+    // 500; the shipped default is the defaults test's to own.
+    cfg["rate_limit_floor"] = json!(500);
+    fake.config(&cfg);
     let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
     a.comment_ids = vec!["C_a".into()];
     install_prs(&fake, &[&a]);
