@@ -48,16 +48,22 @@ fn default_retry_budget() -> u32 {
 
 fn default_rate_limit_floor() -> u32 {
     // The GraphQL point budget (5,000/hr) is shared with the operator's
-    // interactive gh use and anything else on the token. When `remaining`
-    // falls below the floor, sync defers the rest of the run — typed
-    // Deferred messages, watermarks holding at the last completed window —
-    // instead of draining the budget to zero. 10% of the hourly budget by
-    // default. The floor is SOFT by K·c_max (workers in flight when the
+    // interactive gh use and anything else on the token — including the
+    // operator's agents. When `remaining` falls below the floor, sync
+    // defers the rest of the run — typed Deferred messages, watermarks
+    // holding at the last completed window — instead of draining the
+    // budget to zero. Half the budget by default: an even split between
+    // the tool and everything else on the token. Steady-state
+    // incremental syncs cost a few hundred points (sync_runs is the
+    // measure), so the floor never touches them; the passes it can
+    // defer (cold starts, --full) converge across runs by design, so a
+    // generous floor costs wall-clock spread, never lost work. The
+    // floor is SOFT by K·c_max (workers in flight when the
     // threshold trips finish their calls); do not "fix" this with worker
     // coordination — the softness is documented, the coordination is not
     // worth its complexity. `sync --pr` is exempt: the floor exists to
     // protect interactive use, and --pr is interactive use.
-    500
+    2500
 }
 
 /// Which slice of a repo discovery walks.
@@ -501,7 +507,7 @@ mod tests {
         assert_eq!(c.reverify_open_days, 7);
         assert_eq!(c.reverify_closed_days, 30);
         assert_eq!(c.workers, 3);
-        assert_eq!(c.rate_limit_floor, 500);
+        assert_eq!(c.rate_limit_floor, 2500);
         assert_eq!(c.retry_attempts, 3);
         assert_eq!(c.retry_budget, 20);
     }
