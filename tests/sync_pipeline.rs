@@ -64,6 +64,12 @@ for a in "$@"; do
 done
 run=$(cat "$dir/run_n" 2>/dev/null || echo 1)
 case "$doc" in
+  *'nodes(ids:'*)
+    seqf="$dir/typefill_seq_$run"; s=$(cat "$seqf" 2>/dev/null || echo 0); echo $((s+1)) > "$seqf"
+    echo "TYPEFILL|run=$run|seq=$s" >> "$dir/calls.log"
+    resp="$dir/typefill-$run-$s.json"
+    [ -f "$resp" ] || resp="$dir/typefill-default.json"
+    ;;
   *'search(type: ISSUE'*)
     case "$q" in
       *'is:issue'*)
@@ -3822,5 +3828,189 @@ fn targeted_rate_exhaustion_envelope_carries_retry_after() {
     assert_eq!(
         err["retry_after"], "2026-08-01T00:00:00Z",
         "the reset the run learned rides the envelope: {err}"
+    );
+}
+
+// 12. Type backfill: the archive is the cursor; every id a defined outcome.
+
+/// Strip typing from ingested comments so the lane has work — the shape a
+/// pre-v5 archive leaves behind, constructed directly because the current
+/// writer always types what it ingests.
+fn untype_comments(fake: &Fake) {
+    fake.db()
+        .execute("UPDATE comments SET author_type = NULL", [])
+        .unwrap();
+}
+
+/// The lane's own pending set, in the lane's own order — fixtures built
+/// from this stay aligned however many comment rows a Pr fixture emits
+/// (top-level comments, reviews, thread comments alike).
+fn pending_ids(fake: &Fake) -> Vec<String> {
+    let db = fake.db();
+    let mut stmt = db
+        .prepare(
+            "SELECT id FROM comments WHERE author_type IS NULL \
+               AND author IS NOT NULL AND deleted_at IS NULL ORDER BY id",
+        )
+        .unwrap();
+    stmt.query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<String>, _>>()
+        .unwrap()
+}
+
+#[test]
+fn type_backfill_types_marks_and_terminates() {
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    a.comment_ids = vec!["C_h".into(), "C_b".into(), "C_gone".into()];
+    install_prs(&fake, &[&a]);
+    assert_eq!(
+        fake.sync_ok()["sync"].get("type_backfill"),
+        None,
+        "freshly ingested comments are typed; the lane has nothing to say"
+    );
+    untype_comments(&fake);
+    // Later runs discover nothing, or the re-walk's tail fetch would
+    // re-type the rows at ingest before the lane ever saw them.
+    fake.write("disc-default.json", &discovery(&[], None, 4000));
+    // Response aligned to the lane's own pending order: the bot id types
+    // Bot, the gone id resolves to a null NODE, everything else a User —
+    // the three outcomes in one chunk, however many rows the fixture made.
+    let pending = pending_ids(&fake);
+    let expect_typed = (pending.len() - 1) as i64;
+    let nodes: Vec<Value> = pending
+        .iter()
+        .map(|id| match id.as_str() {
+            "C_gone" => Value::Null,
+            "C_b" => json!({"id": id, "author": {"login": "bottington", "__typename": "Bot"}}),
+            _ => json!({"id": id, "author": {"login": "human", "__typename": "User"}}),
+        })
+        .collect();
+    fake.write(
+        "typefill-2-0.json",
+        &json!({"data": {"nodes": nodes, "rateLimit": rate_limit(4000)}}).to_string(),
+    );
+    let doc = fake.sync_ok();
+    let lane = &doc["sync"]["type_backfill"];
+    assert_eq!(lane["typed"], expect_typed, "{lane}");
+    assert_eq!(lane["unresolvable"], 1, "{lane}");
+    assert_eq!(lane["remaining_untyped"], 0, "{lane}");
+    assert_eq!(lane["deferred_at_floor"], false, "{lane}");
+    assert_eq!(lane.get("error"), None, "a clean lane discloses no error");
+    let (h, b, gone): (String, String, String) = fake
+        .db()
+        .query_row(
+            "SELECT (SELECT author_type FROM comments WHERE id='C_h'), \
+                (SELECT author_type FROM comments WHERE id='C_b'), \
+                (SELECT author_type FROM comments WHERE id='C_gone')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (h.as_str(), b.as_str(), gone.as_str()),
+        ("User", "Bot", ""),
+        "typed, typed, durably marked — the lane terminates"
+    );
+    // Termination is the checkpoint: a third run has no pending rows and
+    // makes no nodes call.
+    let doc = fake.sync_ok();
+    assert_eq!(doc["sync"].get("type_backfill"), None);
+    let calls = std::fs::read_to_string(fake.dir.join("calls.log")).unwrap();
+    assert_eq!(
+        calls.matches("TYPEFILL").count(),
+        1,
+        "one chunk ever — completed work is never re-paid"
+    );
+}
+
+#[test]
+fn type_backfill_defers_at_the_floor_and_resumes() {
+    let fake = Fake::new();
+    let mut cfg = base_config();
+    cfg["rate_limit_floor"] = json!(500);
+    fake.config(&cfg);
+    let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    a.comment_ids = vec!["C_1".into(), "C_2".into()];
+    // The sync's own last call reports remaining BELOW the floor, so the
+    // lane must not spend a single point: seed check, immediate deferral.
+    install_prs(&fake, &[&a]);
+    fake.sync_ok();
+    untype_comments(&fake);
+    // Empty discovery whose rateLimit reports one point BELOW the floor:
+    // the lane's seed is the run's own last-known remaining, so it must
+    // not spend a single point — and 499-vs-500 pins the comparison's
+    // strict side (AT the floor the lane runs; see the resume phase).
+    fake.write("disc-default.json", &discovery(&[], None, 499));
+    let stranded = pending_ids(&fake).len() as i64;
+    let doc = fake.sync_ok();
+    let lane = &doc["sync"]["type_backfill"];
+    assert_eq!(lane["deferred_at_floor"], true, "{lane}");
+    assert_eq!(lane["typed"], 0, "{lane}");
+    assert_eq!(lane["remaining_untyped"], stranded, "{lane}");
+    let calls = std::fs::read_to_string(fake.dir.join("calls.log")).unwrap();
+    assert_eq!(
+        calls.matches("TYPEFILL").count(),
+        0,
+        "below the floor the lane spends nothing"
+    );
+    // Budget recovers to EXACTLY the floor: remaining == floor is not
+    // below it, so the lane runs — the boundary's other side.
+    fake.write("disc-default.json", &discovery(&[], None, 500));
+    let nodes: Vec<Value> = pending_ids(&fake)
+        .iter()
+        .map(|id| json!({"id": id, "author": {"login": "human", "__typename": "User"}}))
+        .collect();
+    fake.write(
+        "typefill-default.json",
+        &json!({"data": {"nodes": nodes, "rateLimit": rate_limit(3999)}}).to_string(),
+    );
+    let doc = fake.sync_ok();
+    let lane = &doc["sync"]["type_backfill"];
+    assert_eq!(lane["typed"], stranded, "{lane}");
+    assert_eq!(lane["remaining_untyped"], 0, "{lane}");
+}
+
+#[test]
+fn type_backfill_workless_chunk_stops_and_gates_strict() {
+    // A reply whose every node names some OTHER id writes nothing; the
+    // lane must stop after ONE call with the fact disclosed — not loop
+    // re-paying the same chunk — and a lane error is exactly the
+    // incompleteness --strict exists to surface.
+    let fake = Fake::new();
+    fake.config(&base_config());
+    let mut a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    a.comment_ids = vec!["C_1".into()];
+    install_prs(&fake, &[&a]);
+    fake.sync_ok();
+    untype_comments(&fake);
+    fake.write("disc-default.json", &discovery(&[], None, 4000));
+    fake.write(
+        "typefill-default.json",
+        &json!({"data": {"nodes": [
+            {"id": "SOMEBODY_ELSE", "author": {"login": "x", "__typename": "User"}}
+        ], "rateLimit": rate_limit(4000)}})
+        .to_string(),
+    );
+    let (code, doc, stderr) = fake.run(&["sync", "--strict"]);
+    assert_eq!(
+        code, 1,
+        "a lane error gates the strict exit; stderr:\n{stderr}"
+    );
+    let doc = doc.expect("sync emits one JSON document");
+    let lane = &doc["sync"]["type_backfill"];
+    assert!(
+        lane["error"].as_str().unwrap().contains("resolved no ids"),
+        "the workless stop is disclosed: {lane}"
+    );
+    let stranded = pending_ids(&fake).len();
+    assert!(stranded > 0, "the rows stay NULL for the next run");
+    let calls = std::fs::read_to_string(fake.dir.join("calls.log")).unwrap();
+    assert_eq!(
+        calls.matches("TYPEFILL").count(),
+        1,
+        "one workless chunk, then stop — never a loop"
     );
 }

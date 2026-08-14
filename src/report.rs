@@ -1338,6 +1338,23 @@ pub fn stats(cfg: &Config) -> Result<Value> {
             .map_err(classify_ours)?;
         counts.insert(table.to_string(), Value::Number(n.into()));
     }
+    // The type-backfill countdown: comments whose author still awaits its
+    // structural __typename (sync.rs, type_backfill — the lane's own WHERE,
+    // so this number is exactly its remaining work). Nonzero means
+    // they_replied is failing open on that many rows; zero means the
+    // backfill is done and stays done.
+    let untyped: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM comments WHERE author_type IS NULL \
+               AND author IS NOT NULL AND deleted_at IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(classify_ours)?;
+    counts.insert(
+        "comments_untyped".to_string(),
+        Value::Number(untyped.into()),
+    );
 
     let db_bytes: i64 = conn
         .query_row(
@@ -1937,8 +1954,10 @@ fn comment_rows(
             "author": author,
             "author_assoc": assoc,
             // The structural __typename; null = ingested before the column
-            // existed (re-hydration types it). Disclosed so a reader can
-            // see WHY a bot's comment moved no attention bucket.
+            // existed (re-hydration types it); "" = unresolvable at
+            // backfill (node or author gone upstream — schema.sql).
+            // Both fail open. Disclosed so a reader can see WHY a bot's
+            // comment moved no attention bucket.
             "author_type": author_type,
             "body": body,
             "body_elided": elided,

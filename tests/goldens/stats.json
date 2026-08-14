@@ -100,6 +100,7 @@
     },
     "counts": {
       "comments": 16,
+      "comments_untyped": 15,
       "issues": 6,
       "observations": 3,
       "prs": 10,
@@ -109,7 +110,7 @@
       "review_threads": 4,
       "sync_runs": 0
     },
-    "db_bytes": 200704,
+    "db_bytes": 204800,
     "open_prs": [
       {
         "never_verified": 1,

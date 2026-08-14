@@ -207,9 +207,24 @@ to the deferred list below with its deciding evidence.
   Adopt when a real agent session blows a real client's ingestion cap
   on a default read, sized by that evidence; today's real-archive reads
   measure ~1-3 KB on every verb except a comment-heavy `pr`.
-- Batched `nodes(ids:)` hydration — from the overhead-intercept median over
-  trailing `sync_runs` rows: batch only if spawn overhead dominates, and
-  only after the quarantine exists, or the failure unit becomes the batch.
+- Batched `nodes(ids:)` hydration — PARTIALLY ADOPTED: the type-backfill
+  lane (sync.rs) batches 100 known comment ids per call, meeting the
+  entry's condition — its failure unit is one chunk whose every id
+  resolves to a defined outcome. Full hydration batching stays deferred
+  on the original evidence: the overhead-intercept median over trailing
+  `sync_runs` rows, and only after the quarantine exists, or the failure
+  unit becomes the batch.
+- A durable frontier for `--full` — the full walk ignores watermarks by
+  definition, so a floor-deferred `--full` re-pays completed windows on
+  every retry; measured (2026-08, chainguard-dev/mono): two attempts at
+  ~2,000 points each banked nothing. The design that fits: a walk-scoped
+  cursor in sync_state committed by the same window-completion witness
+  that licenses the watermark, cleared by the completing window, never
+  read by incremental plans. Build it before the next `--full`-class
+  event (a schema backfill the type lane cannot carry, a quiet-mutation
+  incident, a lookback widening on a monorepo) — the type-backfill lane
+  covers column backfills, so the trigger is the first full-refetch need
+  that is NOT one column.
 - Tail size `last: K` and the 50×30 nested thread-comment request (most of
   a hydration's point cost) — from the connection `totalCount` distribution
   once real syncs run.

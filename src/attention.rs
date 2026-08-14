@@ -76,7 +76,8 @@
 //!                     argument; the ambient population stays machinery).
 //!                     The judgment is the structural
 //!                     __typename, never a login pattern; an UNTYPED
-//!                     author (NULL — ingested before the column existed)
+//!                     author (NULL — ingested before the column existed
+//!                     — or '', unresolvable at backfill: schema.sql)
 //!                     fails OPEN as a human until re-hydration types it,
 //!                     so uncertainty escalates here like everywhere
 //!                     else. A third known narrowing joins the two above:
