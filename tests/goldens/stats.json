@@ -99,8 +99,8 @@
       }
     },
     "counts": {
-      "comments": 16,
-      "comments_untyped": 15,
+      "comments": 17,
+      "comments_untyped": 16,
       "issues": 6,
       "observations": 3,
       "prs": 10,

@@ -83,12 +83,12 @@
 //!     production case; the discovery walk resolves a `None` hit to a
 //!     defined outcome like any other id (counted and disclosed as
 //!     health.masked_hits — sync.rs).
-//!   * The three connections the schema itself marks nullable
-//!     (`reviewRequests`, `latestOpinionatedReviews`,
-//!     `closingIssuesReferences`) are `Option<_>` — `None` means that
-//!     connection's resolver failed and was masked, so the hydrator
-//!     treats it as truncation, never as empty (counted_complete,
-//!     sync.rs).
+//!   * `reviewRequests`, `reviews`, and `closingIssuesReferences` are
+//!     `Option<_>` — `None` means that connection's resolver failed and was
+//!     masked (a null the schema permits on the first two by marking them
+//!     nullable; on `reviews` the Option is defensive and uniform, a masked
+//!     resolver reading the same way), so the hydrator treats it as
+//!     truncation, never as empty (counted_complete, sync.rs).
 //!   * Everything else parses strict. A null where this module is strict
 //!     fails the one PR's parse, and the quarantine row (error_class
 //!     'parse') is the disclosed, retried outcome — the correct failure
@@ -261,8 +261,8 @@ pub struct Paged<T> {
 }
 
 /// A connection selected with totalCount + nodes, no pageInfo: the bounded
-/// selections (reviewRequests, latestOpinionatedReviews,
-/// closingIssuesReferences, a thread's comments). Truncation is detectable
+/// selections (reviewRequests, reviews, closingIssuesReferences, a thread's
+/// comments). Truncation is detectable
 /// as `nodes.len() < total_count`; the hydrator owns that judgment.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "harness", derive(Serialize))]
@@ -405,7 +405,7 @@ pub struct PrNode {
     #[serde(deserialize_with = "nullable")]
     pub review_requests: Option<Counted<ReviewRequestNode>>,
     #[serde(deserialize_with = "nullable")]
-    pub latest_opinionated_reviews: Option<Counted<ReviewNode>>,
+    pub reviews: Option<Counted<ReviewNode>>,
     #[serde(deserialize_with = "nullable")]
     pub closing_issues_references: Option<Counted<LinkedIssueNode>>,
     pub comments: Paged<CommentNode>,
@@ -506,14 +506,16 @@ pub struct TeamRef {
 #[serde(deny_unknown_fields)]
 pub struct EmptyObject {}
 
-/// One row of latestOpinionatedReviews: per-reviewer verdict without paging
-/// review history. Becomes a comments row (kind='review'; schema.sql) —
-/// which is why it selects `id` (comments.id is NOT NULL UNIQUE), `body`
-/// (review summaries join comments_fts like any other comment text), and
-/// `url`. `submittedAt` is schema-nullable; a `None` cannot become a
-/// comments row (created_at is NOT NULL) and the writer skips it — an
-/// opinionated review always carries one in practice, so the skip is
-/// disclosure-free (sync.rs records the decision).
+/// One row of the `reviews` connection: a single review of any state
+/// (APPROVED | CHANGES_REQUESTED | COMMENTED | DISMISSED | PENDING). Ingest
+/// (sync.rs ingestable_reviews) selects which become comments rows
+/// (kind='review'; schema.sql) — the latest opinionated verdict per reviewer
+/// plus every COMMENTED review. That is why it selects `id` (comments.id is
+/// NOT NULL UNIQUE), `body` (review summaries join comments_fts like any
+/// other comment text), and `url`. `submittedAt` is null for a PENDING
+/// review (not yet submitted); a `None` cannot become a comments row
+/// (created_at is NOT NULL) and the writer skips it (sync.rs records the
+/// decision).
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "harness", derive(Serialize))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -891,7 +893,7 @@ pub struct RefreshPrNode {
     #[serde(deserialize_with = "nullable")]
     pub review_requests: Option<Counted<ReviewRequestNode>>,
     #[serde(deserialize_with = "nullable")]
-    pub latest_opinionated_reviews: Option<Counted<ReviewNode>>,
+    pub reviews: Option<Counted<ReviewNode>>,
     #[serde(deserialize_with = "nullable")]
     pub closing_issues_references: Option<Counted<LinkedIssueNode>>,
     pub comments: BackPaged<CommentNode>,
@@ -1145,10 +1147,16 @@ mod tests {
         assert!(bot.is_bot());
         assert!(bot.database_id.is_some());
 
-        let reviews = pr.latest_opinionated_reviews.as_ref().unwrap();
-        assert!(reviews.total_count >= 1);
-        assert_eq!(reviews.nodes[0].state, "APPROVED");
-        assert!(reviews.nodes[0].submitted_at.is_some());
+        // The `reviews` connection carries every review, not just verdicts:
+        // this PR has a COMMENTED review (a bot's summary) alongside a human
+        // APPROVED. The COMMENTED one is what latestOpinionatedReviews used to
+        // hide — pinning it here proves the query change surfaces comment-only
+        // reviews for ingest (sync.rs ingestable_reviews).
+        let reviews = pr.reviews.as_ref().unwrap();
+        assert!(reviews.total_count >= 2);
+        assert!(reviews.nodes.iter().any(|r| r.state == "COMMENTED"));
+        assert!(reviews.nodes.iter().any(|r| r.state == "APPROVED"));
+        assert!(reviews.nodes.iter().all(|r| r.submitted_at.is_some()));
 
         let closing = pr.closing_issues_references.as_ref().unwrap();
         assert!(closing.total_count >= 1);
@@ -1238,7 +1246,7 @@ mod tests {
             "mergedAt": null, "closedAt": null,
             "commits": {"nodes": [{"commit": {"oid": "0123456789012345678901234567890123456789", "committedDate": "2026-01-01T00:00:00Z"}}]},
             "reviewRequests": {"totalCount": 0, "nodes": []},
-            "latestOpinionatedReviews": {"totalCount": 0, "nodes": []},
+            "reviews": {"totalCount": 0, "nodes": []},
             "closingIssuesReferences": {"totalCount": 0, "nodes": []},
             "comments": {"totalCount": 0, "pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": []},
             "reviewThreads": {"totalCount": 0, "pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": []}
@@ -1273,17 +1281,17 @@ mod tests {
 
     #[test]
     fn nullable_connections_mask_as_none_strict_ones_do_not() {
-        // The schema marks exactly three connections nullable; a masked
+        // Three connections parse Option (module docs): a masked
         // (error-bubbled) one parses as None for the hydrator to treat as
-        // truncation. The non-null ones stay strict: null there is schema
+        // truncation. The strict ones stay strict: null there is schema
         // drift and must fail loudly.
         let mut pr = minimal_pr();
         pr["reviewRequests"] = Value::Null;
-        pr["latestOpinionatedReviews"] = Value::Null;
+        pr["reviews"] = Value::Null;
         pr["closingIssuesReferences"] = Value::Null;
         let parsed = hydrate_pr(&json!({"node": pr.clone()})).unwrap().unwrap();
         assert_eq!(parsed.review_requests, None);
-        assert_eq!(parsed.latest_opinionated_reviews, None);
+        assert_eq!(parsed.reviews, None);
         assert_eq!(parsed.closing_issues_references, None);
 
         pr["comments"] = Value::Null;
@@ -1314,7 +1322,7 @@ mod tests {
             "closedAt",
             "reviewDecision",
             "reviewRequests",
-            "latestOpinionatedReviews",
+            "reviews",
             "closingIssuesReferences",
         ] {
             let mut dropped = minimal_pr();

@@ -154,10 +154,16 @@ pub fn backfill_terms(
 ///     (cross-repo included) — ingested as refs kind='fixes', source='api'.
 ///     Body extraction (refs.rs) covers the rest. "Related to #N" is missed
 ///     by design and documented as such.
-///   * latestOpinionatedReviews gives per-reviewer APPROVED/CHANGES_REQUESTED
-///     without paging review history; with reviewRequests this feeds
-///     attention::effective_review_state. reviewDecision is stored raw and
-///     never trusted alone.
+///   * reviews(first: 100) is the full per-PR review set (verdicts AND
+///     COMMENTED). Ingest derives the latest opinionated verdict per reviewer
+///     itself (sync.rs ingestable_reviews) — the effective_review_state
+///     precondition, formerly bought by GitHub's latestOpinionatedReviews
+///     connection — and additionally keeps COMMENTED reviews as activity
+///     rows, so a human's comment-only review reaches waiting_on_me
+///     (report.rs other_last_activity). One connection, same point cost as
+///     the opinionated-only selection it replaced; with reviewRequests this
+///     feeds attention::effective_review_state. reviewDecision is stored raw
+///     and never trusted alone.
 ///   * commits(last:1) carries head oid + committedDate. It does NOT carry
 ///     push time: Commit.pushedDate — the field prs.last_pushed_at was
 ///     designed around — is deprecated upstream ("no longer supported") and
@@ -218,7 +224,7 @@ query($id: ID!) {
         totalCount
         nodes { requestedReviewer { ... on User { login } ... on Team { name } } }
       }
-      latestOpinionatedReviews(first: 100) {
+      reviews(first: 100) {
         totalCount
         nodes { id state submittedAt body url authorAssociation
                 author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }
@@ -456,7 +462,7 @@ query($id: ID!) {
         totalCount
         nodes { requestedReviewer { ... on User { login } ... on Team { name } } }
       }
-      latestOpinionatedReviews(first: 100) {
+      reviews(first: 100) {
         totalCount
         nodes { id state submittedAt body url authorAssociation
                 author { login __typename ... on User { databaseId } ... on Bot { databaseId } } }

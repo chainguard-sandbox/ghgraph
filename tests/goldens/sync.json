@@ -4,7 +4,7 @@
     "repos": [
       {
         "cost": {
-          "bytes_parsed": 4513,
+          "bytes_parsed": 4479,
           "rate_cost": 3,
           "sleep_seconds": "<SECS>",
           "sleeps": 0,

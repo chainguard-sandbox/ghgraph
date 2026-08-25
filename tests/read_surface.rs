@@ -223,6 +223,20 @@ fn seed(s: &Scratch) {
                  '2026-01-01T06:00:00Z', 'https://github.com/octo/alpha/pull/1#r2')",
         &[],
     );
+    // bob COMMENTED before approving: a comment-only review carries no
+    // verdict, so it pins the COMMENTED JSON shape in the pr reviews array
+    // (state + freshness through HOT_REVIEWS_BY_PR's ORDER BY, under
+    // reverse_unordered_selects) without changing bob's verdict —
+    // effective_review_state ignores it. Timestamp precedes the PR's
+    // last_other_activity_at (2026-01-04), so attention is unmoved.
+    exec(
+        "INSERT INTO comments (id, parent_kind, parent, kind, state, author, author_assoc, \
+                               body, created_at, url) \
+         VALUES ('RV_a1_bob_c', 'pr', 1, 'review', 'COMMENTED', 'bob', 'MEMBER', \
+                 'one nit before I approve', '2026-01-01T12:00:00Z', \
+                 'https://github.com/octo/alpha/pull/1#r3')",
+        &[],
+    );
     exec(
         "INSERT INTO review_requests (pr, reviewer, kind) VALUES (1, 'dave', 'user')",
         &[],

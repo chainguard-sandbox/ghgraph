@@ -55,24 +55,6 @@
       "headRefName": "tommaso-moro-add-grok-skill-host",
       "id": "PR_kwDODKw3uc7xAi-o",
       "isDraft": false,
-      "latestOpinionatedReviews": {
-        "nodes": [
-          {
-            "author": {
-              "__typename": "User",
-              "databaseId": 36728931,
-              "login": "babakks"
-            },
-            "authorAssociation": "MEMBER",
-            "body": "LGTM! Thanks! 🍻 ",
-            "id": "PRR_kwDODKw3uc8AAAABFywNLw",
-            "state": "APPROVED",
-            "submittedAt": "2026-07-13T10:12:08Z",
-            "url": "https://github.com/cli/cli/pull/13864#pullrequestreview-4683730223"
-          }
-        ],
-        "totalCount": 1
-      },
       "mergedAt": "2026-07-13T10:27:31Z",
       "number": 13864,
       "repository": {
@@ -127,6 +109,37 @@
         },
         "totalCount": 1
       },
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "databaseId": 175728472,
+              "login": "copilot-pull-request-reviewer"
+            },
+            "authorAssociation": "CONTRIBUTOR",
+            "body": "## Pull request overview\n\nAdds Grok as a supported agent host for `gh skill`, wiring it into the shared skills host registry so install/update flows can target Grok’s expected skills directories.\n\n**Changes:**\n- Register Grok as an `AgentHost` with project and user skill directories at `.grok/skills`.\n- Extend registry tests to cover Grok host lookup and install directory resolution.\n- Update `gh skill install` and `gh skill update` help text to mention Grok.\n\n<details open>\n<summary>Show a summary per file</summary>\n\n| File | Description |\r\n| ---- | ----------- |\r\n| pkg/cmd/skills/update/update.go | Mentions Grok in update command help text. |\r\n| pkg/cmd/skills/install/install.go | Mentions Grok in install command help text. |\r\n| internal/skills/registry/registry.go | Adds Grok to the supported agent host registry with `.grok/skills` dirs. |\r\n| internal/skills/registry/registry_test.go | Adds Grok coverage for `FindByID` and `InstallDir` tests. |\n</details>\n\n## Review details\n\n> [!TIP]\n> <a href=\"/cli/cli/new/trunk?filename=.github/instructions/*.instructions.md\" class=\"Link--inTextBlock\" target=\"_blank\" rel=\"noopener noreferrer\">Add Copilot custom instructions</a> for smarter, more guided reviews. <a href=\"https://docs.github.com/en/copilot/customizing-copilot/adding-repository-custom-instructions-for-github-copilot\" class=\"Link--inTextBlock\" target=\"_blank\" rel=\"noopener noreferrer\">Learn how to get started</a>.\n\n\n\n\n\n- **Files reviewed:** 4/4 changed files\n- **Comments generated:** 1\n- **Review effort level:** Low\n\n\n",
+            "id": "PRR_kwDODKw3uc8AAAABFyucaQ",
+            "state": "COMMENTED",
+            "submittedAt": "2026-07-13T10:07:45Z",
+            "url": "https://github.com/cli/cli/pull/13864#pullrequestreview-4683701353"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "databaseId": 36728931,
+              "login": "babakks"
+            },
+            "authorAssociation": "MEMBER",
+            "body": "LGTM! Thanks! 🍻 ",
+            "id": "PRR_kwDODKw3uc8AAAABFywNLw",
+            "state": "APPROVED",
+            "submittedAt": "2026-07-13T10:12:08Z",
+            "url": "https://github.com/cli/cli/pull/13864#pullrequestreview-4683730223"
+          }
+        ],
+        "totalCount": 2
+      },
       "state": "MERGED",
       "title": "Add Grok skill host support",
       "updatedAt": "2026-07-13T10:27:33Z",
@@ -134,8 +147,8 @@
     },
     "rateLimit": {
       "cost": 1,
-      "remaining": 4992,
-      "resetAt": "2026-07-31T23:44:34Z"
+      "remaining": 4990,
+      "resetAt": "2026-08-25T00:41:17Z"
     }
   }
 }

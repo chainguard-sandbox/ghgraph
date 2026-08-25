@@ -112,37 +112,6 @@
       "headRefName": "tommaso-moro-rename-windsurf-to-devin",
       "id": "PR_kwDODKw3uc73afq3",
       "isDraft": false,
-      "latestOpinionatedReviews": {
-        "nodes": [
-          {
-            "author": {
-              "__typename": "User",
-              "databaseId": 1611510,
-              "login": "williammartin"
-            },
-            "authorAssociation": "MEMBER",
-            "body": "Works for me!",
-            "id": "PRR_kwDODKw3uc8AAAABHl3RDQ",
-            "state": "APPROVED",
-            "submittedAt": "2026-07-29T05:48:03Z",
-            "url": "https://github.com/cli/cli/pull/13987#pullrequestreview-4804432141"
-          },
-          {
-            "author": {
-              "__typename": "User",
-              "databaseId": 47394200,
-              "login": "BagToad"
-            },
-            "authorAssociation": "MEMBER",
-            "body": "",
-            "id": "PRR_kwDODKw3uc8AAAABHlgjRQ",
-            "state": "APPROVED",
-            "submittedAt": "2026-07-29T04:47:22Z",
-            "url": "https://github.com/cli/cli/pull/13987#pullrequestreview-4804059973"
-          }
-        ],
-        "totalCount": 2
-      },
       "mergedAt": "2026-07-29T10:05:19Z",
       "number": 13987,
       "repository": {
@@ -165,6 +134,63 @@
         },
         "totalCount": 0
       },
+      "reviews": {
+        "nodes": [
+          {
+            "author": {
+              "__typename": "Bot",
+              "databaseId": 175728472,
+              "login": "copilot-pull-request-reviewer"
+            },
+            "authorAssociation": "CONTRIBUTOR",
+            "body": "## Pull request overview\n\nUpdates the `gh skills install` agent registry to reflect Cognition’s rebrand from Windsurf to Devin, ensuring skills are installed into the correct Devin-specific directories.\n\n**Changes:**\n- Add a new `devin` agent host and install to `.devin/skills` at both project and user scope.\n- Remove the `windsurf` agent host entry and update registry tests to treat it as unsupported.\n- Update `gh skills install` help text to mention Devin instead of Windsurf.\n\n<details open>\n<summary>Show a summary per file</summary>\n\n| File | Description |\r\n| ---- | ----------- |\r\n| pkg/cmd/skills/install/install.go | Updates install command help text to include Devin and remove Windsurf. |\r\n| internal/skills/registry/registry.go | Replaces the Windsurf agent host entry with a Devin entry and `.devin/skills` install paths. |\r\n| internal/skills/registry/registry_test.go | Adds coverage for the new `devin` agent and asserts `windsurf` is now an unknown agent. |\n</details>\n\n## Review details\n\n> [!TIP]\n> <a href=\"/cli/cli/new/trunk?filename=.github/instructions/*.instructions.md\" class=\"Link--inTextBlock\" target=\"_blank\" rel=\"noopener noreferrer\">Add Copilot custom instructions</a> for smarter, more guided reviews. <a href=\"https://docs.github.com/en/copilot/customizing-copilot/adding-repository-custom-instructions-for-github-copilot\" class=\"Link--inTextBlock\" target=\"_blank\" rel=\"noopener noreferrer\">Learn how to get started</a>.\n\n\n\n\n\n\n- **Files reviewed:** 3/3 changed files\n- **Comments generated:** 0\n- **Review effort level:** Low\n\n\n",
+            "id": "PRR_kwDODKw3uc8AAAABHejOMw",
+            "state": "COMMENTED",
+            "submittedAt": "2026-07-28T11:34:16Z",
+            "url": "https://github.com/cli/cli/pull/13987#pullrequestreview-4796763699"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "databaseId": 1611510,
+              "login": "williammartin"
+            },
+            "authorAssociation": "MEMBER",
+            "body": "Should this actually remove `windsurf`? Are there still users out there you might be using windsurf and not updating?",
+            "id": "PRR_kwDODKw3uc8AAAABHekYug",
+            "state": "COMMENTED",
+            "submittedAt": "2026-07-28T11:36:34Z",
+            "url": "https://github.com/cli/cli/pull/13987#pullrequestreview-4796782778"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "databaseId": 47394200,
+              "login": "BagToad"
+            },
+            "authorAssociation": "MEMBER",
+            "body": "",
+            "id": "PRR_kwDODKw3uc8AAAABHlgjRQ",
+            "state": "APPROVED",
+            "submittedAt": "2026-07-29T04:47:22Z",
+            "url": "https://github.com/cli/cli/pull/13987#pullrequestreview-4804059973"
+          },
+          {
+            "author": {
+              "__typename": "User",
+              "databaseId": 1611510,
+              "login": "williammartin"
+            },
+            "authorAssociation": "MEMBER",
+            "body": "Works for me!",
+            "id": "PRR_kwDODKw3uc8AAAABHl3RDQ",
+            "state": "APPROVED",
+            "submittedAt": "2026-07-29T05:48:03Z",
+            "url": "https://github.com/cli/cli/pull/13987#pullrequestreview-4804432141"
+          }
+        ],
+        "totalCount": 4
+      },
       "state": "MERGED",
       "title": "Replace Windsurf with Devin in skill agents",
       "updatedAt": "2026-07-29T10:05:57Z",
@@ -172,8 +198,8 @@
     },
     "rateLimit": {
       "cost": 1,
-      "remaining": 4991,
-      "resetAt": "2026-07-31T23:44:34Z"
+      "remaining": 4989,
+      "resetAt": "2026-08-25T00:41:17Z"
     }
   }
 }

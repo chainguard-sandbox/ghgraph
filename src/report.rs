@@ -943,9 +943,11 @@ pub fn pr(
         head_flip_observed_at: head_flip.as_deref(),
     };
 
-    // Reviews: kind='review' rows are latest-per-reviewer (the sync sweeps
-    // superseded ones — the effective_review_state precondition). Deleted
-    // rows are superseded-or-removed reviews, not display rows.
+    // Reviews: kind='review' rows are the latest opinionated verdict per
+    // reviewer (the sync sweeps superseded ones — the effective_review_state
+    // precondition) plus any COMMENTED activity rows (sync.rs
+    // ingestable_reviews). Deleted rows are superseded-or-removed reviews, not
+    // display rows.
     let mut stmt = conn.prepare(HOT_REVIEWS_BY_PR).map_err(classify_ours)?;
     let reviews: Vec<(Option<String>, Option<String>, String)> = stmt
         .query_map([pk], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))

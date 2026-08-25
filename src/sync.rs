@@ -48,10 +48,12 @@
 //!     absent from a COMPLETELY fetched connection — never from a truncated
 //!     one, or truncation reads as deletion. Deleted rows are kept: upstream
 //!     deletion is signal for a memory tool. Review rows (comments
-//!     kind='review') sweep under the same rule against the
-//!     latestOpinionatedReviews set: a row leaving that set was superseded
-//!     by its reviewer's newer verdict, and deleted_at uniformly means
-//!     "left the observed set" — one sweep rule, not two.
+//!     kind='review') sweep under the same rule against the ingested review
+//!     set (ingestable_reviews: the latest opinionated verdict per reviewer
+//!     plus every COMMENTED review). A row leaving that set was superseded by
+//!     its reviewer's newer verdict, dismissed, in an unknown state, or
+//!     deleted upstream, and deleted_at uniformly means "left the observed
+//!     set" — one sweep rule, not two.
 //!
 //!   * Upserts: ON CONFLICT(repo, number) for prs (node ids are data, not
 //!     identity), ON CONFLICT(id) elsewhere; never INSERT OR REPLACE (rowid
@@ -402,8 +404,9 @@ pub struct PrBundle {
     /// earns this the same way a full walk does: ids suffice, bodies are
     /// not part of completeness.
     threads_complete: bool,
-    /// The three schema-nullable connections: present (not error-masked)
-    /// and complete (nodes == totalCount).
+    /// The three Option-masked connections (requests and closing are
+    /// schema-nullable; reviews is modeled Option defensively — parse.rs):
+    /// present (not error-masked) and complete (nodes == totalCount).
     requests_complete: bool,
     reviews_complete: bool,
     closing_complete: bool,
@@ -2261,7 +2264,7 @@ fn hydrate_one(
         });
 
     let requests_complete = counted_complete(&node.review_requests);
-    let reviews_complete = counted_complete(&node.latest_opinionated_reviews);
+    let reviews_complete = counted_complete(&node.reviews);
     let closing_complete = counted_complete(&node.closing_issues_references);
 
     let body_refs = refs::extract(&node.body, repo).unwrap_or_default();
@@ -2749,7 +2752,7 @@ fn refresh_one(
             i64::try_from(t.comments.nodes.len()).is_ok_and(|n| n >= t.comments.total_count)
         });
     let requests_complete = counted_complete(&node.review_requests);
-    let reviews_complete = counted_complete(&node.latest_opinionated_reviews);
+    let reviews_complete = counted_complete(&node.reviews);
     let closing_complete = counted_complete(&node.closing_issues_references);
     let body_refs = refs::extract(&node.body, repo).unwrap_or_default();
 
@@ -2779,7 +2782,7 @@ fn refresh_one(
         closed_at: node.closed_at,
         commits: node.commits,
         review_requests: node.review_requests,
-        latest_opinionated_reviews: node.latest_opinionated_reviews,
+        reviews: node.reviews,
         closing_issues_references: node.closing_issues_references,
         comments: parse::Paged {
             total_count: total,
@@ -3783,16 +3786,21 @@ fn upsert_children(
         )?;
     }
 
-    // Reviews land as comments rows (kind='review'). A review without a
-    // submittedAt cannot satisfy comments.created_at NOT NULL and an
-    // opinionated review always carries one; skipping is recorded at the
-    // parse type.
+    // Reviews land as comments rows (kind='review'). The `reviews` connection
+    // carries every review; ingestable_reviews picks which become rows — the
+    // latest opinionated verdict per reviewer (the effective_review_state
+    // precondition, attention.rs) plus every COMMENTED review (a human's
+    // comment-only feedback, which report.rs other_last_activity counts toward
+    // waiting_on_me). A review without a submittedAt is PENDING (not yet
+    // submitted) and cannot satisfy comments.created_at NOT NULL;
+    // ingestable_reviews drops it.
     let mut seen_reviews: HashSet<String> = HashSet::new();
-    if let Some(reviews) = &pr.latest_opinionated_reviews {
-        for r in &reviews.nodes {
-            let Some(submitted) = &r.submitted_at else {
-                continue;
-            };
+    if let Some(reviews) = &pr.reviews {
+        for r in ingestable_reviews(&reviews.nodes) {
+            let submitted = r
+                .submitted_at
+                .as_ref()
+                .expect("ingestable_reviews keeps only submitted reviews");
             seen_reviews.insert(r.id.clone());
             upsert_comment(
                 tx,
@@ -4070,6 +4078,74 @@ fn upsert_thread(
             Ok(pk)
         }
     }
+}
+
+/// Which reviews from the `reviews` connection become kind='review' comments
+/// rows. Two kept classes, both requiring a submittedAt (a PENDING review has
+/// none and cannot be a row — comments.created_at is NOT NULL):
+///
+///   * every COMMENTED review — a reviewer's comment-only feedback, no
+///     verdict, kept as activity so report.rs other_last_activity counts it
+///     toward waiting_on_me;
+///   * the latest opinionated verdict (APPROVED | CHANGES_REQUESTED) per
+///     reviewer — reconstructs what GitHub's latestOpinionatedReviews gave
+///     before, the effective_review_state "latest-per-reviewer" precondition
+///     (attention.rs). A superseded verdict is left out of the returned set,
+///     so the sweep soft-deletes it (sync.rs module docs).
+///
+/// DISMISSED reviews are dropped: the verdict was cleared, so its body is
+/// stale feedback that must not count as activity. Any unknown state is
+/// dropped too — a new opinionated state would need its own polarity decision
+/// in attention.rs before it could be trusted as a verdict.
+///
+/// "Latest per reviewer" ranks by (submittedAt, id): id breaks a
+/// same-timestamp tie, so the choice is deterministic under replay. A
+/// reviewer is keyed by login (ASCII-folded, the login_eq rule); a
+/// null-author opinionated review cannot be deduplicated and is kept whole
+/// (fail-open — never silently drop a verdict). The result is sorted by the
+/// same rank so the ingest order is stable for tests, though correctness does
+/// not need it (upserts are keyed by id, seen_reviews is a set).
+fn ingestable_reviews(nodes: &[parse::ReviewNode]) -> Vec<&parse::ReviewNode> {
+    fn rank(r: &parse::ReviewNode) -> (&str, &str) {
+        (
+            // Every review reaching rank passed the submitted_at.is_none()
+            // filter below, so the None arm is unreachable; "" would sort a
+            // stray null earliest, the harmless direction if that ever broke.
+            r.submitted_at.as_ref().map_or("", |t| t.as_str()),
+            r.id.as_str(),
+        )
+    }
+    let mut latest: HashMap<String, &parse::ReviewNode> = HashMap::new();
+    let mut kept: Vec<&parse::ReviewNode> = Vec::new();
+    for r in nodes {
+        if r.submitted_at.is_none() {
+            continue; // PENDING — not yet submitted, no timestamp.
+        }
+        match r.state.as_str() {
+            "COMMENTED" => kept.push(r),
+            "APPROVED" | "CHANGES_REQUESTED" => match r.author.as_ref() {
+                Some(a) => {
+                    let key = a.login.as_str().to_ascii_lowercase();
+                    match latest.get(&key) {
+                        Some(prev) if rank(prev) >= rank(r) => {}
+                        _ => {
+                            latest.insert(key, r);
+                        }
+                    }
+                }
+                // A deleted account has no login to key on: keep each verdict
+                // rather than dedup. Two verdicts from one null author both
+                // survive, but effective_review_state short-circuits on
+                // CHANGES_REQUESTED, so a stale CR can only veto (escalate),
+                // never clear, a later APPROVED — the fail-open direction.
+                None => kept.push(r),
+            },
+            _ => {} // DISMISSED / unknown.
+        }
+    }
+    kept.extend(latest.into_values());
+    kept.sort_by(|a, b| rank(a).cmp(&rank(b)));
+    kept
 }
 
 /// The comment column set shared by the three kinds; reviews adapt into it.
@@ -5133,6 +5209,132 @@ mod tests {
     fn fp(cfg_json: &str) -> Value {
         let c = cfg(cfg_json);
         fingerprint(&c, &c.repos[0].resolved())
+    }
+
+    // --- ingestable_reviews: which reviews become kind='review' rows ---
+
+    fn review(id: &str, state: &str, submitted: Option<&str>, login: Option<&str>) -> Value {
+        json!({
+            "id": id,
+            "state": state,
+            "submittedAt": submitted,
+            "body": "",
+            "url": "https://github.com/r",
+            "authorAssociation": "MEMBER",
+            "author": login.map(|l| json!({"login": l, "__typename": "User", "databaseId": 1})),
+        })
+    }
+
+    fn ingested_ids(nodes: &[Value]) -> Vec<String> {
+        let nodes: Vec<parse::ReviewNode> = nodes
+            .iter()
+            .map(|v| serde_json::from_value(v.clone()).expect("review node parses"))
+            .collect();
+        ingestable_reviews(&nodes)
+            .into_iter()
+            .map(|r| r.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn ingestable_keeps_latest_opinionated_per_reviewer() {
+        // amy: CHANGES_REQUESTED superseded by her own later APPROVED — only
+        // the latest verdict survives, so effective_review_state cannot see a
+        // stale veto (the attention.rs precondition). bob's lone APPROVED
+        // stands. The superseded row is absent from the kept set, which is
+        // what licenses the sweep to soft-delete it.
+        let nodes = [
+            review(
+                "r1",
+                "CHANGES_REQUESTED",
+                Some("2026-01-01T00:00:00Z"),
+                Some("amy"),
+            ),
+            review("r2", "APPROVED", Some("2026-01-02T00:00:00Z"), Some("amy")),
+            review("r3", "APPROVED", Some("2026-01-01T12:00:00Z"), Some("bob")),
+        ];
+        assert_eq!(ingested_ids(&nodes), vec!["r3", "r2"]);
+    }
+
+    #[test]
+    fn ingestable_keeps_every_commented_review() {
+        // COMMENTED carries no verdict but IS activity: every one is kept
+        // (two from the same reviewer are two distinct feedback bodies), so
+        // report.rs other_last_activity can see a human's comment-only review
+        // and route the PR to waiting_on_me.
+        let nodes = [
+            review("c1", "COMMENTED", Some("2026-01-01T00:00:00Z"), Some("amy")),
+            review("c2", "COMMENTED", Some("2026-01-03T00:00:00Z"), Some("amy")),
+            review("a1", "APPROVED", Some("2026-01-02T00:00:00Z"), Some("amy")),
+        ];
+        // All three: both comments plus amy's one verdict; ordered by (submittedAt, id).
+        assert_eq!(ingested_ids(&nodes), vec!["c1", "a1", "c2"]);
+    }
+
+    #[test]
+    fn ingestable_drops_dismissed_and_pending() {
+        // DISMISSED is a cleared verdict — stale feedback, never activity.
+        // PENDING has no submittedAt (cannot be a comments row). An unknown
+        // state is dropped too: a new opinionated state needs its own
+        // attention.rs polarity decision before it can be trusted.
+        let nodes = [
+            review("d1", "DISMISSED", Some("2026-01-01T00:00:00Z"), Some("amy")),
+            review("p1", "PENDING", None, Some("amy")),
+            review(
+                "u1",
+                "SOMETHING_NEW",
+                Some("2026-01-01T00:00:00Z"),
+                Some("amy"),
+            ),
+            review("a1", "APPROVED", None, Some("amy")),
+        ];
+        // a1 is APPROVED but PENDING-shaped (null submittedAt) here, so it too
+        // drops — nothing survives.
+        assert!(ingested_ids(&nodes).is_empty());
+    }
+
+    #[test]
+    fn ingestable_tiebreak_is_deterministic_on_equal_timestamps() {
+        // Two verdicts from one reviewer at the SAME submittedAt: the rank's
+        // id tiebreak must pick the lexicographically-larger id regardless of
+        // input order, or HashMap::into_values iteration order would leak into
+        // the result (the determinism the doc claims). Both orders → ["r2"].
+        let ts = "2026-01-01T00:00:00Z";
+        let fwd = [
+            review("r1", "APPROVED", Some(ts), Some("amy")),
+            review("r2", "APPROVED", Some(ts), Some("amy")),
+        ];
+        let rev = [
+            review("r2", "APPROVED", Some(ts), Some("amy")),
+            review("r1", "APPROVED", Some(ts), Some("amy")),
+        ];
+        assert_eq!(ingested_ids(&fwd), vec!["r2"]);
+        assert_eq!(ingested_ids(&rev), vec!["r2"]);
+    }
+
+    #[test]
+    fn ingestable_keeps_null_author_verdict_whole() {
+        // A verdict from a deleted account cannot be keyed to a reviewer, so
+        // it is kept rather than silently dropped (fail-open — never lose a
+        // verdict). login match is ASCII-folded (login_eq): Amy and amy are
+        // one reviewer, so only her latest verdict survives.
+        let nodes = [
+            review("n1", "APPROVED", Some("2026-01-01T00:00:00Z"), None),
+            review(
+                "n2",
+                "CHANGES_REQUESTED",
+                Some("2026-01-02T00:00:00Z"),
+                None,
+            ),
+            review(
+                "g1",
+                "CHANGES_REQUESTED",
+                Some("2026-01-01T00:00:00Z"),
+                Some("Amy"),
+            ),
+            review("g2", "APPROVED", Some("2026-01-02T00:00:00Z"), Some("amy")),
+        ];
+        assert_eq!(ingested_ids(&nodes), vec!["n1", "g2", "n2"]);
     }
 
     // --- overhead intercept: the sync_runs batching input ---

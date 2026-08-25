@@ -468,7 +468,7 @@ impl Pr {
                         json!({"totalCount": 1, "nodes": [
                             {"requestedReviewer": {"login": "rev"}}]})
                     },
-                    "latestOpinionatedReviews": {"totalCount": 1, "nodes": [{
+                    "reviews": {"totalCount": 1, "nodes": [{
                         "id": format!("REV_{}", self.id), "state": "APPROVED",
                         "submittedAt": "2026-07-11T00:00:00Z", "body": "lgtm",
                         "url": "https://github.com/r", "authorAssociation": "MEMBER",

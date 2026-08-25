@@ -50,10 +50,6 @@
       "headRefName": "V12.49",
       "id": "PR_kwDOSbh2Nc7av-g3",
       "isDraft": false,
-      "latestOpinionatedReviews": {
-        "nodes": [],
-        "totalCount": 0
-      },
       "mergedAt": "2026-02-19T08:54:22Z",
       "number": 44,
       "repository": {
@@ -72,6 +68,10 @@
         },
         "totalCount": 0
       },
+      "reviews": {
+        "nodes": [],
+        "totalCount": 0
+      },
       "state": "MERGED",
       "title": "sdk upgrade for V12.49",
       "updatedAt": "2026-05-12T15:58:08Z",
@@ -79,8 +79,8 @@
     },
     "rateLimit": {
       "cost": 1,
-      "remaining": 4990,
-      "resetAt": "2026-07-31T23:44:34Z"
+      "remaining": 4988,
+      "resetAt": "2026-08-25T00:41:17Z"
     }
   }
 }

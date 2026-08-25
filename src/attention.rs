@@ -3,9 +3,11 @@
 //! consumer prompt.
 //!
 //! effective_review_state per PR, from three raw signals:
-//!   1. latestOpinionatedReviews — per-reviewer APPROVED / CHANGES_REQUESTED
+//!   1. the opinionated reviews — per-reviewer APPROVED / CHANGES_REQUESTED
 //!      (stored as comments rows, kind='review', already latest-per-reviewer:
-//!      the sync sweeps superseded rows — sync.rs)
+//!      ingest keeps only the latest verdict per reviewer and the sync sweeps
+//!      the superseded rows — sync.rs ingestable_reviews. COMMENTED reviews
+//!      are stored alongside as activity but carry no verdict here.)
 //!   2. review_requests          — who is currently asked
 //!   3. the push bounds          — Commit.pushedDate is deprecated upstream,
 //!      so "did this review see the current head?" is answered by two stored
@@ -93,10 +95,9 @@
 //!                     PR into this bucket ahead of that one (priority
 //!                     order) — starving ready_to_merge structurally. A
 //!                     CHANGES_REQUESTED or COMMENTED review IS a reply
-//!                     (COMMENTED arrives only in archives whose review
-//!                     rows carry it — today's ingest query is
-//!                     opinionated-only), and so does a review row whose
-//!                     verdict is missing: only a PROVEN approval is
+//!                     (ingest keeps COMMENTED reviews as activity rows —
+//!                     sync.rs ingestable_reviews), and so does a review row
+//!                     whose verdict is missing: only a PROVEN approval is
 //!                     excluded, absence of a verdict fails open like
 //!                     every other derivation input here. Two known
 //!                     narrowings, PR-level recency and push-is-not-
@@ -294,7 +295,9 @@ impl EffectiveReviewState {
     }
 }
 
-/// One latestOpinionatedReviews row (a comments row, kind='review').
+/// One review row (a comments row, kind='review'). May be an opinionated
+/// verdict or a COMMENTED activity row; the state machine reads only the
+/// former (COMMENTED/DISMISSED/PENDING carry no verdict — see `state`).
 pub struct ReviewSignal<'a> {
     pub reviewer: &'a str,
     /// Raw review state. Only APPROVED and CHANGES_REQUESTED are opinionated;
@@ -306,10 +309,13 @@ pub struct ReviewSignal<'a> {
 
 /// (latest opinionated reviews, push bounds) → effective state. Pure.
 ///
-/// Precondition: `reviews` is latest-per-reviewer (the archive's kind='review'
-/// rows are, because the sync sweeps superseded ones — sync.rs). Feeding all
-/// historical reviews would let a reviewer's superseded CHANGES_REQUESTED
-/// veto their own later approval.
+/// Precondition: the opinionated reviews are latest-per-reviewer (the
+/// archive's kind='review' rows are, because ingest keeps only the latest
+/// verdict per reviewer and the sync sweeps superseded ones — sync.rs
+/// ingestable_reviews). Feeding all historical reviews would let a reviewer's
+/// superseded CHANGES_REQUESTED veto their own later approval. COMMENTED rows
+/// may appear more than once per reviewer; they carry no verdict, so the loop
+/// below ignores them and the precondition is unaffected.
 ///
 /// The polarity rule, mechanically:
 ///   * a CHANGES_REQUESTED counts unless PROVABLY stale — uncertainty
