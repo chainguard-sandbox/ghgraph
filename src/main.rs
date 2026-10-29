@@ -177,6 +177,22 @@ fn main() {
                 let _ = e.print();
                 std::process::exit(0);
             }
+            // A bare `ghgraph`: clap renders the help AS the error. Inside
+            // the envelope it is a JSON-escaped wall of text no human reads,
+            // so the help goes to stderr and the envelope carries the
+            // diagnosis. It stays an error — a forgotten verb is a usage
+            // mistake, and a script must not read it as success. Rejected:
+            // exit 0 with help on stdout (a third contract carve-out, and a
+            // verb-less script "succeeds"); clap's stock stderr-only exit 2
+            // (empty stdout plus nonzero exit reads as INTERNAL); a default
+            // verb (every verb is a named archive operation with an MCP
+            // twin; an implicit one has neither).
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+                eprint!("{e}");
+                let msg = "no command given; run `ghgraph --help` for the list";
+                emit(&error::Error::user(msg.to_owned()).envelope(), 2);
+                std::process::exit(2);
+            }
             _ => {
                 emit(&error::Error::user(e.to_string()).envelope(), 2);
                 std::process::exit(2);
