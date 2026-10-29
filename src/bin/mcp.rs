@@ -104,20 +104,32 @@ use serde_json::{Value, json};
 /// not a support claim this server may assert on its behalf.
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// MCP stdio server for ghgraph: seven tools, one per verb
+///
+/// Each call spawns the CLI. Configure your MCP client to run this binary;
+/// point --ghgraph at the CLI if it is not adjacent or on PATH.
+//
+// Help text prints exactly as written — the layout rationale is at
+// src/main.rs, struct Cli; the `help` tests below hold it.
 #[derive(Parser)]
-#[command(name = "ghgraph-mcp", version)]
-/// MCP stdio server for ghgraph: seven tools, one per verb, each call
-/// spawning the CLI. Configure your MCP client to run this binary; point
-/// --ghgraph at the CLI if it is not adjacent or on PATH.
+#[command(name = "ghgraph-mcp", version, verbatim_doc_comment)]
 struct Cli {
-    /// Path to the ghgraph binary (default: a `ghgraph` beside this
-    /// executable, then `ghgraph` on PATH).
-    #[arg(long)]
+    /// Path to the ghgraph binary
+    ///
+    /// Default: a `ghgraph` beside this executable, then `ghgraph` on PATH.
+    #[arg(long, value_name = "PATH", verbatim_doc_comment)]
     ghgraph: Option<PathBuf>,
 
-    /// Config file, passed through to every spawned verb (default:
-    /// ghgraph's own default, $XDG_CONFIG_HOME/ghgraph/config.json).
-    #[arg(long, env = "GHGRAPH_CONFIG")]
+    /// Config file for the spawned verbs
+    ///
+    /// Passed through to every call. Default: ghgraph's own,
+    /// $XDG_CONFIG_HOME/ghgraph/config.json.
+    #[arg(
+        long,
+        env = "GHGRAPH_CONFIG",
+        value_name = "PATH",
+        verbatim_doc_comment
+    )]
     config: Option<PathBuf>,
 }
 
@@ -873,5 +885,28 @@ mod table {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[path = "../help_lint.rs"]
+mod help_lint;
+
+#[cfg(test)]
+mod help {
+    use clap::CommandFactory;
+
+    use super::{Cli, help_lint};
+
+    #[test]
+    fn help_fits_80_columns() {
+        let bad = help_lint::overwide_lines(Cli::command());
+        assert!(bad.is_empty(), "over-wide help lines:\n{}", bad.join("\n"));
+    }
+
+    #[test]
+    fn every_arg_has_help() {
+        let bad = help_lint::undocumented(Cli::command());
+        assert!(bad.is_empty(), "undocumented help:\n{}", bad.join("\n"));
     }
 }
