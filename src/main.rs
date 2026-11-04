@@ -15,16 +15,34 @@ use ghgraph::{report, sync};
 /// Sync your GitHub work — pull requests, review threads, issues — into
 /// local SQLite; query it offline from the CLI, in JSON.
 ///
-/// I/O contract: stdout is always exactly one JSON document. Progress goes to
-/// stderr, prefixed "ghgraph: ". Exit 0 = ok; exit 2 = error, as a typed
+/// I/O contract: stdout is always exactly one JSON document. Progress goes
+/// to stderr, prefixed "ghgraph: ". Exit 0 = ok; exit 2 = error, as a typed
 /// envelope {"error":{"code","message"}} on stdout; exit 1 is reserved for
 /// opt-in gate flags. Output is deterministic for identical archive state
 /// (modulo timing fields in _meta).
+//
+// Help layout: clap's `wrap_help` feature would cost terminal_size and
+// rustix, so help text is never re-wrapped — what is written here is what
+// prints. Hence `verbatim_doc_comment` on every multi-line item and the
+// shape it enables: a first-paragraph summary short enough for `-h`'s
+// one-line column, and detail paragraphs that only `--help` shows,
+// hand-wrapped to fit 80 columns at its 10-column indent.
+// `help_fits_80_columns` holds the width; `every_arg_has_help` holds the
+// summaries.
 #[derive(Parser)]
-#[command(name = "ghgraph", version)]
+#[command(name = "ghgraph", version, verbatim_doc_comment)]
 struct Cli {
-    /// Config file (default: $XDG_CONFIG_HOME/ghgraph/config.json).
-    #[arg(long, global = true, env = "GHGRAPH_CONFIG")]
+    /// Config file
+    ///
+    /// Default: $XDG_CONFIG_HOME/ghgraph/config.json, where an unset or
+    /// empty XDG_CONFIG_HOME means ~/.config.
+    #[arg(
+        long,
+        global = true,
+        env = "GHGRAPH_CONFIG",
+        value_name = "PATH",
+        verbatim_doc_comment
+    )]
     config: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -33,79 +51,117 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Fetch configured repos into the archive.
+    /// Fetch configured repos into the archive
     Sync {
-        /// Ignore watermarks; refetch the whole lookback window.
+        /// Ignore watermarks; refetch the whole lookback window
         #[arg(long)]
         full: bool,
-        /// Hydrate one PR now ("owner/name#123" or URL) — the read-time
-        /// freshness path. `_meta` says when; the reader says which.
-        #[arg(long, conflicts_with = "full")]
+        /// Hydrate one PR now ("owner/name#123" or URL)
+        ///
+        /// The read-time freshness path. `_meta` says when; the reader
+        /// says which.
+        #[arg(
+            long,
+            conflicts_with = "full",
+            value_name = "REF",
+            verbatim_doc_comment
+        )]
         pr: Option<String>,
-        /// Exit 1 when the run left the archive incomplete (truncation,
-        /// quarantine, capped discovery, floor deferral, errors) — the CI
-        /// gate. Gate flags change the exit code, never a byte of JSON.
-        #[arg(long)]
+        /// Exit 1 if the run left the archive incomplete
+        ///
+        /// Incomplete means truncation, quarantine, capped discovery,
+        /// floor deferral, or errors — the CI gate. Gate flags change the
+        /// exit code, never a byte of JSON.
+        #[arg(long, verbatim_doc_comment)]
         strict: bool,
     },
-    /// What needs the operator's attention, derived from archive state.
+    /// What needs the operator's attention, derived from archive state
     Attention {
-        /// Exit 1 when anything is waiting — the cron gate. Gate flags
-        /// change the exit code, never a byte of JSON.
-        #[arg(long)]
+        /// Exit 1 if anything is waiting
+        ///
+        /// The cron gate. Gate flags change the exit code, never a byte
+        /// of JSON.
+        #[arg(long, verbatim_doc_comment)]
         fail_if_any: bool,
-        /// Cap the rows returned per bucket. Totals stay disclosed: limits
-        /// govern presentation, never derivation.
-        #[arg(long)]
+        /// Cap the rows returned per bucket
+        ///
+        /// Totals stay disclosed: limits govern presentation, never
+        /// derivation.
+        #[arg(long, verbatim_doc_comment)]
         limit: Option<usize>,
     },
-    /// List PRs in the archive.
+    /// List PRs in the archive
     Prs {
-        #[arg(long)]
+        /// Only PRs in this repo
+        #[arg(long, value_name = "OWNER/NAME")]
         repo: Option<String>,
-        /// Include merged, closed, and upstream-deleted PRs.
+        /// Include merged, closed, and upstream-deleted PRs
         #[arg(long)]
         all: bool,
-        /// Only PRs authored by this login (the tracked-person one-liner:
-        /// a WHERE clause, not a monitor verb).
-        #[arg(long)]
+        /// Only PRs authored by this login
+        ///
+        /// The tracked-person one-liner: a WHERE clause, not a monitor
+        /// verb.
+        #[arg(long, value_name = "LOGIN", verbatim_doc_comment)]
         author: Option<String>,
-        /// Cap the rows returned. The matching total is always disclosed:
-        /// limits govern presentation, never derivation.
-        #[arg(long)]
+        /// Cap the rows returned
+        ///
+        /// The matching total is always disclosed: limits govern
+        /// presentation, never derivation.
+        #[arg(long, verbatim_doc_comment)]
         limit: Option<usize>,
     },
-    /// One PR with reviews, threads, comments, and linked issues.
+    /// One PR with reviews, threads, comments, and linked issues
     Pr {
-        /// "owner/name#123", a GitHub PR URL, or a bare number.
+        /// "owner/name#123", a GitHub PR URL, or a bare number
+        ///
         /// Bare numbers resolve via --repo, then the cwd git remote; the
-        /// canonical repo/number/url are echoed in the output so consumers
-        /// never re-parse. (MCP consumers must pass the qualified form —
-        /// cwd inference is a convenience, never the only path.)
+        /// canonical repo/number/url are echoed in the output so
+        /// consumers never re-parse. (MCP consumers must pass the
+        /// qualified form — cwd inference is a convenience, never the
+        /// only path.)
+        #[arg(verbatim_doc_comment)]
         reference: String,
-        #[arg(long)]
+        /// Repo a bare-number REFERENCE resolves in
+        #[arg(long, value_name = "OWNER/NAME")]
         repo: Option<String>,
-        /// Truncate each body field to at most this many bytes (never
-        /// splitting a UTF-8 code point); elided bodies say so via
+        /// Truncate each body field to at most BYTES
+        ///
+        /// Never splits a UTF-8 code point; elided bodies say so via
         /// body_elided. Opt-in: a property of the request, distinct from
         /// `truncated`, which is a property of the archive.
-        #[arg(long)]
+        #[arg(long, value_name = "BYTES", verbatim_doc_comment)]
         max_body_bytes: Option<usize>,
     },
-    /// Full-text search over PR titles/bodies and comments.
+    /// Full-text search over PRs, issues, and comments
     Search {
+        /// FTS5 match expression
+        ///
+        /// Words, "quoted phrases", AND/OR/NOT, prefix*. Results are
+        /// locators (repo#number and where it matched); `pr` fetches
+        /// the context.
+        #[arg(verbatim_doc_comment)]
         query: String,
-        #[arg(long, default_value_t = 20)]
+        /// Cap the results returned
+        ///
+        /// The total is always disclosed.
+        #[arg(long, default_value_t = 20, verbatim_doc_comment)]
         limit: usize,
     },
-    /// Read-only SQL against the archive. "-" (or a piped stdin with no
-    /// argument) reads the statement from stdin.
+    /// Read-only SQL against the archive
     Query {
+        /// One SQL statement; "-" reads it from stdin
+        ///
+        /// Omitting it with stdin piped also reads from stdin.
+        #[arg(verbatim_doc_comment)]
         sql: Option<String>,
-        #[arg(long, default_value_t = 100)]
+        /// Cap the rows returned
+        ///
+        /// Hitting the cap is disclosed (truncated_at_limit).
+        #[arg(long, default_value_t = 100, verbatim_doc_comment)]
         limit: usize,
     },
-    /// Archive counts, size, and per-repo sync state.
+    /// Archive counts, size, and per-repo sync state
     Stats,
 }
 
@@ -120,6 +176,22 @@ fn main() {
             clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
                 let _ = e.print();
                 std::process::exit(0);
+            }
+            // A bare `ghgraph`: clap renders the help AS the error. Inside
+            // the envelope it is a JSON-escaped wall of text no human reads,
+            // so the help goes to stderr and the envelope carries the
+            // diagnosis. It stays an error — a forgotten verb is a usage
+            // mistake, and a script must not read it as success. Rejected:
+            // exit 0 with help on stdout (a third contract carve-out, and a
+            // verb-less script "succeeds"); clap's stock stderr-only exit 2
+            // (empty stdout plus nonzero exit reads as INTERNAL); a default
+            // verb (every verb is a named archive operation with an MCP
+            // twin; an implicit one has neither).
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+                eprint!("{e}");
+                let msg = "no command given; run `ghgraph --help` for the list";
+                emit(&error::Error::user(msg.to_owned()).envelope(), 2);
+                std::process::exit(2);
             }
             _ => {
                 emit(&error::Error::user(e.to_string()).envelope(), 2);
@@ -208,5 +280,28 @@ fn run(cli: Cli) -> Result<(serde_json::Value, i32)> {
         Command::Search { query, limit } => Ok((report::search(&cfg, &query, limit)?, 0)),
         Command::Query { sql, limit } => Ok((report::query(&cfg, sql.as_deref(), limit)?, 0)),
         Command::Stats => Ok((report::stats(&cfg)?, 0)),
+    }
+}
+
+#[cfg(test)]
+#[path = "help_lint.rs"]
+mod help_lint;
+
+#[cfg(test)]
+mod help {
+    use clap::CommandFactory;
+
+    use super::{Cli, help_lint};
+
+    #[test]
+    fn help_fits_80_columns() {
+        let bad = help_lint::overwide_lines(Cli::command());
+        assert!(bad.is_empty(), "over-wide help lines:\n{}", bad.join("\n"));
+    }
+
+    #[test]
+    fn every_arg_has_help() {
+        let bad = help_lint::undocumented(Cli::command());
+        assert!(bad.is_empty(), "undocumented help:\n{}", bad.join("\n"));
     }
 }

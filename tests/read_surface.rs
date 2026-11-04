@@ -1214,6 +1214,65 @@ fn help_and_version_are_exit_zero_carve_outs() {
     }
 }
 
+/// A missing verb is a usage error with a JSON envelope on stdout, but the
+/// two ways clap reports it differ: a bare `ghgraph` renders the whole help
+/// AS the error, which main.rs reroutes to stderr; a verb missing after
+/// other arguments is clap's short usage error, which stays the message.
+#[test]
+fn missing_verb_is_an_envelope_with_readable_help() {
+    struct Case {
+        name: &'static str,
+        args: &'static [&'static str],
+        message_has: &'static str,
+        stderr_has_usage: bool,
+    }
+    let cases = [
+        Case {
+            name: "bare invocation: help on stderr, short diagnosis in the envelope",
+            args: &[],
+            message_has: "no command given",
+            stderr_has_usage: true,
+        },
+        Case {
+            name: "options but no verb: clap's usage error in the envelope",
+            args: &["--config", "/nonexistent/config.json"],
+            message_has: "requires a subcommand",
+            stderr_has_usage: false,
+        },
+    ];
+    for tc in cases {
+        let out = Command::new(env!("CARGO_BIN_EXE_ghgraph"))
+            .args(tc.args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let ctx = format!(
+            "{}: args={:?}\nstdout: {stdout}\nstderr: {stderr}",
+            tc.name, tc.args
+        );
+        assert_eq!(out.status.code(), Some(2), "{ctx}");
+        let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {ctx}"));
+        assert_eq!(env["error"]["code"], json!("USER_INPUT"), "{ctx}");
+        let message = env["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(tc.message_has),
+            "want message containing {:?}: {ctx}",
+            tc.message_has
+        );
+        assert!(
+            !message.contains("Commands:"),
+            "the help listing never rides in the envelope: {ctx}"
+        );
+        assert_eq!(
+            stderr.contains("Usage: ghgraph"),
+            tc.stderr_has_usage,
+            "stderr usage: {ctx}"
+        );
+    }
+}
+
 /// EPIPE must not clobber an earned gate exit (main.rs emit). The consumer
 /// closes the pipe before reading; either the write EPIPEs (earned exit
 /// preserved) or it landed in the pipe buffer first (gate exit path runs) —
