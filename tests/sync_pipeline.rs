@@ -369,7 +369,7 @@ fn author(login: &str, typename: &str) -> Value {
 struct Pr {
     id: &'static str,
     number: i64,
-    updated_at: &'static str,
+    updated_at: String,
     title: String,
     body: String,
     state: &'static str,
@@ -393,15 +393,15 @@ struct Pr {
     no_thread: bool,
     /// closingIssuesReferences arrives error-masked (null).
     mask_closing: bool,
-    closed_at: Option<&'static str>,
+    closed_at: Option<String>,
 }
 
 impl Pr {
-    fn new(id: &'static str, number: i64, updated_at: &'static str) -> Pr {
+    fn new(id: &'static str, number: i64, updated_at: impl Into<String>) -> Pr {
         Pr {
             id,
             number,
-            updated_at,
+            updated_at: updated_at.into(),
             title: format!("title {number}"),
             body: format!("body {number}"),
             state: "OPEN",
@@ -459,7 +459,7 @@ impl Pr {
                     "updatedAt": self.updated_at,
                     "mergedAt": null,
                     "closedAt": if self.state == "CLOSED" {
-                        json!(self.closed_at.unwrap_or("2026-07-21T00:00:00Z"))
+                        json!(self.closed_at.as_deref().unwrap_or("2026-07-21T00:00:00Z"))
                     } else { Value::Null },
                     "commits": {"nodes": [{"commit": {
                         "oid": "0123456789012345678901234567890123456789",
@@ -914,7 +914,7 @@ fn body_edits_reindex_fts_both_tables() {
     // alone must fire the guard), and the comment body is quiet-edited in
     // the hydration document.
     a.body = "amended prose entirely".into();
-    a.updated_at = "2026-07-20T12:00:00Z";
+    a.updated_at = "2026-07-20T12:00:00Z".into();
     install_prs(&fake, &[&a]);
     // PR_1 carries a witnessed baseline, so run 2 walks the REFRESH form.
     // A real comment edit announces itself via lastEditedAt (schema.sql:
@@ -1036,7 +1036,7 @@ fn sigkill_mid_run_converges_and_watermark_never_leads_data() {
                 .ok();
             if let Some(wm) = wm {
                 for pr in &prs {
-                    if pr.updated_at <= wm.as_str() {
+                    if pr.updated_at.as_str() <= wm.as_str() {
                         let n: i64 = conn
                             .query_row("SELECT count(*) FROM prs WHERE id=?1", [pr.id], |r| {
                                 r.get(0)
@@ -1224,12 +1224,28 @@ fn discovery_bounds(fake: &Fake, run: u32) -> Vec<(String, String)> {
         .collect()
 }
 
+/// `days` days and `secs` seconds before the wall clock. Fixtures whose
+/// outcome depends on the lookback must be dated with this: sync clamps
+/// discovery and the closed re-verify tier to `now − lookback_days`, and
+/// reads `now` from the real clock, so a fixed date silently crosses the
+/// clamp once it is older than the lookback (two tests dated July 2026
+/// went red on 2026-10-18 and 2026-10-19 that way).
+fn ago(days: u32, secs: u64) -> ghgraph::time::Rfc3339Utc {
+    ghgraph::time::Rfc3339Utc::now()
+        .checked_sub_days(days)
+        .and_then(|t| t.checked_sub_secs(secs))
+        .unwrap()
+}
+
 #[test]
 fn fingerprint_transitions_drive_discovery_reach() {
     let fake = Fake::new();
     fake.config(&working_config(&[], 90));
-    let a = Pr::new("PR_1", 1, "2026-07-20T10:00:00Z");
+    // Inside the 90-day lookback, so run 2's since is the watermark.
+    let updated = ago(10, 0);
+    let a = Pr::new("PR_1", 1, updated.as_str());
     install_prs(&fake, &[&a]);
+    let incremental = updated.checked_sub_secs(600).unwrap();
 
     // Run 1, cold start: the three viewer flavors, since ≈ lookback.
     fake.sync_ok();
@@ -1243,7 +1259,7 @@ fn fingerprint_transitions_drive_discovery_reach() {
     fake.sync_ok();
     let b2 = discovery_bounds(&fake, 2);
     assert_eq!(b2.len(), 3);
-    assert_eq!(b2[0].1, "2026-07-20T09:50:00Z", "watermark − 10min overlap");
+    assert_eq!(b2[0].1, incremental.as_str(), "watermark − 10min overlap");
 
     // Run 3, person added: the regular incremental flavors PLUS a backfill
     // involves:bob over the full lookback (the cheaper-than-cold path).
@@ -1270,7 +1286,7 @@ fn fingerprint_transitions_drive_discovery_reach() {
     fake.sync_ok();
     let b4 = discovery_bounds(&fake, 4);
     assert_eq!(b4.len(), 3, "no extra flavors: {b4:?}");
-    assert_eq!(b4[0].1, "2026-07-20T09:50:00Z");
+    assert_eq!(b4[0].1, incremental.as_str());
 
     // Run 5, lookback increased: a relaxation — the stream cold-starts.
     fake.config(&working_config(&[], 120));
@@ -1703,12 +1719,14 @@ fn truncation_never_stamps_sweeps_or_drops_requests_and_heals() {
 fn reverify_catches_quiet_mutations_within_its_tiers() {
     let fake = Fake::new();
     fake.config(&base_config());
-    let open = Pr::new("PR_O", 1, "2026-07-20T10:00:00Z");
-    let mut recent = Pr::new("PR_RC", 2, "2026-07-20T11:00:00Z");
-    recent.state = "CLOSED"; // closed_at 2026-07-21: inside the lookback
-    let mut ancient = Pr::new("PR_AC", 3, "2026-07-20T12:00:00Z");
+    let open_updated = ago(10, 7200);
+    let open = Pr::new("PR_O", 1, open_updated.as_str());
+    let mut recent = Pr::new("PR_RC", 2, ago(10, 3600).as_str());
+    recent.state = "CLOSED";
+    recent.closed_at = Some(ago(9, 0).as_str().into()); // inside the lookback
+    let mut ancient = Pr::new("PR_AC", 3, ago(10, 0).as_str());
     ancient.state = "CLOSED";
-    ancient.closed_at = Some("2020-01-01T00:00:00Z"); // far outside it
+    ancient.closed_at = Some("2020-01-01T00:00:00Z".into()); // far outside it
     install_prs(&fake, &[&open, &recent, &ancient]);
     fake.sync_ok();
 
@@ -1725,7 +1743,7 @@ fn reverify_catches_quiet_mutations_within_its_tiers() {
             rusqlite::params![aged.as_str()],
         )
         .unwrap();
-    let mut edited = Pr::new("PR_O", 1, "2026-07-20T10:00:00Z");
+    let mut edited = Pr::new("PR_O", 1, open_updated.as_str());
     edited.comment_ids = vec!["C_PR_O".into()];
     let hydration = edited
         .hydration()
